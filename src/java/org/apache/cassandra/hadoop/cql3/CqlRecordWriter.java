@@ -21,34 +21,32 @@ import java.io.IOException;
 import java.net.InetAddress;
 import java.nio.ByteBuffer;
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.*;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.cassandra.db.marshal.AbstractType;
+import com.datastax.driver.core.*;
+import com.datastax.driver.core.exceptions.*;
+
+import org.apache.cassandra.db.marshal.ByteBufferAccessor;
 import org.apache.cassandra.db.marshal.CompositeType;
-import org.apache.cassandra.db.marshal.LongType;
-import org.apache.cassandra.db.marshal.TypeParser;
-import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.dht.IPartitioner;
 import org.apache.cassandra.dht.Token;
-import org.apache.cassandra.exceptions.ConfigurationException;
-import org.apache.cassandra.exceptions.SyntaxException;
-import org.apache.cassandra.hadoop.AbstractColumnFamilyRecordWriter;
 import org.apache.cassandra.hadoop.ConfigHelper;
-import org.apache.cassandra.hadoop.Progressable;
-import org.apache.cassandra.thrift.*;
-import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.hadoop.HadoopCompat;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.mapreduce.RecordWriter;
 import org.apache.hadoop.mapreduce.TaskAttemptContext;
-import org.apache.thrift.TException;
-import org.apache.thrift.transport.TTransport;
+import org.apache.hadoop.util.Progressable;
+
+import static java.util.stream.Collectors.toMap;
 
 /**
- * The <code>ColumnFamilyRecordWriter</code> maps the output &lt;key, value&gt;
- * pairs to a Cassandra column family. In particular, it applies the binded variables
- * in the value to the prepared statement, which it associates with the key, and in 
+ * The <code>CqlRecordWriter</code> maps the output &lt;key, value&gt;
+ * pairs to a Cassandra table. In particular, it applies the binded variables
+ * in the value to the prepared statement, which it associates with the key, and in
  * turn the responsible endpoint.
  *
  * <p>
@@ -59,21 +57,38 @@ import org.apache.thrift.transport.TTransport;
  *
  * @see CqlOutputFormat
  */
-final class CqlRecordWriter extends AbstractColumnFamilyRecordWriter<Map<String, ByteBuffer>, List<ByteBuffer>>
+class CqlRecordWriter extends RecordWriter<Map<String, ByteBuffer>, List<ByteBuffer>> implements
+        org.apache.hadoop.mapred.RecordWriter<Map<String, ByteBuffer>, List<ByteBuffer>>, AutoCloseable
 {
     private static final Logger logger = LoggerFactory.getLogger(CqlRecordWriter.class);
 
+    // The configuration this writer is associated with.
+    protected final Configuration conf;
+    // The number of mutations to buffer per endpoint
+    protected final int queueSize;
+
+    protected final long batchThreshold;
+
+    protected Progressable progressable;
+    protected TaskAttemptContext context;
+
+    // The ring cache that describes the token ranges each node in the ring is
+    // responsible for. This is what allows us to group the mutations by
+    // the endpoints they should be targeted at. The targeted endpoint
+    // essentially
+    // acts as the primary replica for the rows being affected by the mutations.
+    private final NativeRingCache ringCache;
+
     // handles for clients for each range running in the threadpool
-    private final Map<Range, RangeClient> clients;
+    protected final Map<InetAddress, RangeClient> clients;
 
     // host to prepared statement id mappings
-    private ConcurrentHashMap<Cassandra.Client, Integer> preparedStatements = new ConcurrentHashMap<Cassandra.Client, Integer>();
+    protected final ConcurrentHashMap<Session, PreparedStatement> preparedStatements = new ConcurrentHashMap<Session, PreparedStatement>();
 
-    private final String cql;
+    protected final String cql;
 
-    private AbstractType<?> keyValidator;
-    private String [] partitionKeyColumns;
-    private List<String> clusterColumns;
+    protected List<ColumnMetadata> partitionKeyColumns;
+    protected List<ColumnMetadata> clusterColumns;
 
     /**
      * Upon construction, obtain the map that this writer will use to collect
@@ -84,11 +99,11 @@ final class CqlRecordWriter extends AbstractColumnFamilyRecordWriter<Map<String,
      */
     CqlRecordWriter(TaskAttemptContext context) throws IOException
     {
-        this(context.getConfiguration());
-        this.progressable = new Progressable(context);
+        this(HadoopCompat.getConfiguration(context));
+        this.context = context;
     }
 
-    CqlRecordWriter(Configuration conf, Progressable progressable) throws IOException
+    CqlRecordWriter(Configuration conf, Progressable progressable)
     {
         this(conf);
         this.progressable = progressable;
@@ -96,31 +111,50 @@ final class CqlRecordWriter extends AbstractColumnFamilyRecordWriter<Map<String,
 
     CqlRecordWriter(Configuration conf)
     {
-        super(conf);
-        this.clients = new HashMap<Range, RangeClient>();
+        this.conf = conf;
+        this.queueSize = conf.getInt(CqlOutputFormat.QUEUE_SIZE, 32 * FBUtilities.getAvailableProcessors());
+        batchThreshold = conf.getLong(CqlOutputFormat.BATCH_THRESHOLD, 32);
+        this.clients = new HashMap<>();
+        String keyspace = ConfigHelper.getOutputKeyspace(conf);
 
-        try
+        try (Cluster cluster = CqlConfigHelper.getOutputCluster(ConfigHelper.getOutputInitialAddress(conf), conf))
         {
-            Cassandra.Client client = ConfigHelper.getClientFromOutputAddressList(conf);
-            retrievePartitionKeyValidator(client);
+            Metadata metadata = cluster.getMetadata();
+            ringCache = new NativeRingCache(conf, metadata);
+            TableMetadata tableMetadata = metadata.getKeyspace(Metadata.quote(keyspace)).getTable(ConfigHelper.getOutputColumnFamily(conf));
+            clusterColumns = tableMetadata.getClusteringColumns();
+            partitionKeyColumns = tableMetadata.getPartitionKey();
+
             String cqlQuery = CqlConfigHelper.getOutputCql(conf).trim();
-            if (cqlQuery.toLowerCase().startsWith("insert"))
+            if (cqlQuery.toLowerCase(Locale.ENGLISH).startsWith("insert"))
                 throw new UnsupportedOperationException("INSERT with CqlRecordWriter is not supported, please use UPDATE/DELETE statement");
             cql = appendKeyWhereClauses(cqlQuery);
-
-            if (client != null)
-            {
-                TTransport transport = client.getOutputProtocol().getTransport();
-                if (transport.isOpen())
-                    transport.close();
-            }
         }
         catch (Exception e)
         {
             throw new RuntimeException(e);
         }
     }
-    
+
+    /**
+     * Close this <code>RecordWriter</code> to future operations, but not before
+     * flushing out the batched mutations.
+     *
+     * @param context the context of the task
+     * @throws IOException
+     */
+    public void close(TaskAttemptContext context) throws IOException, InterruptedException
+    {
+        close();
+    }
+
+    /** Fills the deprecated RecordWriter interface for streaming. */
+    @Deprecated
+    public void close(org.apache.hadoop.mapred.Reporter reporter) throws IOException
+    {
+        close();
+    }
+
     @Override
     public void close() throws IOException
     {
@@ -141,10 +175,10 @@ final class CqlRecordWriter extends AbstractColumnFamilyRecordWriter<Map<String,
         if (clientException != null)
             throw clientException;
     }
-    
+
     /**
      * If the key is to be associated with a valid value, a mutation is created
-     * for it with the given column family and columns. In the event the value
+     * for it with the given table and columns. In the event the value
      * in the column is missing (i.e., null), then it is marked for
      * {@link Deletion}. Similarly, if the entire value for a key is missing
      * (i.e., null), then the entire key is marked for {@link Deletion}.
@@ -159,212 +193,281 @@ final class CqlRecordWriter extends AbstractColumnFamilyRecordWriter<Map<String,
     @Override
     public void write(Map<String, ByteBuffer> keyColumns, List<ByteBuffer> values) throws IOException
     {
-        Range<Token> range = ringCache.getRange(getPartitionKey(keyColumns));
+        TokenRange range = ringCache.getRange(getPartitionKey(keyColumns));
 
         // get the client for the given range, or create a new one
-        RangeClient client = clients.get(range);
+        final InetAddress address = ringCache.getEndpoints(range).get(0);
+        RangeClient client = clients.get(address);
         if (client == null)
         {
             // haven't seen keys for this range: create new client
-            client = new RangeClient(ringCache.getEndpoint(range));
+            client = new RangeClient(ringCache.getEndpoints(range));
             client.start();
-            clients.put(range, client);
+            clients.put(address, client);
         }
 
         // add primary key columns to the bind variables
         List<ByteBuffer> allValues = new ArrayList<ByteBuffer>(values);
-        for (String column : partitionKeyColumns)
-            allValues.add(keyColumns.get(column));
-        for (String column : clusterColumns)
-            allValues.add(keyColumns.get(column));
+        for (ColumnMetadata column : partitionKeyColumns)
+            allValues.add(keyColumns.get(column.getName()));
+        for (ColumnMetadata column : clusterColumns)
+            allValues.add(keyColumns.get(column.getName()));
 
         client.put(allValues);
-        progressable.progress();
+
+        if (progressable != null)
+            progressable.progress();
+        if (context != null)
+            HadoopCompat.progress(context);
+    }
+
+    private static void closeSession(Session session)
+    {
+        //Close the session to satisfy to avoid warnings for the resource not being closed
+        try
+        {
+            if (session != null)
+                session.getCluster().closeAsync();
+        }
+        catch (Throwable t)
+        {
+            logger.warn("Error closing connection", t);
+        }
     }
 
     /**
      * A client that runs in a threadpool and connects to the list of endpoints for a particular
      * range. Bound variables for keys in that range are sent to this client via a queue.
      */
-    public class RangeClient extends AbstractRangeClient<List<ByteBuffer>>
+    public class RangeClient extends Thread
     {
+        // The list of endpoints for this range
+        protected final List<InetAddress> endpoints;
+        protected Cluster cluster = null;
+        // A bounded queue of incoming mutations for this range
+        protected final BlockingQueue<List<ByteBuffer>> queue = new ArrayBlockingQueue<List<ByteBuffer>>(queueSize);
+
+        protected volatile boolean run = true;
+        // we want the caller to know if something went wrong, so we record any unrecoverable exception while writing
+        // so we can throw it on the caller's stack when he calls put() again, or if there are no more put calls,
+        // when the client is closed.
+        protected volatile IOException lastException;
+
         /**
          * Constructs an {@link RangeClient} for the given endpoints.
          * @param endpoints the possible endpoints to execute the mutations on
          */
         public RangeClient(List<InetAddress> endpoints)
         {
-            super(endpoints);
-         }
-        
+            super("client-" + endpoints);
+            this.endpoints = endpoints;
+        }
+
         /**
-         * Loops collecting cql binded variable values from the queue and sending to Cassandra
+         * enqueues the given value to Cassandra
          */
-        public void run()
+        public void put(List<ByteBuffer> value) throws IOException
         {
-            outer:
-            while (run || !queue.isEmpty())
+            while (true)
             {
-                List<ByteBuffer> bindVariables;
+                if (lastException != null)
+                    throw lastException;
                 try
                 {
-                    bindVariables = queue.take();
+                    if (queue.offer(value, 100, TimeUnit.MILLISECONDS))
+                        break;
                 }
                 catch (InterruptedException e)
                 {
-                    // re-check loop condition after interrupt
-                    continue;
-                }
-
-                Iterator<InetAddress> iter = endpoints.iterator();
-                while (true)
-                {
-                    // send the mutation to the last-used endpoint.  first time through, this will NPE harmlessly.
-                    try
-                    {
-                        int i = 0;
-                        int itemId = preparedStatement(client);
-                        while (bindVariables != null)
-                        {
-                            client.execute_prepared_cql3_query(itemId, bindVariables, ConsistencyLevel.ONE);
-                            i++;
-                            
-                            if (i >= batchThreshold)
-                                break;
-                            
-                            bindVariables = queue.poll();
-                        }
-                        
-                        break;
-                    }
-                    catch (Exception e)
-                    {
-                        closeInternal();
-                        if (!iter.hasNext())
-                        {
-                            lastException = new IOException(e);
-                            break outer;
-                        }
-                    }
-
-                    // attempt to connect to a different endpoint
-                    try
-                    {
-                        InetAddress address = iter.next();
-                        String host = address.getHostName();
-                        int port = ConfigHelper.getOutputRpcPort(conf);
-                        client = CqlOutputFormat.createAuthenticatedClient(host, port, conf);
-                    }
-                    catch (Exception e)
-                    {
-                        closeInternal();
-                        // TException means something unexpected went wrong to that endpoint, so
-                        // we should try again to another.  Other exceptions (auth or invalid request) are fatal.
-                        if ((!(e instanceof TException)) || !iter.hasNext())
-                        {
-                            lastException = new IOException(e);
-                            break outer;
-                        }
-                    }
+                    throw new AssertionError(e);
                 }
             }
         }
 
-        /** get prepared statement id from cache, otherwise prepare it from Cassandra server*/
-        private int preparedStatement(Cassandra.Client client)
+        /**
+         * Loops collecting cql binded variable values from the queue and sending to Cassandra
+         */
+        @SuppressWarnings("resource")
+        public void run()
         {
-            Integer itemId = preparedStatements.get(client);
-            if (itemId == null)
+            Session session = null;
+
+            try
             {
-                CqlPreparedResult result;
+                outer:
+                while (run || !queue.isEmpty())
+                {
+                    List<ByteBuffer> bindVariables;
+                    try
+                    {
+                        bindVariables = queue.take();
+                    }
+                    catch (InterruptedException e)
+                    {
+                        // re-check loop condition after interrupt
+                        continue;
+                    }
+
+                    ListIterator<InetAddress> iter = endpoints.listIterator();
+                    while (true)
+                    {
+                        // send the mutation to the last-used endpoint.  first time through, this will NPE harmlessly.
+                        if (session != null)
+                        {
+                            try
+                            {
+                                int i = 0;
+                                PreparedStatement statement = preparedStatement(session);
+                                while (bindVariables != null)
+                                {
+                                    BoundStatement boundStatement = new BoundStatement(statement);
+                                    for (int columnPosition = 0; columnPosition < bindVariables.size(); columnPosition++)
+                                    {
+                                        boundStatement.setBytesUnsafe(columnPosition, bindVariables.get(columnPosition));
+                                    }
+                                    session.execute(boundStatement);
+                                    i++;
+
+                                    if (i >= batchThreshold)
+                                        break;
+                                    bindVariables = queue.poll();
+                                }
+                                break;
+                            }
+                            catch (Exception e)
+                            {
+                                closeInternal();
+                                if (!iter.hasNext())
+                                {
+                                    lastException = new IOException(e);
+                                    break outer;
+                                }
+                            }
+                        }
+
+                        // attempt to connect to a different endpoint
+                        try
+                        {
+                            InetAddress address = iter.next();
+                            String host = address.getHostName();
+                            cluster = CqlConfigHelper.getOutputCluster(host, conf);
+                            closeSession(session);
+                            session = cluster.connect();
+                        }
+                        catch (Exception e)
+                        {
+                            //If connection died due to Interrupt, just try connecting to the endpoint again.
+                            //There are too many ways for the Thread.interrupted() state to be cleared, so
+                            //we can't rely on that here. Until the java driver gives us a better way of knowing
+                            //that this exception came from an InterruptedException, this is the best solution.
+                            if (canRetryDriverConnection(e))
+                            {
+                                iter.previous();
+                            }
+                            closeInternal();
+
+                            // Most exceptions mean something unexpected went wrong to that endpoint, so
+                            // we should try again to another.  Other exceptions (auth or invalid request) are fatal.
+                            if ((e instanceof AuthenticationException || e instanceof InvalidQueryException) || !iter.hasNext())
+                            {
+                                lastException = new IOException(e);
+                                break outer;
+                            }
+                        }
+                    }
+                }
+            }
+            finally
+            {
+                closeSession(session);
+                // close all our connections once we are done.
+                closeInternal();
+            }
+        }
+
+        /** get prepared statement id from cache, otherwise prepare it from Cassandra server*/
+        private PreparedStatement preparedStatement(Session client)
+        {
+            PreparedStatement statement = preparedStatements.get(client);
+            if (statement == null)
+            {
+                PreparedStatement result;
                 try
                 {
-                    result = client.prepare_cql3_query(ByteBufferUtil.bytes(cql), Compression.NONE);
+                    result = client.prepare(cql);
                 }
-                catch (InvalidRequestException e)
-                {
-                    throw new RuntimeException("failed to prepare cql query " + cql, e);
-                }
-                catch (TException e)
+                catch (NoHostAvailableException e)
                 {
                     throw new RuntimeException("failed to prepare cql query " + cql, e);
                 }
 
-                Integer previousId = preparedStatements.putIfAbsent(client, Integer.valueOf(result.itemId));
-                itemId = previousId == null ? result.itemId : previousId;
+                PreparedStatement previousId = preparedStatements.putIfAbsent(client, result);
+                statement = previousId == null ? result : previousId;
             }
-            return itemId;
+            return statement;
+        }
+
+        public void close() throws IOException
+        {
+            // stop the run loop.  this will result in closeInternal being called by the time join() finishes.
+            run = false;
+            interrupt();
+            try
+            {
+                this.join();
+            }
+            catch (InterruptedException e)
+            {
+                throw new AssertionError(e);
+            }
+
+            if (lastException != null)
+                throw lastException;
+        }
+
+        protected void closeInternal()
+        {
+            if (cluster != null)
+            {
+                cluster.close();
+            }
+        }
+
+        private boolean canRetryDriverConnection(Exception e)
+        {
+            if (e instanceof DriverException && e.getMessage().contains("Connection thread interrupted"))
+                return true;
+            if (e instanceof NoHostAvailableException)
+            {
+                if (((NoHostAvailableException) e).getErrors().size() == 1)
+                {
+                    Throwable cause = ((NoHostAvailableException) e).getErrors().values().iterator().next();
+                    if (cause != null && cause.getCause() instanceof java.nio.channels.ClosedByInterruptException)
+                    {
+                        return true;
+                    }
+                }
+            }
+            return false;
         }
     }
 
     private ByteBuffer getPartitionKey(Map<String, ByteBuffer> keyColumns)
     {
         ByteBuffer partitionKey;
-        if (keyValidator instanceof CompositeType)
+        if (partitionKeyColumns.size() > 1)
         {
-            ByteBuffer[] keys = new ByteBuffer[partitionKeyColumns.length];
+            ByteBuffer[] keys = new ByteBuffer[partitionKeyColumns.size()];
             for (int i = 0; i< keys.length; i++)
-                keys[i] = keyColumns.get(partitionKeyColumns[i]);
+                keys[i] = keyColumns.get(partitionKeyColumns.get(i).getName());
 
-            partitionKey = CompositeType.build(keys);
+            partitionKey = CompositeType.build(ByteBufferAccessor.instance, keys);
         }
         else
         {
-            partitionKey = keyColumns.get(partitionKeyColumns[0]);
+            partitionKey = keyColumns.get(partitionKeyColumns.get(0).getName());
         }
         return partitionKey;
-    }
-
-    /** retrieve the key validator from system.schema_columnfamilies table */
-    private void retrievePartitionKeyValidator(Cassandra.Client client) throws Exception
-    {
-        String keyspace = ConfigHelper.getOutputKeyspace(conf);
-        String cfName = ConfigHelper.getOutputColumnFamily(conf);
-        String query = "SELECT key_validator," +
-        		       "       key_aliases," +
-        		       "       column_aliases " +
-                       "FROM system.schema_columnfamilies " +
-                       "WHERE keyspace_name='%s' and columnfamily_name='%s'";
-        String formatted = String.format(query, keyspace, cfName);
-        CqlResult result = client.execute_cql3_query(ByteBufferUtil.bytes(formatted), Compression.NONE, ConsistencyLevel.ONE);
-
-        Column rawKeyValidator = result.rows.get(0).columns.get(0);
-        String validator = ByteBufferUtil.string(ByteBuffer.wrap(rawKeyValidator.getValue()));
-        keyValidator = parseType(validator);
-        
-        Column rawPartitionKeys = result.rows.get(0).columns.get(1);
-        String keyString = ByteBufferUtil.string(ByteBuffer.wrap(rawPartitionKeys.getValue()));
-        logger.debug("partition keys: {}", keyString);
-
-        List<String> keys = FBUtilities.fromJsonList(keyString);
-        partitionKeyColumns = new String[keys.size()];
-        int i = 0;
-        for (String key : keys)
-        {
-            partitionKeyColumns[i] = key;
-            i++;
-        }
-
-        Column rawClusterColumns = result.rows.get(0).columns.get(2);
-        String clusterColumnString = ByteBufferUtil.string(ByteBuffer.wrap(rawClusterColumns.getValue()));
-
-        logger.debug("cluster columns: {}", clusterColumnString);
-        clusterColumns = FBUtilities.fromJsonList(clusterColumnString);
-    }
-
-    private AbstractType<?> parseType(String type) throws ConfigurationException
-    {
-        try
-        {
-            // always treat counters like longs, specifically CCT.serialize is not what we need
-            if (type != null && type.equals("org.apache.cassandra.db.marshal.CounterColumnType"))
-                return LongType.instance;
-            return TypeParser.parse(type);
-        }
-        catch (SyntaxException e)
-        {
-            throw new ConfigurationException(e.getMessage(), e);
-        }
     }
 
     /**
@@ -374,10 +477,10 @@ final class CqlRecordWriter extends AbstractColumnFamilyRecordWriter<Map<String,
     {
         String keyWhereClause = "";
 
-        for (String partitionKey : partitionKeyColumns)
-            keyWhereClause += String.format("%s = ?", keyWhereClause.isEmpty() ? quote(partitionKey) : (" AND " + quote(partitionKey)));
-        for (String clusterColumn : clusterColumns)
-            keyWhereClause += " AND " + quote(clusterColumn) + " = ?";
+        for (ColumnMetadata partitionKey : partitionKeyColumns)
+            keyWhereClause += String.format("%s = ?", keyWhereClause.isEmpty() ? quote(partitionKey.getName()) : (" AND " + quote(partitionKey.getName())));
+        for (ColumnMetadata clusterColumn : clusterColumns)
+            keyWhereClause += " AND " + quote(clusterColumn.getName()) + " = ?";
 
         return cqlQuery + " WHERE " + keyWhereClause;
     }
@@ -386,5 +489,48 @@ final class CqlRecordWriter extends AbstractColumnFamilyRecordWriter<Map<String,
     private String quote(String identifier)
     {
         return "\"" + identifier.replaceAll("\"", "\"\"") + "\"";
+    }
+
+    static class NativeRingCache
+    {
+        private final Map<TokenRange, Set<Host>> rangeMap;
+        private final Metadata metadata;
+        private final IPartitioner partitioner;
+
+        public NativeRingCache(Configuration conf, Metadata metadata)
+        {
+            this.partitioner = ConfigHelper.getOutputPartitioner(conf);
+            this.metadata = metadata;
+            String keyspace = ConfigHelper.getOutputKeyspace(conf);
+            this.rangeMap = metadata.getTokenRanges()
+                                    .stream()
+                                    .collect(toMap(p -> p, p -> metadata.getReplicas('"' + keyspace + '"', p)));
+        }
+
+        public TokenRange getRange(ByteBuffer key)
+        {
+            Token t = partitioner.getToken(key);
+            com.datastax.driver.core.Token driverToken = metadata.newToken(partitioner.getTokenFactory().toString(t));
+            for (TokenRange range : rangeMap.keySet())
+            {
+                if (range.contains(driverToken))
+                {
+                    return range;
+                }
+            }
+
+            throw new RuntimeException("Invalid token information returned by describe_ring: " + rangeMap);
+        }
+
+        public List<InetAddress> getEndpoints(TokenRange range)
+        {
+            Set<Host> hostSet = rangeMap.get(range);
+            List<InetAddress> addresses = new ArrayList<>(hostSet.size());
+            for (Host host: hostSet)
+            {
+                addresses.add(host.getAddress());
+            }
+            return addresses;
+        }
     }
 }

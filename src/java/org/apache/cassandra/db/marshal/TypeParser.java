@@ -21,14 +21,12 @@ import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.Iterator;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 
-import org.apache.commons.lang3.StringUtils;
+import com.google.common.base.Verify;
+import com.google.common.collect.ImmutableMap;
 
+import org.apache.cassandra.cql3.FieldIdentifier;
 import org.apache.cassandra.exceptions.*;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
@@ -43,7 +41,7 @@ public class TypeParser
     private int idx;
 
     // A cache of parsed string, specially useful for DynamicCompositeType
-    private static final Map<String, AbstractType<?>> cache = new HashMap<String, AbstractType<?>>();
+    private static volatile ImmutableMap<String, AbstractType<?>> cache = ImmutableMap.of();
 
     public static final TypeParser EMPTY_PARSER = new TypeParser("", 0);
 
@@ -66,6 +64,7 @@ public class TypeParser
         if (str == null)
             return BytesType.instance;
 
+        // A single volatile read of 'cache' should not hurt.
         AbstractType<?> type = cache.get(str);
 
         if (type != null)
@@ -89,19 +88,32 @@ public class TypeParser
         else
             type = getAbstractType(name);
 
-        // We don't really care about concurrency here. Worst case scenario, we do some parsing unnecessarily
-        cache.put(str, type);
-        return type;
+        Verify.verify(type != null, "Parsing %s yielded null, which is a bug", str);
+
+        // Prevent concurrent modification to the map acting as the cache for TypeParser at the expense of
+        // more allocation when the cache needs to be updated, since updates to the cache are rare compared
+        // to the amount of reads.
+        //
+        // Copy the existing cache into a new map and add the parsed AbstractType instance and replace
+        // the cache, if the type is not already in the cache.
+        //
+        // The cache-update is done in a short synchronized block to prevent duplicate instances of AbstractType
+        // for the same string representation.
+        synchronized (TypeParser.class)
+        {
+            if (!cache.containsKey(str))
+            {
+                ImmutableMap.Builder<String, AbstractType<?>> builder = ImmutableMap.builder();
+                builder.putAll(cache).put(str, type);
+                cache = builder.build();
+            }
+            return type;
+        }
     }
 
     public static AbstractType<?> parse(CharSequence compareWith) throws SyntaxException, ConfigurationException
     {
         return parse(compareWith == null ? null : compareWith.toString());
-    }
-
-    public static String getShortName(AbstractType<?> type)
-    {
-        return type.getClass().getSimpleName();
     }
 
     /**
@@ -121,14 +133,13 @@ public class TypeParser
 
     public Map<String, String> getKeyValueParameters() throws SyntaxException
     {
-        Map<String, String> map = new HashMap<String, String>();
-
         if (isEOS())
-            return map;
+            return Collections.emptyMap();
 
         if (str.charAt(idx) != '(')
             throw new IllegalStateException();
 
+        Map<String, String> map = new HashMap<>();
         ++idx; // skipping '('
 
         while (skipBlankAndComma())
@@ -159,7 +170,7 @@ public class TypeParser
 
     public List<AbstractType<?>> getTypeParameters() throws SyntaxException, ConfigurationException
     {
-        List<AbstractType<?>> list = new ArrayList<AbstractType<?>>();
+        List<AbstractType<?>> list = new ArrayList<>();
 
         if (isEOS())
             return list;
@@ -193,7 +204,7 @@ public class TypeParser
 
     public Map<Byte, AbstractType<?>> getAliasParameters() throws SyntaxException, ConfigurationException
     {
-        Map<Byte, AbstractType<?>> map = new HashMap<Byte, AbstractType<?>>();
+        Map<Byte, AbstractType<?>> map = new HashMap<>();
 
         if (isEOS())
             return map;
@@ -241,7 +252,7 @@ public class TypeParser
 
     public Map<ByteBuffer, CollectionType> getCollectionsParameters() throws SyntaxException, ConfigurationException
     {
-        Map<ByteBuffer, CollectionType> map = new HashMap<ByteBuffer, CollectionType>();
+        Map<ByteBuffer, CollectionType> map = new HashMap<>();
 
         if (isEOS())
             return map;
@@ -271,7 +282,7 @@ public class TypeParser
             {
                 AbstractType<?> type = parse();
                 if (!(type instanceof CollectionType))
-                    throw new SyntaxException(type.toString() + " is not a collection type");
+                    throw new SyntaxException(type + " is not a collection type");
                 map.put(bb, (CollectionType)type);
             }
             catch (SyntaxException e)
@@ -297,7 +308,7 @@ public class TypeParser
         }
     }
 
-    public Pair<ByteBuffer, List<Pair<ByteBuffer, AbstractType>>> getUserTypeParameters() throws SyntaxException, ConfigurationException
+    public Pair<Pair<String, ByteBuffer>, List<Pair<ByteBuffer, AbstractType>>> getUserTypeParameters() throws SyntaxException, ConfigurationException
     {
 
         if (isEOS() || str.charAt(idx) != '(')
@@ -305,6 +316,8 @@ public class TypeParser
 
         ++idx; // skipping '('
 
+        skipBlankAndComma();
+        String keyspace = readNextIdentifier();
         skipBlankAndComma();
         ByteBuffer typeName = fromHex(readNextIdentifier());
         List<Pair<ByteBuffer, AbstractType>> defs = new ArrayList<>();
@@ -314,7 +327,7 @@ public class TypeParser
             if (str.charAt(idx) == ')')
             {
                 ++idx;
-                return Pair.create(typeName, defs);
+                return Pair.create(Pair.create(keyspace, typeName), defs);
             }
 
             ByteBuffer name = fromHex(readNextIdentifier());
@@ -347,12 +360,7 @@ public class TypeParser
             Field field = typeClass.getDeclaredField("instance");
             return (AbstractType<?>) field.get(null);
         }
-        catch (NoSuchFieldException e)
-        {
-            // Trying with empty parser
-            return getRawAbstractType(typeClass, EMPTY_PARSER);
-        }
-        catch (IllegalAccessException e)
+        catch (NoSuchFieldException | IllegalAccessException e)
         {
             // Trying with empty parser
             return getRawAbstractType(typeClass, EMPTY_PARSER);
@@ -368,13 +376,7 @@ public class TypeParser
             Method method = typeClass.getDeclaredMethod("getInstance", TypeParser.class);
             return (AbstractType<?>) method.invoke(null, parser);
         }
-        catch (NoSuchMethodException e)
-        {
-            // Trying to see if we have an instance field and apply the default parameter to it
-            AbstractType<?> type = getRawAbstractType(typeClass);
-            return AbstractType.parseDefaultParameters(type, parser);
-        }
-        catch (IllegalAccessException e)
+        catch (NoSuchMethodException | IllegalAccessException e)
         {
             // Trying to see if we have an instance field and apply the default parameter to it
             AbstractType<?> type = getRawAbstractType(typeClass);
@@ -395,11 +397,7 @@ public class TypeParser
             Field field = typeClass.getDeclaredField("instance");
             return (AbstractType<?>) field.get(null);
         }
-        catch (NoSuchFieldException e)
-        {
-            throw new ConfigurationException("Invalid comparator class " + typeClass.getName() + ": must define a public static instance field or a public static method getInstance(TypeParser).");
-        }
-        catch (IllegalAccessException e)
+        catch (NoSuchFieldException | IllegalAccessException e)
         {
             throw new ConfigurationException("Invalid comparator class " + typeClass.getName() + ": must define a public static instance field or a public static method getInstance(TypeParser).");
         }
@@ -412,11 +410,7 @@ public class TypeParser
             Method method = typeClass.getDeclaredMethod("getInstance", TypeParser.class);
             return (AbstractType<?>) method.invoke(null, parser);
         }
-        catch (NoSuchMethodException e)
-        {
-            throw new ConfigurationException("Invalid comparator class " + typeClass.getName() + ": must define a public static instance field or a public static method getInstance(TypeParser).");
-        }
-        catch (IllegalAccessException e)
+        catch (NoSuchMethodException | IllegalAccessException e)
         {
             throw new ConfigurationException("Invalid comparator class " + typeClass.getName() + ": must define a public static instance field or a public static method getInstance(TypeParser).");
         }
@@ -504,12 +498,6 @@ public class TypeParser
         return str.substring(i, idx);
     }
 
-    public char readNextChar()
-    {
-        skipBlank();
-        return str.charAt(idx++);
-    }
-
     /**
      * Helper function to ease the writing of AbstractType.toString() methods.
      */
@@ -537,40 +525,53 @@ public class TypeParser
      */
     public static String stringifyTypeParameters(List<AbstractType<?>> types)
     {
-        StringBuilder sb = new StringBuilder();
-        sb.append('(').append(StringUtils.join(types, ",")).append(')');
-        return sb.toString();
+        return stringifyTypeParameters(types, false);
     }
 
-    public static String stringifyCollectionsParameters(Map<ByteBuffer, CollectionType> collections)
+    /**
+     * Helper function to ease the writing of AbstractType.toString() methods.
+     */
+    public static String stringifyTypeParameters(List<AbstractType<?>> types, boolean ignoreFreezing)
+    {
+        StringBuilder sb = new StringBuilder("(");
+        for (int i = 0; i < types.size(); i++)
+        {
+            if (i > 0)
+                sb.append(",");
+            sb.append(types.get(i).toString(ignoreFreezing));
+        }
+        return sb.append(')').toString();
+    }
+
+    public static String stringifyCollectionsParameters(Map<ByteBuffer, ? extends CollectionType> collections)
     {
         StringBuilder sb = new StringBuilder();
         sb.append('(');
         boolean first = true;
-        for (Map.Entry<ByteBuffer, CollectionType> entry : collections.entrySet())
+        for (Map.Entry<ByteBuffer, ? extends CollectionType> entry : collections.entrySet())
         {
             if (!first)
-            {
                 sb.append(',');
-            }
+
             first = false;
             sb.append(ByteBufferUtil.bytesToHex(entry.getKey())).append(":");
-            entry.getValue().appendToStringBuilder(sb);
+            sb.append(entry.getValue());
         }
         sb.append(')');
         return sb.toString();
     }
 
-    public static String stringifyUserTypeParameters(ByteBuffer typeName, List<ByteBuffer> columnNames, List<AbstractType<?>> columnTypes)
+    public static String stringifyUserTypeParameters(String keysace, ByteBuffer typeName, List<FieldIdentifier> fields,
+                                                     List<AbstractType<?>> columnTypes, boolean ignoreFreezing)
     {
         StringBuilder sb = new StringBuilder();
-        sb.append('(').append(ByteBufferUtil.bytesToHex(typeName));
+        sb.append('(').append(keysace).append(",").append(ByteBufferUtil.bytesToHex(typeName));
 
-        for (int i = 0; i < columnNames.size(); i++)
+        for (int i = 0; i < fields.size(); i++)
         {
             sb.append(',');
-            sb.append(ByteBufferUtil.bytesToHex(columnNames.get(i))).append(":");
-            sb.append(columnTypes.get(i).toString());
+            sb.append(ByteBufferUtil.bytesToHex(fields.get(i).bytes)).append(":");
+            sb.append(columnTypes.get(i).toString(ignoreFreezing));
         }
         sb.append(')');
         return sb.toString();

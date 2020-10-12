@@ -17,38 +17,33 @@
 # code for dealing with CQL's syntax, rules, interpretation
 # i.e., stuff that's not necessarily cqlsh-specific
 
-import re
 import traceback
-from . import pylexotron, util
-from cql import cqltypes
+
+from cassandra.metadata import cql_keywords_reserved
+from cqlshlib import pylexotron, util
 
 Hint = pylexotron.Hint
 
+
 class CqlParsingRuleSet(pylexotron.ParsingRuleSet):
-    keywords = set()
 
     available_compression_classes = (
         'DeflateCompressor',
         'SnappyCompressor',
         'LZ4Compressor',
+        'ZstdCompressor',
     )
 
     available_compaction_classes = (
         'LeveledCompactionStrategy',
-        'SizeTieredCompactionStrategy'
+        'SizeTieredCompactionStrategy',
+        'DateTieredCompactionStrategy',
+        'TimeWindowCompactionStrategy'
     )
 
     replication_strategies = (
         'SimpleStrategy',
-        'OldNetworkTopologyStrategy',
         'NetworkTopologyStrategy'
-    )
-
-    replication_factor_strategies = (
-        'SimpleStrategy',
-        'org.apache.cassandra.locator.SimpleStrategy',
-        'OldNetworkTopologyStrategy',
-        'org.apache.cassandra.locator.OldNetworkTopologyStrategy'
     )
 
     def __init__(self, *args, **kwargs):
@@ -56,7 +51,15 @@ class CqlParsingRuleSet(pylexotron.ParsingRuleSet):
 
         # note: commands_end_with_newline may be extended by callers.
         self.commands_end_with_newline = set()
-        self.set_keywords_as_syntax()
+        self.set_reserved_keywords(cql_keywords_reserved)
+
+    def set_reserved_keywords(self, keywords):
+        """
+        We cannot let resreved cql keywords be simple 'identifier' since this caused
+        problems with completion, see CASSANDRA-10415
+        """
+        syntax = '<reserved_identifier> ::= /(' + '|'.join(r'\b{}\b'.format(k) for k in keywords) + ')/ ;'
+        self.append_rules(syntax)
 
     def completer_for(self, rulename, symname):
         def registrator(f):
@@ -65,7 +68,7 @@ class CqlParsingRuleSet(pylexotron.ParsingRuleSet):
                 if cass is None:
                     return ()
                 return f(ctxt, cass)
-            completerwrapper.func_name = 'completerwrapper_on_' + f.func_name
+            completerwrapper.__name__ = 'completerwrapper_on_' + f.__name__
             self.register_completer(completerwrapper, rulename, symname)
             return completerwrapper
         return registrator
@@ -73,16 +76,12 @@ class CqlParsingRuleSet(pylexotron.ParsingRuleSet):
     def explain_completion(self, rulename, symname, explanation=None):
         if explanation is None:
             explanation = '<%s>' % (symname,)
+
         @self.completer_for(rulename, symname)
         def explainer(ctxt, cass):
             return [Hint(explanation)]
-        return explainer
 
-    def set_keywords_as_syntax(self):
-        syntax = []
-        for k in self.keywords:
-            syntax.append('<K_%s> ::= "%s" ;' % (k.upper(), k))
-        self.append_rules('\n'.join(syntax))
+        return explainer
 
     def cql_massage_tokens(self, toklist):
         curstmt = []
@@ -97,6 +96,13 @@ class CqlParsingRuleSet(pylexotron.ParsingRuleSet):
                 else:
                     # don't put any 'endline' tokens in output
                     continue
+
+            # Convert all unicode tokens to ascii, where possible.  This
+            # helps avoid problems with performing unicode-incompatible
+            # operations on tokens (like .lower()).  See CASSANDRA-9083
+            # for one example of this.
+            str_token = t[1]
+
             curstmt.append(t)
             if t[0] == 'endtoken':
                 term_on_nl = False
@@ -125,17 +131,18 @@ class CqlParsingRuleSet(pylexotron.ParsingRuleSet):
         stmts = util.split_list(tokens, lambda t: t[0] == 'endtoken')
         output = []
         in_batch = False
+        in_pg_string = len([st for st in tokens if len(st) > 0 and st[0] == 'unclosedPgString']) == 1
         for stmt in stmts:
             if in_batch:
                 output[-1].extend(stmt)
             else:
                 output.append(stmt)
             if len(stmt) > 2:
-                if stmt[-3][0] == 'K_APPLY':
+                if stmt[-3][1].upper() == 'APPLY':
                     in_batch = False
-                elif stmt[0][0] == 'K_BEGIN':
+                elif stmt[0][1].upper() == 'BEGIN':
                     in_batch = True
-        return output, in_batch
+        return output, in_batch or in_pg_string
 
     def cql_complete_single(self, text, partial, init_bindings={}, ignore_case=True,
                             startsymbol='Start'):
@@ -185,35 +192,35 @@ class CqlParsingRuleSet(pylexotron.ParsingRuleSet):
             f = lambda s: s and dequoter(s).lower().startswith(partial)
         else:
             f = lambda s: s and dequoter(s).startswith(partial)
-        candidates = filter(f, strcompletes)
+        candidates = list(filter(f, strcompletes))
 
         if prefix is not None:
             # dequote, re-escape, strip quotes: gets us the right quoted text
             # for completion. the opening quote is already there on the command
             # line and not part of the word under completion, and readline
             # fills in the closing quote for us.
-            candidates = [requoter(dequoter(c))[len(prefix)+1:-1] for c in candidates]
+            candidates = [requoter(dequoter(c))[len(prefix) + 1:-1] for c in candidates]
 
             # the above process can result in an empty string; this doesn't help for
             # completions
-            candidates = filter(None, candidates)
+            candidates = [_f for _f in candidates if _f]
 
         # prefix a space when desirable for pleasant cql formatting
         if tokens:
             newcandidates = []
             for c in candidates:
                 if self.want_space_between(tokens[-1], c) \
-                and prefix is None \
-                and not text[-1].isspace() \
-                and not c[0].isspace():
+                        and prefix is None \
+                        and not text[-1].isspace() \
+                        and not c[0].isspace():
                     c = ' ' + c
                 newcandidates.append(c)
             candidates = newcandidates
 
         # append a space for single, complete identifiers
         if len(candidates) == 1 and candidates[0][-1].isalnum()  \
-                                and lasttype != 'unclosedString' \
-                                and lasttype != 'unclosedName':
+                and lasttype != 'unclosedString' \
+                and lasttype != 'unclosedName':
             candidates[0] += ' '
         return candidates, hints
 
@@ -238,7 +245,7 @@ class CqlParsingRuleSet(pylexotron.ParsingRuleSet):
         init_bindings = {'cassandra_conn': cassandra_conn}
         if debug:
             init_bindings['*DEBUG*'] = True
-            print "cql_complete(%r, partial=%r)" % (text, partial)
+            print("cql_complete(%r, partial=%r)" % (text, partial))
 
         completions, hints = self.cql_complete_single(text, partial, init_bindings,
                                                       startsymbol=startsymbol)
@@ -250,12 +257,12 @@ class CqlParsingRuleSet(pylexotron.ParsingRuleSet):
         if len(completions) == 1 and len(hints) == 0:
             c = completions[0]
             if debug:
-                print "** Got one completion: %r. Checking for further matches...\n" % (c,)
+                print("** Got one completion: %r. Checking for further matches...\n" % (c,))
             if not c.isspace():
                 new_c = self.cql_complete_multiple(text, c, init_bindings, startsymbol=startsymbol)
                 completions = [new_c]
             if debug:
-                print "** New list of completions: %r" % (completions,)
+                print("** New list of completions: %r" % (completions,))
 
         return hints + completions
 
@@ -266,18 +273,18 @@ class CqlParsingRuleSet(pylexotron.ParsingRuleSet):
                                                           startsymbol=startsymbol)
         except Exception:
             if debug:
-                print "** completion expansion had a problem:"
+                print("** completion expansion had a problem:")
                 traceback.print_exc()
             return first
         if hints:
             if not first[-1].isspace():
                 first += ' '
             if debug:
-                print "** completion expansion found hints: %r" % (hints,)
+                print("** completion expansion found hints: %r" % (hints,))
             return first
         if len(completions) == 1 and completions[0] != '':
             if debug:
-                print "** Got another completion: %r." % (completions[0],)
+                print("** Got another completion: %r." % (completions[0],))
             if completions[0][0] in (',', ')', ':') and first[-1] == ' ':
                 first = first[:-1]
             first += completions[0]
@@ -288,10 +295,10 @@ class CqlParsingRuleSet(pylexotron.ParsingRuleSet):
             if common_prefix[0] in (',', ')', ':') and first[-1] == ' ':
                 first = first[:-1]
             if debug:
-                print "** Got a partial completion: %r." % (common_prefix,)
-            first += common_prefix
+                print("** Got a partial completion: %r." % (common_prefix,))
+            return first + common_prefix
         if debug:
-            print "** New total completion: %r. Checking for further matches...\n" % (first,)
+            print("** New total completion: %r. Checking for further matches...\n" % (first,))
         return self.cql_complete_multiple(text, first, init_bindings, startsymbol=startsymbol)
 
     @staticmethod
@@ -304,7 +311,7 @@ class CqlParsingRuleSet(pylexotron.ParsingRuleSet):
         if tok[0] == 'unclosedName':
             # strip one quote
             return tok[1][1:].replace('""', '"')
-        if tok[0] == 'stringLiteral':
+        if tok[0] == 'quotedStringLiteral':
             # strip quotes
             return tok[1][1:-1].replace("''", "'")
         if tok[0] == 'unclosedString':

@@ -17,46 +17,118 @@
  */
 package org.apache.cassandra.serializers;
 
+import io.netty.util.concurrent.FastThreadLocal;
+import org.apache.cassandra.db.marshal.ValueAccessor;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
 import java.nio.ByteBuffer;
 import java.text.SimpleDateFormat;
+import java.time.ZoneId;
+import java.time.ZonedDateTime;
+import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeFormatterBuilder;
+import java.time.format.DateTimeParseException;
+import java.time.temporal.ChronoField;
+import java.util.ArrayList;
 import java.util.Date;
+import java.util.List;
+import java.util.TimeZone;
+import java.util.regex.Pattern;
 
-public class TimestampSerializer implements TypeSerializer<Date>
+
+public class TimestampSerializer extends TypeSerializer<Date>
 {
-    public static final String[] iso8601Patterns = new String[] {
-            "yyyy-MM-dd HH:mm",
-            "yyyy-MM-dd HH:mm:ss",
-            "yyyy-MM-dd HH:mmZ",
-            "yyyy-MM-dd HH:mm:ssZ",
-            "yyyy-MM-dd HH:mm:ss.SSS",
-            "yyyy-MM-dd HH:mm:ss.SSSZ",
-            "yyyy-MM-dd'T'HH:mm",
-            "yyyy-MM-dd'T'HH:mmZ",
-            "yyyy-MM-dd'T'HH:mm:ss",
-            "yyyy-MM-dd'T'HH:mm:ssZ",
-            "yyyy-MM-dd'T'HH:mm:ss.SSS",
-            "yyyy-MM-dd'T'HH:mm:ss.SSSZ",
-            "yyyy-MM-dd",
-            "yyyy-MM-ddZ"
-    };
 
-    static final String DEFAULT_FORMAT = iso8601Patterns[3];
+    private static final List<DateTimeFormatter> dateFormatters = generateFormatters();
 
-    static final ThreadLocal<SimpleDateFormat> FORMATTER = new ThreadLocal<SimpleDateFormat>()
+    private static List<DateTimeFormatter> generateFormatters()
+    {
+        List<DateTimeFormatter> formatters = new ArrayList<>();
+
+        final String[] dateTimeFormats = new String[]
+                                         {
+                                         "y-M-d'T'H:m[:s]",
+                                         "y-M-d H:m[:s]"
+                                         };
+        final String[] offsetFormats = new String[]
+                                         {
+                                         " z",
+                                         "X",
+                                         " zzzz",
+                                         "XXX"
+                                         };
+
+        for (String dateTimeFormat: dateTimeFormats)
+        {
+            // local date time
+            formatters.add(
+            new DateTimeFormatterBuilder()
+            .appendPattern(dateTimeFormat)
+            .appendFraction(ChronoField.MILLI_OF_SECOND, 0, 9, true)
+            .toFormatter()
+            .withZone(ZoneId.systemDefault()));
+            for (String offset : offsetFormats)
+            {
+                formatters.add(
+                new DateTimeFormatterBuilder()
+                .appendPattern(dateTimeFormat)
+                .appendFraction(ChronoField.MILLI_OF_SECOND, 0, 9, true)
+                .appendPattern(offset)
+                .toFormatter()
+                );
+            }
+        }
+
+        for (String offset: offsetFormats)
+        {
+            formatters.add(
+            new DateTimeFormatterBuilder()
+            .appendPattern("yyyy-MM-dd")
+            .appendPattern(offset)
+            .parseDefaulting(ChronoField.NANO_OF_DAY, 0)
+            .toFormatter()
+            );
+        }
+
+        // local date
+        formatters.add(
+        new DateTimeFormatterBuilder()
+        .append(DateTimeFormatter.ISO_DATE)
+        .parseDefaulting(ChronoField.NANO_OF_DAY, 0)
+        .toFormatter().withZone(ZoneId.systemDefault()));
+
+        return formatters;
+    }
+
+    private static final Pattern timestampPattern = Pattern.compile("^-?\\d+$");
+
+    private static final FastThreadLocal<SimpleDateFormat> FORMATTER_UTC = new FastThreadLocal<SimpleDateFormat>()
     {
         protected SimpleDateFormat initialValue()
         {
-            return new SimpleDateFormat(DEFAULT_FORMAT);
+            SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSSX");
+            sdf.setTimeZone(TimeZone.getTimeZone("UTC"));
+            return sdf;
         }
     };
 
+    private static final FastThreadLocal<SimpleDateFormat> FORMATTER_TO_JSON = new FastThreadLocal<SimpleDateFormat>()
+    {
+        protected SimpleDateFormat initialValue()
+        {
+            SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSSX");
+            sdf.setTimeZone(TimeZone.getTimeZone("UTC"));
+            return sdf;
+        }
+    };
+
+
+
     public static final TimestampSerializer instance = new TimestampSerializer();
 
-    public Date deserialize(ByteBuffer bytes)
+    public <V> Date deserialize(V value, ValueAccessor<V> accessor)
     {
-        return bytes.remaining() == 0 ? null : new Date(ByteBufferUtil.toLong(bytes));
+        return accessor.isEmpty(value) ? null : new Date(accessor.toLong(value));
     }
 
     public ByteBuffer serialize(Date value)
@@ -64,19 +136,73 @@ public class TimestampSerializer implements TypeSerializer<Date>
         return value == null ? ByteBufferUtil.EMPTY_BYTE_BUFFER : ByteBufferUtil.bytes(value.getTime());
     }
 
-    public void validate(ByteBuffer bytes) throws MarshalException
+    public static long dateStringToTimestamp(String source) throws MarshalException
     {
-        if (bytes.remaining() != 8 && bytes.remaining() != 0)
-            throw new MarshalException(String.format("Expected 8 or 0 byte long for date (%d)", bytes.remaining()));
+        if (source.equalsIgnoreCase("now"))
+            return System.currentTimeMillis();
+
+        // Milliseconds since epoch?
+        if (timestampPattern.matcher(source).matches())
+        {
+            try
+            {
+                return Long.parseLong(source);
+            }
+            catch (NumberFormatException e)
+            {
+                throw new MarshalException(String.format("Unable to make long (for date) from: '%s'", source), e);
+            }
+        }
+
+        for (DateTimeFormatter fmt: dateFormatters)
+        {
+            try
+            {
+                return ZonedDateTime.parse(source, fmt).toInstant().toEpochMilli();
+            }
+            catch (DateTimeParseException e)
+            {
+                continue;
+            }
+        }
+        throw new MarshalException(String.format("Unable to parse a date/time from '%s'", source));
+    }
+
+    public static SimpleDateFormat getJsonDateFormatter()
+    {
+    	return FORMATTER_TO_JSON.get();
+    }
+
+    public <V> void validate(V value, ValueAccessor<V> accessor) throws MarshalException
+    {
+        if (accessor.size(value) != 8 && !accessor.isEmpty(value))
+            throw new MarshalException(String.format("Expected 8 or 0 byte long for date (%d)", accessor.size(value)));
     }
 
     public String toString(Date value)
     {
-        return FORMATTER.get().format(value);
+        return toStringUTC(value);
+    }
+
+    public String toStringUTC(Date value)
+    {
+        return value == null ? "" : FORMATTER_UTC.get().format(value);
     }
 
     public Class<Date> getType()
     {
         return Date.class;
+    }
+
+    /**
+     * Builds CQL literal for a timestamp using time zone UTC and fixed date format.
+     * @see #FORMATTER_UTC
+     */
+    @Override
+    public String toCQLLiteral(ByteBuffer buffer)
+    {
+        return buffer == null || !buffer.hasRemaining()
+               ? "null"
+               : FORMATTER_UTC.get().format(deserialize(buffer));
     }
 }

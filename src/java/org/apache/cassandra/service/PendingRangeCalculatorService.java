@@ -18,69 +18,92 @@
 
 package org.apache.cassandra.service;
 
-import org.apache.cassandra.utils.BiMultiValMap;
-import com.google.common.collect.HashMultimap;
-import com.google.common.collect.ImmutableSet;
-import com.google.common.collect.Multimap;
-import com.google.common.collect.Sets;
-
 import org.apache.cassandra.concurrent.JMXEnabledThreadPoolExecutor;
 import org.apache.cassandra.concurrent.NamedThreadFactory;
-import org.apache.cassandra.config.Schema;
+import org.apache.cassandra.schema.Schema;
 import org.apache.cassandra.db.Keyspace;
-import org.apache.cassandra.dht.Range;
-import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.locator.AbstractReplicationStrategy;
-import org.apache.cassandra.locator.TokenMetadata;
-import org.apache.cassandra.utils.Pair;
+import org.apache.cassandra.utils.ExecutorUtils;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.net.InetAddress;
-import java.util.HashSet;
-import java.util.Map;
-import java.util.Set;
-import java.util.Collection;
+import java.util.List;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
 
+import com.google.common.annotations.VisibleForTesting;
 
-public class PendingRangeCalculatorService extends PendingRangeCalculatorServiceMBean
+public class PendingRangeCalculatorService
 {
     public static final PendingRangeCalculatorService instance = new PendingRangeCalculatorService();
 
     private static Logger logger = LoggerFactory.getLogger(PendingRangeCalculatorService.class);
+
+    // the executor will only run a single range calculation at a time while keeping at most one task queued in order
+    // to trigger an update only after the most recent state change and not for each update individually
     private final JMXEnabledThreadPoolExecutor executor = new JMXEnabledThreadPoolExecutor(1, Integer.MAX_VALUE, TimeUnit.SECONDS,
-            new LinkedBlockingQueue<Runnable>(1), new NamedThreadFactory("PendingRangeCalculator"), "internal");
+            new LinkedBlockingQueue<>(1), new NamedThreadFactory("PendingRangeCalculator"), "internal");
+
+    private AtomicInteger updateJobs = new AtomicInteger(0);
 
     public PendingRangeCalculatorService()
     {
-        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.DiscardPolicy());
+        executor.setRejectedExecutionHandler((r, e) ->
+            {
+                PendingRangeCalculatorServiceDiagnostics.taskRejected(instance, updateJobs);
+                PendingRangeCalculatorService.instance.finishUpdate();
+            }
+        );
     }
 
     private static class PendingRangeTask implements Runnable
     {
+        private final AtomicInteger updateJobs;
+
+        PendingRangeTask(AtomicInteger updateJobs)
+        {
+            this.updateJobs = updateJobs;
+        }
+
         public void run()
         {
-            long start = System.currentTimeMillis();
-            for (String keyspaceName : Schema.instance.getNonSystemKeyspaces())
+            try
             {
-                calculatePendingRanges(Keyspace.open(keyspaceName).getReplicationStrategy(), keyspaceName);
+                PendingRangeCalculatorServiceDiagnostics.taskStarted(instance, updateJobs);
+                long start = System.currentTimeMillis();
+                List<String> keyspaces = Schema.instance.getNonLocalStrategyKeyspaces();
+                for (String keyspaceName : keyspaces)
+                    calculatePendingRanges(Keyspace.open(keyspaceName).getReplicationStrategy(), keyspaceName);
+                if (logger.isTraceEnabled())
+                    logger.trace("Finished PendingRangeTask for {} keyspaces in {}ms", keyspaces.size(), System.currentTimeMillis() - start);
+                PendingRangeCalculatorServiceDiagnostics.taskFinished(instance, updateJobs);
             }
-            logger.debug("finished calculation for {} keyspaces in {}ms", Schema.instance.getNonSystemKeyspaces().size(), System.currentTimeMillis() - start);
+            finally
+            {
+                PendingRangeCalculatorService.instance.finishUpdate();
+            }
         }
     }
 
-    public Future<?> update()
+    private void finishUpdate()
     {
-        return executor.submit(new PendingRangeTask());
+        int jobs = updateJobs.decrementAndGet();
+        PendingRangeCalculatorServiceDiagnostics.taskCountChanged(instance, jobs);
+    }
+
+    public void update()
+    {
+        int jobs = updateJobs.incrementAndGet();
+        PendingRangeCalculatorServiceDiagnostics.taskCountChanged(instance, jobs);
+        executor.execute(new PendingRangeTask(updateJobs));
     }
 
     public void blockUntilFinished()
     {
-        while (true)
+        // We want to be sure the job we're blocking for is actually finished and we can't trust the TPE's active job count
+        while (updateJobs.get() > 0)
         {
-            if (executor.getActiveCount() + executor.getPendingTasks() == 0)
-                break;
             try
             {
                 Thread.sleep(100);
@@ -92,116 +115,16 @@ public class PendingRangeCalculatorService extends PendingRangeCalculatorService
         }
     }
 
-    /**
-     * Calculate pending ranges according to bootsrapping and leaving nodes. Reasoning is:
-     *
-     * (1) When in doubt, it is better to write too much to a node than too little. That is, if
-     * there are multiple nodes moving, calculate the biggest ranges a node could have. Cleaning
-     * up unneeded data afterwards is better than missing writes during movement.
-     * (2) When a node leaves, ranges for other nodes can only grow (a node might get additional
-     * ranges, but it will not lose any of its current ranges as a result of a leave). Therefore
-     * we will first remove _all_ leaving tokens for the sake of calculation and then check what
-     * ranges would go where if all nodes are to leave. This way we get the biggest possible
-     * ranges with regard current leave operations, covering all subsets of possible final range
-     * values.
-     * (3) When a node bootstraps, ranges of other nodes can only get smaller. Without doing
-     * complex calculations to see if multiple bootstraps overlap, we simply base calculations
-     * on the same token ring used before (reflecting situation after all leave operations have
-     * completed). Bootstrapping nodes will be added and removed one by one to that metadata and
-     * checked what their ranges would be. This will give us the biggest possible ranges the
-     * node could have. It might be that other bootstraps make our actual final ranges smaller,
-     * but it does not matter as we can clean up the data afterwards.
-     *
-     * NOTE: This is heavy and ineffective operation. This will be done only once when a node
-     * changes state in the cluster, so it should be manageable.
-     */
+
     // public & static for testing purposes
     public static void calculatePendingRanges(AbstractReplicationStrategy strategy, String keyspaceName)
     {
-        TokenMetadata tm = StorageService.instance.getTokenMetadata();
-        Multimap<Range<Token>, InetAddress> pendingRanges = HashMultimap.create();
-        BiMultiValMap<Token, InetAddress> bootstrapTokens = tm.getBootstrapTokens();
-        Set<InetAddress> leavingEndpoints = tm.getLeavingEndpoints();
+        StorageService.instance.getTokenMetadata().calculatePendingRanges(strategy, keyspaceName);
+    }
 
-        if (bootstrapTokens.isEmpty() && leavingEndpoints.isEmpty() && tm.getMovingEndpoints().isEmpty() && tm.getRelocatingRanges().isEmpty())
-        {
-            if (logger.isDebugEnabled())
-                logger.debug("No bootstrapping, leaving or moving nodes, and no relocating tokens -> empty pending ranges for {}", keyspaceName);
-            tm.setPendingRanges(keyspaceName, pendingRanges);
-            return;
-        }
-
-        Multimap<InetAddress, Range<Token>> addressRanges = strategy.getAddressRanges();
-
-        // Copy of metadata reflecting the situation after all leave operations are finished.
-        TokenMetadata allLeftMetadata = tm.cloneAfterAllLeft();
-
-        // get all ranges that will be affected by leaving nodes
-        Set<Range<Token>> affectedRanges = new HashSet<Range<Token>>();
-        for (InetAddress endpoint : leavingEndpoints)
-            affectedRanges.addAll(addressRanges.get(endpoint));
-
-        // for each of those ranges, find what new nodes will be responsible for the range when
-        // all leaving nodes are gone.
-        for (Range<Token> range : affectedRanges)
-        {
-            Set<InetAddress> currentEndpoints = ImmutableSet.copyOf(strategy.calculateNaturalEndpoints(range.right, tm.cloneOnlyTokenMap()));
-            Set<InetAddress> newEndpoints = ImmutableSet.copyOf(strategy.calculateNaturalEndpoints(range.right, allLeftMetadata));
-            pendingRanges.putAll(range, Sets.difference(newEndpoints, currentEndpoints));
-        }
-
-        // At this stage pendingRanges has been updated according to leave operations. We can
-        // now continue the calculation by checking bootstrapping nodes.
-
-        // For each of the bootstrapping nodes, simply add and remove them one by one to
-        // allLeftMetadata and check in between what their ranges would be.
-        for (InetAddress endpoint : bootstrapTokens.inverse().keySet())
-        {
-            Collection<Token> tokens = bootstrapTokens.inverse().get(endpoint);
-
-            allLeftMetadata.updateNormalTokens(tokens, endpoint);
-            for (Range<Token> range : strategy.getAddressRanges(allLeftMetadata).get(endpoint))
-                pendingRanges.put(range, endpoint);
-            allLeftMetadata.removeEndpoint(endpoint);
-        }
-
-        // At this stage pendingRanges has been updated according to leaving and bootstrapping nodes.
-        // We can now finish the calculation by checking moving and relocating nodes.
-
-        // For each of the moving nodes, we do the same thing we did for bootstrapping:
-        // simply add and remove them one by one to allLeftMetadata and check in between what their ranges would be.
-        for (Pair<Token, InetAddress> moving : tm.getMovingEndpoints())
-        {
-            InetAddress endpoint = moving.right; // address of the moving node
-
-            //  moving.left is a new token of the endpoint
-            allLeftMetadata.updateNormalToken(moving.left, endpoint);
-
-            for (Range<Token> range : strategy.getAddressRanges(allLeftMetadata).get(endpoint))
-            {
-                pendingRanges.put(range, endpoint);
-            }
-
-            allLeftMetadata.removeEndpoint(endpoint);
-        }
-
-        // Ranges being relocated.
-        for (Map.Entry<Token, InetAddress> relocating : tm.getRelocatingRanges().entrySet())
-        {
-            InetAddress endpoint = relocating.getValue(); // address of the moving node
-            Token token = relocating.getKey();
-
-            allLeftMetadata.updateNormalToken(token, endpoint);
-
-            for (Range<Token> range : strategy.getAddressRanges(allLeftMetadata).get(endpoint))
-                pendingRanges.put(range, endpoint);
-
-            allLeftMetadata.removeEndpoint(endpoint);
-        }
-
-        tm.setPendingRanges(keyspaceName, pendingRanges);
-
-        if (logger.isDebugEnabled())
-            logger.debug("Pending ranges:\n" + (pendingRanges.isEmpty() ? "<empty>" : tm.printPendingRanges()));
+    @VisibleForTesting
+    public void shutdownAndWait(long timeout, TimeUnit unit) throws InterruptedException, TimeoutException
+    {
+        ExecutorUtils.shutdownNowAndWait(timeout, unit, executor);
     }
 }

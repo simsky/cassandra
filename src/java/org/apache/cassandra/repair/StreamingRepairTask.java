@@ -17,69 +17,78 @@
  */
 package org.apache.cassandra.repair;
 
+import java.util.UUID;
+import java.util.Collections;
+import java.util.Collection;
+
+import com.google.common.annotations.VisibleForTesting;
+import org.apache.cassandra.locator.RangesAtEndpoint;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.net.Message;
 import org.apache.cassandra.net.MessagingService;
-import org.apache.cassandra.repair.messages.SyncComplete;
-import org.apache.cassandra.repair.messages.SyncRequest;
-import org.apache.cassandra.streaming.*;
-import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.repair.messages.SyncResponse;
+import org.apache.cassandra.streaming.PreviewKind;
+import org.apache.cassandra.streaming.StreamEvent;
+import org.apache.cassandra.streaming.StreamEventHandler;
+import org.apache.cassandra.streaming.StreamPlan;
+import org.apache.cassandra.streaming.StreamState;
+import org.apache.cassandra.streaming.StreamOperation;
+
+import static org.apache.cassandra.net.Verb.SYNC_RSP;
 
 /**
- * Task that make two nodes exchange (stream) some ranges (for a given table/cf).
- * This handle the case where the local node is neither of the two nodes that
- * must stream their range, and allow to register a callback to be called on
- * completion.
+ * StreamingRepairTask performs data streaming between two remote replicas, neither of which is repair coordinator.
+ * Task will send {@link SyncResponse} message back to coordinator upon streaming completion.
  */
 public class StreamingRepairTask implements Runnable, StreamEventHandler
 {
     private static final Logger logger = LoggerFactory.getLogger(StreamingRepairTask.class);
 
-    /** Repair session ID that this streaming task belongs */
-    public final RepairJobDesc desc;
-    public final SyncRequest request;
+    private final RepairJobDesc desc;
+    private final boolean asymmetric;
+    private final InetAddressAndPort initiator;
+    private final InetAddressAndPort src;
+    private final InetAddressAndPort dst;
+    private final Collection<Range<Token>> ranges;
+    private final UUID pendingRepair;
+    private final PreviewKind previewKind;
 
-    public StreamingRepairTask(RepairJobDesc desc, SyncRequest request)
+    public StreamingRepairTask(RepairJobDesc desc, InetAddressAndPort initiator, InetAddressAndPort src, InetAddressAndPort dst, Collection<Range<Token>> ranges,  UUID pendingRepair, PreviewKind previewKind, boolean asymmetric)
     {
         this.desc = desc;
-        this.request = request;
-    }
-
-    /**
-     * Returns true if the task if the task can be executed locally, false if
-     * it has to be forwarded.
-     */
-    public boolean isLocalTask()
-    {
-        return request.initiator.equals(request.src);
+        this.initiator = initiator;
+        this.src = src;
+        this.dst = dst;
+        this.ranges = ranges;
+        this.asymmetric = asymmetric;
+        this.pendingRepair = pendingRepair;
+        this.previewKind = previewKind;
     }
 
     public void run()
     {
-        if (request.src.equals(FBUtilities.getBroadcastAddress()))
-            initiateStreaming();
-        else
-            forwardToSource();
+        logger.info("[streaming task #{}] Performing streaming repair of {} ranges with {}", desc.sessionId, ranges.size(), dst);
+        createStreamPlan(dst).execute();
     }
 
-    private void initiateStreaming()
+    @VisibleForTesting
+    StreamPlan createStreamPlan(InetAddressAndPort dest)
     {
-        logger.info(String.format("[streaming task #%s] Performing streaming repair of %d ranges with %s", desc.sessionId, request.ranges.size(), request.dst));
-        StreamResultFuture op = new StreamPlan("Repair")
-                                    .flushBeforeTransfer(true)
-                                    // request ranges from the remote node
-                                    .requestRanges(request.dst, desc.keyspace, request.ranges, desc.columnFamily)
-                                    // send ranges to the remote node
-                                    .transferRanges(request.dst, desc.keyspace, request.ranges, desc.columnFamily)
-                                    .execute();
-        op.addEventListener(this);
-    }
-
-    private void forwardToSource()
-    {
-        logger.info(String.format("[repair #%s] Forwarding streaming repair of %d ranges to %s (to be streamed with %s)", desc.sessionId, request.ranges.size(), request.src, request.dst));
-        MessagingService.instance().sendOneWay(request.createMessage(), request.src);
+        StreamPlan sp = new StreamPlan(StreamOperation.REPAIR, 1, false, pendingRepair, previewKind)
+               .listeners(this)
+               .flushBeforeTransfer(pendingRepair == null) // sstables are isolated at the beginning of an incremental repair session, so flushing isn't neccessary
+               // see comment on RangesAtEndpoint.toDummyList for why we synthesize replicas here
+               .requestRanges(dest, desc.keyspace, RangesAtEndpoint.toDummyList(ranges),
+                       RangesAtEndpoint.toDummyList(Collections.emptyList()), desc.columnFamily); // request ranges from the remote node
+        if (!asymmetric)
+            // see comment on RangesAtEndpoint.toDummyList for why we synthesize replicas here
+            sp.transferRanges(dest, desc.keyspace, RangesAtEndpoint.toDummyList(ranges), desc.columnFamily); // send ranges to the remote node
+        return sp;
     }
 
     public void handleStreamEvent(StreamEvent event)
@@ -89,19 +98,19 @@ public class StreamingRepairTask implements Runnable, StreamEventHandler
     }
 
     /**
-     * If we succeeded on both stream in and out, reply back to the initiator.
+     * If we succeeded on both stream in and out, respond back to coordinator
      */
     public void onSuccess(StreamState state)
     {
-        logger.info(String.format("[repair #%s] streaming task succeed, returning response to %s", desc.sessionId, request.initiator));
-        MessagingService.instance().sendOneWay(new SyncComplete(desc, request.src, request.dst, true).createMessage(), request.initiator);
+        logger.info("[repair #{}] streaming task succeed, returning response to {}", desc.sessionId, initiator);
+        MessagingService.instance().send(Message.out(SYNC_RSP, new SyncResponse(desc, src, dst, true, state.createSummaries())), initiator);
     }
 
     /**
-     * If we failed on either stream in or out, reply fail to the initiator.
+     * If we failed on either stream in or out, respond fail to coordinator
      */
     public void onFailure(Throwable t)
     {
-        MessagingService.instance().sendOneWay(new SyncComplete(desc, request.src, request.dst, false).createMessage(), request.initiator);
+        MessagingService.instance().send(Message.out(SYNC_RSP, new SyncResponse(desc, src, dst, false, Collections.emptyList())), initiator);
     }
 }

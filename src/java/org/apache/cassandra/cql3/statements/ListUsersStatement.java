@@ -17,31 +17,56 @@
  */
 package org.apache.cassandra.cql3.statements;
 
-import org.apache.cassandra.auth.Auth;
-import org.apache.cassandra.cql3.QueryProcessor;
-import org.apache.cassandra.db.ConsistencyLevel;
-import org.apache.cassandra.exceptions.RequestExecutionException;
-import org.apache.cassandra.exceptions.RequestValidationException;
-import org.apache.cassandra.exceptions.UnauthorizedException;
-import org.apache.cassandra.service.ClientState;
-import org.apache.cassandra.service.QueryState;
+import java.util.List;
+
+import com.google.common.collect.ImmutableList;
+
+import org.apache.cassandra.auth.*;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.schema.SchemaConstants;
+import org.apache.cassandra.cql3.ColumnIdentifier;
+import org.apache.cassandra.cql3.ColumnSpecification;
+import org.apache.cassandra.cql3.ResultSet;
+import org.apache.cassandra.db.marshal.BooleanType;
+import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.transport.messages.ResultMessage;
+import org.apache.commons.lang3.builder.ToStringBuilder;
+import org.apache.commons.lang3.builder.ToStringStyle;
 
-public class ListUsersStatement extends AuthenticationStatement
+public class ListUsersStatement extends ListRolesStatement
 {
-    public void validate(ClientState state)
-    {
-    }
+    // pseudo-virtual cf as the actual datasource is dependent on the IRoleManager impl
+    private static final String KS = SchemaConstants.AUTH_KEYSPACE_NAME;
+    private static final String CF = "users";
 
-    public void checkAccess(ClientState state) throws UnauthorizedException
-    {
-        state.ensureNotAnonymous();
-    }
+    private static final List<ColumnSpecification> metadata =
+        ImmutableList.of(new ColumnSpecification(KS, CF, new ColumnIdentifier("name", true), UTF8Type.instance),
+                         new ColumnSpecification(KS, CF, new ColumnIdentifier("super", true), BooleanType.instance),
+                         new ColumnSpecification(KS, CF, new ColumnIdentifier("datacenters", true), UTF8Type.instance));
 
-    public ResultMessage execute(ClientState state) throws RequestValidationException, RequestExecutionException
+    @Override
+    protected ResultMessage formatResults(List<RoleResource> sortedRoles)
     {
-        return QueryProcessor.process(String.format("SELECT * FROM %s.%s", Auth.AUTH_KS, Auth.USERS_CF),
-                                      ConsistencyLevel.QUORUM,
-                                      QueryState.forInternalCalls());
+        ResultSet.ResultMetadata resultMetadata = new ResultSet.ResultMetadata(metadata);
+        ResultSet result = new ResultSet(resultMetadata);
+
+        IRoleManager roleManager = DatabaseDescriptor.getRoleManager();
+        INetworkAuthorizer networkAuthorizer = DatabaseDescriptor.getNetworkAuthorizer();
+        for (RoleResource role : sortedRoles)
+        {
+            if (!roleManager.canLogin(role))
+                continue;
+            result.addColumnValue(UTF8Type.instance.decompose(role.getRoleName()));
+            result.addColumnValue(BooleanType.instance.decompose(Roles.hasSuperuserStatus(role)));
+            result.addColumnValue(UTF8Type.instance.decompose(networkAuthorizer.authorize(role).toString()));
+        }
+
+        return new ResultMessage.Rows(result);
+    }
+    
+    @Override
+    public String toString()
+    {
+        return ToStringBuilder.reflectionToString(this, ToStringStyle.SHORT_PREFIX_STYLE);
     }
 }

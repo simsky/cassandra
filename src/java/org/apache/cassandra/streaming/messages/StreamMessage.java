@@ -18,11 +18,16 @@
 package org.apache.cassandra.streaming.messages;
 
 import java.io.IOException;
-import java.nio.ByteBuffer;
-import java.nio.channels.ReadableByteChannel;
-import java.nio.channels.WritableByteChannel;
+import java.util.HashMap;
+import java.util.Map;
 
+import io.netty.channel.Channel;
+
+import org.apache.cassandra.io.util.DataInputPlus;
+import org.apache.cassandra.io.util.DataOutputStreamPlus;
 import org.apache.cassandra.streaming.StreamSession;
+
+import static java.lang.Math.max;
 
 /**
  * StreamMessage is an abstract base class that every messages in streaming protocol inherit.
@@ -31,73 +36,86 @@ import org.apache.cassandra.streaming.StreamSession;
  */
 public abstract class StreamMessage
 {
-    /** Streaming protocol version */
-    public static final int CURRENT_VERSION = 1;
-
-    public static void serialize(StreamMessage message, WritableByteChannel out, int version, StreamSession session) throws IOException
+    public static void serialize(StreamMessage message, DataOutputStreamPlus out, int version, StreamSession session) throws IOException
     {
-        ByteBuffer buff = ByteBuffer.allocate(1);
-        // message type
-        buff.put(message.type.type);
-        buff.flip();
-        out.write(buff);
-        message.type.serializer.serialize(message, out, version, session);
+        out.writeByte(message.type.id);
+        message.type.outSerializer.serialize(message, out, version, session);
     }
 
-    public static StreamMessage deserialize(ReadableByteChannel in, int version, StreamSession session) throws IOException
+    public static long serializedSize(StreamMessage message, int version) throws IOException
     {
-        ByteBuffer buff = ByteBuffer.allocate(1);
-        if (in.read(buff) > 0)
-        {
-            buff.flip();
-            Type type = Type.get(buff.get());
-            return type.serializer.deserialize(in, version, session);
-        }
-        else
-        {
-            // when socket gets closed, there is a chance that buff is empty
-            // in that case, just return null
-            return null;
-        }
+        return 1 + message.type.outSerializer.serializedSize(message, version);
+    }
+
+    public static StreamMessage deserialize(DataInputPlus in, int version) throws IOException
+    {
+        Type type = Type.lookupById(in.readByte());
+        return type.inSerializer.deserialize(in, version);
     }
 
     /** StreamMessage serializer */
     public static interface Serializer<V extends StreamMessage>
     {
-        V deserialize(ReadableByteChannel in, int version, StreamSession session) throws IOException;
-        void serialize(V message, WritableByteChannel out, int version, StreamSession session) throws IOException;
+        V deserialize(DataInputPlus in, int version) throws IOException;
+        void serialize(V message, DataOutputStreamPlus out, int version, StreamSession session) throws IOException;
+        long serializedSize(V message, int version) throws IOException;
     }
 
     /** StreamMessage types */
-    public static enum Type
+    public enum Type
     {
-        PREPARE(1, 5, PrepareMessage.serializer),
-        FILE(2, 0, FileMessage.serializer),
-        RECEIVED(3, 4, ReceivedMessage.serializer),
-        RETRY(4, 4, RetryMessage.serializer),
-        COMPLETE(5, 1, CompleteMessage.serializer),
-        SESSION_FAILED(6, 5, SessionFailedMessage.serializer);
+        PREPARE_SYN    (1,  5, PrepareSynMessage.serializer   ),
+        STREAM         (2,  0, IncomingStreamMessage.serializer, OutgoingStreamMessage.serializer),
+        RECEIVED       (3,  4, ReceivedMessage.serializer     ),
+        COMPLETE       (5,  1, CompleteMessage.serializer     ),
+        SESSION_FAILED (6,  5, SessionFailedMessage.serializer),
+        KEEP_ALIVE     (7,  5, KeepAliveMessage.serializer    ),
+        PREPARE_SYNACK (8,  5, PrepareSynAckMessage.serializer),
+        PREPARE_ACK    (9,  5, PrepareAckMessage.serializer   ),
+        STREAM_INIT    (10, 5, StreamInitMessage.serializer   );
 
-        public static Type get(byte type)
+        private static final Map<Integer, Type> idToTypeMap;
+
+        static
         {
-            for (Type t : Type.values())
+            idToTypeMap = new HashMap<>();
+            for (Type t : values())
             {
-                if (t.type == type)
-                    return t;
+                if (idToTypeMap.put(t.id, t) != null)
+                    throw new RuntimeException("Two StreamMessage Types map to the same id: " + t.id);
             }
-            throw new IllegalArgumentException("Unknown type " + type);
         }
 
-        private final byte type;
+        public static Type lookupById(int id)
+        {
+            Type t = idToTypeMap.get(id);
+            if (t == null)
+                throw new IllegalArgumentException("Invalid type id: " + id);
+
+            return t;
+        }
+
+        public final int id;
         public final int priority;
-        public final Serializer<StreamMessage> serializer;
+
+        public final Serializer<StreamMessage> inSerializer;
+        public final Serializer<StreamMessage> outSerializer;
+
+        Type(int id, int priority, Serializer serializer)
+        {
+            this(id, priority, serializer, serializer);
+        }
 
         @SuppressWarnings("unchecked")
-        private Type(int type, int priority, Serializer serializer)
+        Type(int id, int priority, Serializer inSerializer, Serializer outSerializer)
         {
-            this.type = (byte) type;
+            if (id < 0 || id > Byte.MAX_VALUE)
+                throw new IllegalArgumentException("StreamMessage Type id must be non-negative and less than " + Byte.MAX_VALUE);
+
+            this.id = id;
             this.priority = priority;
-            this.serializer = serializer;
+            this.inSerializer = inSerializer;
+            this.outSerializer = outSerializer;
         }
     }
 
@@ -114,5 +132,14 @@ public abstract class StreamMessage
     public int getPriority()
     {
         return type.priority;
+    }
+
+    /**
+     * Get or create a {@link StreamSession} based on this stream message data: not all stream messages support this,
+     * so the default implementation just throws an exception.
+     */
+    public StreamSession getOrCreateSession(Channel channel)
+    {
+        throw new UnsupportedOperationException("Not supported by streaming messages of type: " + this.getClass());
     }
 }

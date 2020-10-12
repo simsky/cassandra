@@ -18,15 +18,18 @@
 package org.apache.cassandra.gms;
 
 import java.io.*;
-import java.util.Map;
+import java.util.*;
+import java.util.concurrent.atomic.AtomicReference;
+
+import javax.annotation.Nullable;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
 import org.apache.cassandra.db.TypeSizes;
 import org.apache.cassandra.io.IVersionedSerializer;
-
-import org.cliffc.high_scale_lib.NonBlockingHashMap;
+import org.apache.cassandra.io.util.DataInputPlus;
+import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.utils.CassandraVersion;
 
 /**
  * This abstraction represents both the HeartBeatState and the ApplicationState in an EndpointState
@@ -41,15 +44,21 @@ public class EndpointState
     public final static IVersionedSerializer<EndpointState> serializer = new EndpointStateSerializer();
 
     private volatile HeartBeatState hbState;
-    final Map<ApplicationState, VersionedValue> applicationState = new NonBlockingHashMap<ApplicationState, VersionedValue>();
+    private final AtomicReference<Map<ApplicationState, VersionedValue>> applicationState;
 
     /* fields below do not get serialized */
     private volatile long updateTimestamp;
     private volatile boolean isAlive;
 
-    EndpointState(HeartBeatState initialHbState)
+    public EndpointState(HeartBeatState initialHbState)
+    {
+        this(initialHbState, new EnumMap<ApplicationState, VersionedValue>(ApplicationState.class));
+    }
+
+    EndpointState(HeartBeatState initialHbState, Map<ApplicationState, VersionedValue> states)
     {
         hbState = initialHbState;
+        applicationState = new AtomicReference<Map<ApplicationState, VersionedValue>>(new EnumMap<>(states));
         updateTimestamp = System.nanoTime();
         isAlive = true;
     }
@@ -67,21 +76,37 @@ public class EndpointState
 
     public VersionedValue getApplicationState(ApplicationState key)
     {
-        return applicationState.get(key);
+        return applicationState.get().get(key);
     }
 
-    /**
-     * TODO replace this with operations that don't expose private state
-     */
-    @Deprecated
-    public Map<ApplicationState, VersionedValue> getApplicationStateMap()
+    public Set<Map.Entry<ApplicationState, VersionedValue>> states()
     {
-        return applicationState;
+        return applicationState.get().entrySet();
     }
 
-    void addApplicationState(ApplicationState key, VersionedValue value)
+    public void addApplicationState(ApplicationState key, VersionedValue value)
     {
-        applicationState.put(key, value);
+        addApplicationStates(Collections.singletonMap(key, value));
+    }
+
+    public void addApplicationStates(Map<ApplicationState, VersionedValue> values)
+    {
+        addApplicationStates(values.entrySet());
+    }
+
+    public void addApplicationStates(Set<Map.Entry<ApplicationState, VersionedValue>> values)
+    {
+        while (true)
+        {
+            Map<ApplicationState, VersionedValue> orig = applicationState.get();
+            Map<ApplicationState, VersionedValue> copy = new EnumMap<>(orig);
+
+            for (Map.Entry<ApplicationState, VersionedValue> value : values)
+                copy.put(value.getKey(), value.getValue());
+
+            if (applicationState.compareAndSet(orig, copy))
+                return;
+        }
     }
 
     /* getters and setters */
@@ -113,54 +138,102 @@ public class EndpointState
         isAlive = false;
     }
 
+    public boolean isRpcReady()
+    {
+        VersionedValue rpcState = getApplicationState(ApplicationState.RPC_READY);
+        return rpcState != null && Boolean.parseBoolean(rpcState.value);
+    }
+
+    public boolean isNormalState()
+    {
+        return getStatus().equals(VersionedValue.STATUS_NORMAL);
+    }
+
+    public String getStatus()
+    {
+        VersionedValue status = getApplicationState(ApplicationState.STATUS_WITH_PORT);
+        if (status == null)
+        {
+            status = getApplicationState(ApplicationState.STATUS);
+        }
+        if (status == null)
+        {
+            return "";
+        }
+
+        String[] pieces = status.value.split(VersionedValue.DELIMITER_STR, -1);
+        assert (pieces.length > 0);
+        return pieces[0];
+    }
+
+    @Nullable
+    public UUID getSchemaVersion()
+    {
+        VersionedValue applicationState = getApplicationState(ApplicationState.SCHEMA);
+        return applicationState != null
+               ? UUID.fromString(applicationState.value)
+               : null;
+    }
+
+    @Nullable
+    public CassandraVersion getReleaseVersion()
+    {
+        VersionedValue applicationState = getApplicationState(ApplicationState.RELEASE_VERSION);
+        return applicationState != null
+               ? new CassandraVersion(applicationState.value)
+               : null;
+    }
+
     public String toString()
     {
-        return "EndpointState: HeartBeatState = " + hbState + ", AppStateMap = " + applicationState;
+        return "EndpointState: HeartBeatState = " + hbState + ", AppStateMap = " + applicationState.get();
     }
 }
 
 class EndpointStateSerializer implements IVersionedSerializer<EndpointState>
 {
-    public void serialize(EndpointState epState, DataOutput out, int version) throws IOException
+    public void serialize(EndpointState epState, DataOutputPlus out, int version) throws IOException
     {
         /* serialize the HeartBeatState */
         HeartBeatState hbState = epState.getHeartBeatState();
         HeartBeatState.serializer.serialize(hbState, out, version);
 
         /* serialize the map of ApplicationState objects */
-        int size = epState.applicationState.size();
-        out.writeInt(size);
-        for (Map.Entry<ApplicationState, VersionedValue> entry : epState.applicationState.entrySet())
+        Set<Map.Entry<ApplicationState, VersionedValue>> states = epState.states();
+        out.writeInt(states.size());
+        for (Map.Entry<ApplicationState, VersionedValue> state : states)
         {
-            VersionedValue value = entry.getValue();
-            out.writeInt(entry.getKey().ordinal());
+            VersionedValue value = state.getValue();
+            out.writeInt(state.getKey().ordinal());
             VersionedValue.serializer.serialize(value, out, version);
         }
     }
 
-    public EndpointState deserialize(DataInput in, int version) throws IOException
+    public EndpointState deserialize(DataInputPlus in, int version) throws IOException
     {
         HeartBeatState hbState = HeartBeatState.serializer.deserialize(in, version);
-        EndpointState epState = new EndpointState(hbState);
 
         int appStateSize = in.readInt();
+        Map<ApplicationState, VersionedValue> states = new EnumMap<>(ApplicationState.class);
         for (int i = 0; i < appStateSize; ++i)
         {
             int key = in.readInt();
             VersionedValue value = VersionedValue.serializer.deserialize(in, version);
-            epState.addApplicationState(Gossiper.STATES[key], value);
+            states.put(Gossiper.STATES[key], value);
         }
-        return epState;
+
+        return new EndpointState(hbState, states);
     }
 
     public long serializedSize(EndpointState epState, int version)
     {
         long size = HeartBeatState.serializer.serializedSize(epState.getHeartBeatState(), version);
-        size += TypeSizes.NATIVE.sizeof(epState.applicationState.size());
-        for (Map.Entry<ApplicationState, VersionedValue> entry : epState.applicationState.entrySet())
+        Set<Map.Entry<ApplicationState, VersionedValue>> states = epState.states();
+        size += TypeSizes.sizeof(states.size());
+        for (Map.Entry<ApplicationState, VersionedValue> state : states)
         {
-            VersionedValue value = entry.getValue();
-            size += TypeSizes.NATIVE.sizeof(entry.getKey().ordinal());
+            VersionedValue value = state.getValue();
+            size += TypeSizes.sizeof(state.getKey().ordinal());
             size += VersionedValue.serializer.serializedSize(value, version);
         }
         return size;

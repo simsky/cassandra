@@ -20,8 +20,7 @@ package org.apache.cassandra.transport.messages;
 import java.util.ArrayList;
 import java.util.List;
 
-import org.jboss.netty.buffer.ChannelBuffer;
-import org.jboss.netty.buffer.ChannelBuffers;
+import io.netty.buffer.ByteBuf;
 
 import org.apache.cassandra.service.QueryState;
 import org.apache.cassandra.transport.*;
@@ -30,23 +29,23 @@ public class RegisterMessage extends Message.Request
 {
     public static final Message.Codec<RegisterMessage> codec = new Message.Codec<RegisterMessage>()
     {
-        public RegisterMessage decode(ChannelBuffer body, int version)
+        public RegisterMessage decode(ByteBuf body, ProtocolVersion version)
         {
             int length = body.readUnsignedShort();
-            List<Event.Type> eventTypes = new ArrayList<Event.Type>(length);
+            List<Event.Type> eventTypes = new ArrayList<>(length);
             for (int i = 0; i < length; ++i)
                 eventTypes.add(CBUtil.readEnumValue(Event.Type.class, body));
             return new RegisterMessage(eventTypes);
         }
 
-        public void encode(RegisterMessage msg, ChannelBuffer dest, int version)
+        public void encode(RegisterMessage msg, ByteBuf dest, ProtocolVersion version)
         {
             dest.writeShort(msg.eventTypes.size());
             for (Event.Type type : msg.eventTypes)
                 CBUtil.writeEnumValue(type, dest);
         }
 
-        public int encodedSize(RegisterMessage msg, int version)
+        public int encodedSize(RegisterMessage msg, ProtocolVersion version)
         {
             int size = 2;
             for (Event.Type type : msg.eventTypes)
@@ -63,13 +62,18 @@ public class RegisterMessage extends Message.Request
         this.eventTypes = eventTypes;
     }
 
-    public Response execute(QueryState state)
+    @Override
+    protected Response execute(QueryState state, long queryStartNanoTime, boolean traceRequest)
     {
         assert connection instanceof ServerConnection;
-        Connection.Tracker tracker = ((ServerConnection)connection).getTracker();
+        Connection.Tracker tracker = connection.getTracker();
         assert tracker instanceof Server.ConnectionTracker;
         for (Event.Type type : eventTypes)
-            ((Server.ConnectionTracker)tracker).register(type, connection().channel());
+        {
+            if (type.minimumVersion.isGreaterThan(connection.getVersion()))
+                throw new ProtocolException("Event " + type.name() + " not valid for protocol version " + connection.getVersion());
+            ((Server.ConnectionTracker) tracker).register(type, connection().channel());
+        }
         return new ReadyMessage();
     }
 

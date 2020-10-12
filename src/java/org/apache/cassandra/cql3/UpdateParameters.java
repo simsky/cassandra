@@ -18,72 +18,203 @@
 package org.apache.cassandra.cql3;
 
 import java.nio.ByteBuffer;
-import java.util.Collections;
-import java.util.List;
 import java.util.Map;
 
-import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.cql3.statements.ColumnGroupMap;
+import org.apache.cassandra.schema.ColumnMetadata;
+import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.context.CounterContext;
+import org.apache.cassandra.db.filter.ColumnFilter;
+import org.apache.cassandra.db.partitions.Partition;
+import org.apache.cassandra.db.rows.*;
 import org.apache.cassandra.exceptions.InvalidRequestException;
-import org.apache.cassandra.utils.Pair;
 
 /**
- * A simple container that simplify passing parameters for collections methods.
+ * Groups the parameters of an update query, and make building updates easier.
  */
 public class UpdateParameters
 {
-    public final CFMetaData metadata;
-    public final List<ByteBuffer> variables;
-    public final long timestamp;
+    public final TableMetadata metadata;
+    public final RegularAndStaticColumns updatedColumns;
+    public final QueryOptions options;
+
+    private final int nowInSec;
+    private final long timestamp;
     private final int ttl;
-    public final int localDeletionTime;
+
+    private final DeletionTime deletionTime;
 
     // For lists operation that require a read-before-write. Will be null otherwise.
-    private final Map<ByteBuffer, ColumnGroupMap> prefetchedLists;
+    private final Map<DecoratedKey, Partition> prefetchedRows;
 
-    public UpdateParameters(CFMetaData metadata, List<ByteBuffer> variables, long timestamp, int ttl, Map<ByteBuffer, ColumnGroupMap> prefetchedLists)
+    private Row.Builder staticBuilder;
+    private Row.Builder regularBuilder;
+
+    // The builder currently in use. Will alias either staticBuilder or regularBuilder, which are themselves built lazily.
+    private Row.Builder builder;
+
+    public UpdateParameters(TableMetadata metadata,
+                            RegularAndStaticColumns updatedColumns,
+                            QueryOptions options,
+                            long timestamp,
+                            int nowInSec,
+                            int ttl,
+                            Map<DecoratedKey, Partition> prefetchedRows)
+    throws InvalidRequestException
     {
         this.metadata = metadata;
-        this.variables = variables;
+        this.updatedColumns = updatedColumns;
+        this.options = options;
+
+        this.nowInSec = nowInSec;
         this.timestamp = timestamp;
         this.ttl = ttl;
-        this.localDeletionTime = (int)(System.currentTimeMillis() / 1000);
-        this.prefetchedLists = prefetchedLists;
+
+        this.deletionTime = new DeletionTime(timestamp, nowInSec);
+
+        this.prefetchedRows = prefetchedRows;
+
+        // We use MIN_VALUE internally to mean the absence of of timestamp (in Selection, in sstable stats, ...), so exclude
+        // it to avoid potential confusion.
+        if (timestamp == Long.MIN_VALUE)
+            throw new InvalidRequestException(String.format("Out of bound timestamp, must be in [%d, %d]", Long.MIN_VALUE + 1, Long.MAX_VALUE));
     }
 
-    public Column makeColumn(ByteBuffer name, ByteBuffer value) throws InvalidRequestException
+    public <V> void newRow(Clustering<V> clustering) throws InvalidRequestException
     {
-        QueryProcessor.validateCellName(name);
-        return Column.create(name, value, timestamp, ttl, metadata);
+        if (clustering == Clustering.STATIC_CLUSTERING)
+        {
+            if (staticBuilder == null)
+                staticBuilder = BTreeRow.unsortedBuilder();
+            builder = staticBuilder;
+        }
+        else
+        {
+            if (regularBuilder == null)
+                regularBuilder = BTreeRow.unsortedBuilder();
+            builder = regularBuilder;
+        }
+
+        builder.newRow(clustering);
     }
 
-    public Column makeTombstone(ByteBuffer name) throws InvalidRequestException
+    public Clustering<?> currentClustering()
     {
-        QueryProcessor.validateCellName(name);
-        return new DeletedColumn(name, localDeletionTime, timestamp);
+        return builder.clustering();
     }
 
-    public RangeTombstone makeRangeTombstone(ByteBuffer start, ByteBuffer end) throws InvalidRequestException
+    public void addPrimaryKeyLivenessInfo()
     {
-        QueryProcessor.validateCellName(start);
-        QueryProcessor.validateCellName(end);
-        return new RangeTombstone(start, end, timestamp, localDeletionTime);
+        builder.addPrimaryKeyLivenessInfo(LivenessInfo.create(timestamp, ttl, nowInSec));
     }
 
-    public RangeTombstone makeTombstoneForOverwrite(ByteBuffer start, ByteBuffer end) throws InvalidRequestException
+    public void addRowDeletion()
     {
-        QueryProcessor.validateCellName(start);
-        QueryProcessor.validateCellName(end);
-        return new RangeTombstone(start, end, timestamp - 1, localDeletionTime);
+        builder.addRowDeletion(Row.Deletion.regular(deletionTime));
     }
 
-    public List<Pair<ByteBuffer, Column>> getPrefetchedList(ByteBuffer rowKey, ColumnIdentifier cql3ColumnName)
+    public void addTombstone(ColumnMetadata column) throws InvalidRequestException
     {
-        if (prefetchedLists == null)
-            return Collections.emptyList();
+        addTombstone(column, null);
+    }
 
-        ColumnGroupMap m = prefetchedLists.get(rowKey);
-        return m == null ? Collections.<Pair<ByteBuffer, Column>>emptyList() : m.getCollection(cql3ColumnName.bytes);
+    public void addTombstone(ColumnMetadata column, CellPath path) throws InvalidRequestException
+    {
+        builder.addCell(BufferCell.tombstone(column, timestamp, nowInSec, path));
+    }
+
+    public void addCell(ColumnMetadata column, ByteBuffer value) throws InvalidRequestException
+    {
+        addCell(column, null, value);
+    }
+
+    public void addCell(ColumnMetadata column, CellPath path, ByteBuffer value) throws InvalidRequestException
+    {
+        Cell<?> cell = ttl == LivenessInfo.NO_TTL
+                       ? BufferCell.live(column, timestamp, value, path)
+                       : BufferCell.expiring(column, timestamp, ttl, nowInSec, value, path);
+        builder.addCell(cell);
+    }
+
+    public void addCounter(ColumnMetadata column, long increment) throws InvalidRequestException
+    {
+        assert ttl == LivenessInfo.NO_TTL;
+
+        // Because column is a counter, we need the value to be a CounterContext. However, we're only creating a
+        // "counter update", which is a temporary state until we run into 'CounterMutation.updateWithCurrentValue()'
+        // which does the read-before-write and sets the proper CounterId, clock and updated value.
+        //
+        // We thus create a "fake" local shard here. The clock used doesn't matter as this is just a temporary
+        // state that will be replaced when processing the mutation in CounterMutation, but the reason we use a 'local'
+        // shard is due to the merging rules: if a user includes multiple updates to the same counter in a batch, those
+        // multiple updates will be merged in the PartitionUpdate *before* they even reach CounterMutation. So we need
+        // such update to be added together, and that's what a local shard gives us.
+        //
+        // We set counterid to a special value to differentiate between regular pre-2.0 local shards from pre-2.1 era
+        // and "counter update" temporary state cells. Please see CounterContext.createUpdate() for further details.
+        builder.addCell(BufferCell.live(column, timestamp, CounterContext.instance().createUpdate(increment)));
+    }
+
+    public void setComplexDeletionTime(ColumnMetadata column)
+    {
+        builder.addComplexDeletion(column, deletionTime);
+    }
+
+    public void setComplexDeletionTimeForOverwrite(ColumnMetadata column)
+    {
+        builder.addComplexDeletion(column, new DeletionTime(deletionTime.markedForDeleteAt() - 1, deletionTime.localDeletionTime()));
+    }
+
+    public Row buildRow()
+    {
+        Row built = builder.build();
+        builder = null; // Resetting to null just so we quickly bad usage where we forget to call newRow() after that.
+        return built;
+    }
+
+    public DeletionTime deletionTime()
+    {
+        return deletionTime;
+    }
+
+    public RangeTombstone makeRangeTombstone(ClusteringComparator comparator, Clustering<?> clustering)
+    {
+        return makeRangeTombstone(Slice.make(comparator, clustering));
+    }
+
+    public RangeTombstone makeRangeTombstone(Slice slice)
+    {
+        return new RangeTombstone(slice, deletionTime);
+    }
+
+    /**
+     * Returns the prefetched row with the already performed modifications.
+     * <p>If no modification have yet been performed this method will return the fetched row or {@code null} if
+     * the row does not exist. If some modifications (updates or deletions) have already been done the row returned
+     * will be the result of the merge of the fetched row and of the pending mutations.</p>
+     *
+     * @param key the partition key
+     * @param clustering the row clustering
+     * @return the prefetched row with the already performed modifications
+     */
+    public Row getPrefetchedRow(DecoratedKey key, Clustering<?> clustering)
+    {
+        if (prefetchedRows == null)
+            return null;
+
+        Partition partition = prefetchedRows.get(key);
+        Row prefetchedRow = partition == null ? null : partition.searchIterator(ColumnFilter.selection(partition.columns()), false).next(clustering);
+
+        // We need to apply the pending mutations to return the row in its current state
+        Row pendingMutations = builder.copy().build();
+
+        if (pendingMutations.isEmpty())
+            return prefetchedRow;
+
+        if (prefetchedRow == null)
+            return pendingMutations;
+
+        return Rows.merge(prefetchedRow, pendingMutations)
+                   .purge(DeletionPurger.PURGE_ALL, nowInSec, metadata.enforceStrictLiveness());
     }
 }

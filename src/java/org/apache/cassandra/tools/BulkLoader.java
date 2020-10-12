@@ -17,400 +17,277 @@
  */
 package org.apache.cassandra.tools;
 
-import java.io.File;
-import java.net.InetAddress;
-import java.net.UnknownHostException;
-import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.TimeUnit;
+import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.util.Set;
+import javax.net.ssl.SSLContext;
 
-import com.google.common.collect.Sets;
-import org.apache.commons.cli.*;
-import org.apache.thrift.protocol.TBinaryProtocol;
-import org.apache.thrift.protocol.TProtocol;
-import org.apache.thrift.transport.TFramedTransport;
-import org.apache.thrift.transport.TSocket;
-import org.apache.thrift.transport.TTransport;
+import com.datastax.driver.core.AuthProvider;
+import com.datastax.driver.core.JdkSSLOptions;
+import com.datastax.driver.core.SSLOptions;
+import com.google.common.collect.HashMultimap;
+import com.google.common.collect.Multimap;
+import org.apache.commons.cli.Option;
+import org.apache.commons.cli.Options;
 
-import org.apache.cassandra.auth.IAuthenticator;
-import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.db.Keyspace;
-import org.apache.cassandra.db.SystemKeyspace;
-import org.apache.cassandra.dht.Range;
-import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.config.EncryptionOptions;
 import org.apache.cassandra.io.sstable.SSTableLoader;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.security.SSLFactory;
 import org.apache.cassandra.streaming.*;
-import org.apache.cassandra.thrift.*;
-import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.JVMStabilityInspector;
+import org.apache.cassandra.utils.NativeSSTableLoaderClient;
 import org.apache.cassandra.utils.OutputHandler;
 
 public class BulkLoader
 {
-    private static final String TOOL_NAME = "sstableloader";
-    private static final String VERBOSE_OPTION  = "verbose";
-    private static final String DEBUG_OPTION  = "debug";
-    private static final String HELP_OPTION  = "help";
-    private static final String NOPROGRESS_OPTION  = "no-progress";
-    private static final String IGNORE_NODES_OPTION  = "ignore";
-    private static final String INITIAL_HOST_ADDRESS_OPTION = "nodes";
-    private static final String RPC_PORT_OPTION = "port";
-    private static final String USER_OPTION = "username";
-    private static final String PASSWD_OPTION = "password";
-    private static final String THROTTLE_MBITS = "throttle";
-
-    public static void main(String args[])
+    public static void main(String args[]) throws BulkLoadException
     {
-        LoaderOptions options = LoaderOptions.parseArgs(args);
+        LoaderOptions options = LoaderOptions.builder().parseArgs(args).build();
+        load(options);
+    }
+
+    public static void load(LoaderOptions options) throws BulkLoadException
+    {
+        DatabaseDescriptor.toolInitialization();
         OutputHandler handler = new OutputHandler.SystemOutput(options.verbose, options.debug);
-        SSTableLoader loader = new SSTableLoader(options.directory, new ExternalClient(options.hosts, options.rpcPort, options.user, options.passwd), handler);
+        SSTableLoader loader = new SSTableLoader(
+                options.directory.getAbsoluteFile(),
+                new ExternalClient(
+                        options.hosts,
+                        options.storagePort,
+                        options.authProvider,
+                        options.sslStoragePort,
+                        options.serverEncOptions,
+                        buildSSLOptions(options.clientEncOptions)),
+                        handler,
+                        options.connectionsPerHost,
+                        options.targetKeyspace);
         DatabaseDescriptor.setStreamThroughputOutboundMegabitsPerSec(options.throttle);
-        StreamResultFuture future = loader.stream(options.ignores);
-        future.addEventListener(new ProgressIndicator());
+        DatabaseDescriptor.setInterDCStreamThroughputOutboundMegabitsPerSec(options.interDcThrottle);
+        StreamResultFuture future = null;
+
+        ProgressIndicator indicator = new ProgressIndicator();
+        try
+        {
+            if (options.noProgress)
+            {
+                future = loader.stream(options.ignores);
+            }
+            else
+            {
+                future = loader.stream(options.ignores, indicator);
+            }
+
+        }
+        catch (Exception e)
+        {
+            JVMStabilityInspector.inspectThrowable(e);
+            System.err.println(e.getMessage());
+            if (e.getCause() != null)
+            {
+                System.err.println(e.getCause());
+            }
+            e.printStackTrace(System.err);
+            throw new BulkLoadException(e);
+        }
+
         try
         {
             future.get();
-            System.exit(0); // We need that to stop non daemonized threads
+
+            if (!options.noProgress)
+            {
+                indicator.printSummary(options.connectionsPerHost);
+            }
+
+            // Give sockets time to gracefully close
+            Thread.sleep(1000);
         }
         catch (Exception e)
         {
             System.err.println("Streaming to the following hosts failed:");
             System.err.println(loader.getFailedHosts());
-            System.err.println(e);
-            if (options.debug)
-                e.printStackTrace(System.err);
-            System.exit(1);
+            e.printStackTrace(System.err);
+            throw new BulkLoadException(e);
         }
     }
 
     // Return true when everything is at 100%
     static class ProgressIndicator implements StreamEventHandler
     {
-        private final Map<InetAddress, SessionInfo> sessionsByHost = new ConcurrentHashMap<>();
-        private final Map<InetAddress, Set<ProgressInfo>> progressByHost = new ConcurrentHashMap<>();
-
         private long start;
         private long lastProgress;
         private long lastTime;
+
+        private long peak = 0;
+        private int totalFiles = 0;
+
+        private final Multimap<InetAddressAndPort, SessionInfo> sessionsByHost = HashMultimap.create();
 
         public ProgressIndicator()
         {
             start = lastTime = System.nanoTime();
         }
 
-        public void onSuccess(StreamState finalState) {}
-        public void onFailure(Throwable t) {}
+        public void onSuccess(StreamState finalState)
+        {
+        }
 
-        public void handleStreamEvent(StreamEvent event)
+        public void onFailure(Throwable t)
+        {
+        }
+
+        public synchronized void handleStreamEvent(StreamEvent event)
         {
             if (event.eventType == StreamEvent.Type.STREAM_PREPARED)
             {
                 SessionInfo session = ((StreamEvent.SessionPreparedEvent) event).session;
                 sessionsByHost.put(session.peer, session);
             }
-            else if (event.eventType == StreamEvent.Type.FILE_PROGRESS)
+            else if (event.eventType == StreamEvent.Type.FILE_PROGRESS || event.eventType == StreamEvent.Type.STREAM_COMPLETE)
             {
-                ProgressInfo progressInfo = ((StreamEvent.ProgressEvent) event).progress;
-
-                // update progress
-                Set<ProgressInfo> progresses = progressByHost.get(progressInfo.peer);
-                if (progresses == null)
+                ProgressInfo progressInfo = null;
+                if (event.eventType == StreamEvent.Type.FILE_PROGRESS)
                 {
-                    progresses = Sets.newSetFromMap(new ConcurrentHashMap<ProgressInfo, Boolean>());
-                    progressByHost.put(progressInfo.peer, progresses);
+                    progressInfo = ((StreamEvent.ProgressEvent) event).progress;
                 }
-                if (progresses.contains(progressInfo))
-                    progresses.remove(progressInfo);
-                progresses.add(progressInfo);
+
+                long time = System.nanoTime();
+                long deltaTime = time - lastTime;
 
                 StringBuilder sb = new StringBuilder();
                 sb.append("\rprogress: ");
 
                 long totalProgress = 0;
                 long totalSize = 0;
-                for (Map.Entry<InetAddress, Set<ProgressInfo>> entry : progressByHost.entrySet())
-                {
-                    SessionInfo session = sessionsByHost.get(entry.getKey());
 
-                    long size = session.getTotalSizeToSend();
-                    long current = 0;
-                    int completed = 0;
-                    for (ProgressInfo progress : entry.getValue())
+                boolean updateTotalFiles = totalFiles == 0;
+                // recalculate progress across all sessions in all hosts and display
+                for (InetAddressAndPort peer : sessionsByHost.keySet())
+                {
+                    sb.append("[").append(peer).append("]");
+
+                    for (SessionInfo session : sessionsByHost.get(peer))
                     {
-                        if (progress.currentBytes == progress.totalBytes)
-                            completed++;
-                        current += progress.currentBytes;
+                        long size = session.getTotalSizeToSend();
+                        long current = 0;
+                        int completed = 0;
+
+                        if (progressInfo != null && session.peer.equals(progressInfo.peer) && session.sessionIndex == progressInfo.sessionIndex)
+                        {
+                            session.updateProgress(progressInfo);
+                        }
+                        for (ProgressInfo progress : session.getSendingFiles())
+                        {
+                            if (progress.isCompleted())
+                            {
+                                completed++;
+                            }
+                            current += progress.currentBytes;
+                        }
+                        totalProgress += current;
+
+                        totalSize += size;
+
+                        sb.append(session.sessionIndex).append(":");
+                        sb.append(completed).append("/").append(session.getTotalFilesToSend());
+                        sb.append(" ").append(String.format("%-3d", size == 0 ? 100L : current * 100L / size)).append("% ");
+
+                        if (updateTotalFiles)
+                        {
+                            totalFiles += session.getTotalFilesToSend();
+                        }
                     }
-                    totalProgress += current;
-                    totalSize += size;
-                    sb.append("[").append(entry.getKey());
-                    sb.append(" ").append(completed).append("/").append(session.getTotalFilesToSend());
-                    sb.append(" (").append(size == 0 ? 100L : current * 100L / size).append("%)] ");
                 }
-                long time = System.nanoTime();
-                long deltaTime = TimeUnit.NANOSECONDS.toMillis(time - lastTime);
+
                 lastTime = time;
                 long deltaProgress = totalProgress - lastProgress;
                 lastProgress = totalProgress;
 
-                sb.append("[total: ").append(totalSize == 0 ? 100L : totalProgress * 100L / totalSize).append("% - ");
-                sb.append(mbPerSec(deltaProgress, deltaTime)).append("MB/s");
-                sb.append(" (avg: ").append(mbPerSec(totalProgress, TimeUnit.NANOSECONDS.toMillis(time - start))).append("MB/s)]");
+                sb.append("total: ").append(totalSize == 0 ? 100L : totalProgress * 100L / totalSize).append("% ");
+                sb.append(FBUtilities.prettyPrintMemoryPerSecond(deltaProgress, deltaTime));
+                long average = bytesPerSecond(totalProgress, time - start);
 
-                System.out.print(sb.toString());
+                if (average > peak)
+                {
+                    peak = average;
+                }
+                sb.append(" (avg: ").append(FBUtilities.prettyPrintMemoryPerSecond(totalProgress, time - start)).append(")");
+
+                System.out.println(sb.toString());
             }
         }
 
-        private int mbPerSec(long bytes, long timeInMs)
+        private long bytesPerSecond(long bytes, long timeInNano)
         {
-            double bytesPerMs = ((double)bytes) / timeInMs;
-            return (int)((bytesPerMs * 1000) / (1024 * 2024));
+            return timeInNano != 0 ? (long) (((double) bytes / timeInNano) * 1000 * 1000 * 1000) : 0;
+        }
+
+        private void printSummary(int connectionsPerHost)
+        {
+            long end = System.nanoTime();
+            long durationMS = ((end - start) / (1000000));
+
+            StringBuilder sb = new StringBuilder();
+            sb.append("\nSummary statistics: \n");
+            sb.append(String.format("   %-24s: %-10d%n", "Connections per host ", connectionsPerHost));
+            sb.append(String.format("   %-24s: %-10d%n", "Total files transferred ", totalFiles));
+            sb.append(String.format("   %-24s: %-10s%n", "Total bytes transferred ", FBUtilities.prettyPrintMemory(lastProgress)));
+            sb.append(String.format("   %-24s: %-10s%n", "Total duration ", durationMS + " ms"));
+            sb.append(String.format("   %-24s: %-10s%n", "Average transfer rate ", FBUtilities.prettyPrintMemoryPerSecond(lastProgress, end - start)));
+            sb.append(String.format("   %-24s: %-10s%n", "Peak transfer rate ",  FBUtilities.prettyPrintMemoryPerSecond(peak)));
+            System.out.println(sb.toString());
         }
     }
 
-    static class ExternalClient extends SSTableLoader.Client
+    private static SSLOptions buildSSLOptions(EncryptionOptions clientEncryptionOptions)
     {
-        private final Map<String, CFMetaData> knownCfs = new HashMap<>();
-        private final Set<InetAddress> hosts;
-        private final int rpcPort;
-        private final String user;
-        private final String passwd;
 
-        public ExternalClient(Set<InetAddress> hosts, int port, String user, String passwd)
+        if (!clientEncryptionOptions.isEnabled())
         {
-            super();
-            this.hosts = hosts;
-            this.rpcPort = port;
-            this.user = user;
-            this.passwd = passwd;
+            return null;
         }
 
-        public void init(String keyspace)
+        SSLContext sslContext;
+        try
         {
-            Iterator<InetAddress> hostiter = hosts.iterator();
-            while (hostiter.hasNext())
-            {
-                try
-                {
-                    // Query endpoint to ranges map and schemas from thrift
-                    InetAddress host = hostiter.next();
-                    Cassandra.Client client = createThriftClient(host.getHostAddress(), rpcPort, this.user, this.passwd);
-
-                    setPartitioner(client.describe_partitioner());
-                    Token.TokenFactory tkFactory = getPartitioner().getTokenFactory();
-
-                    for (TokenRange tr : client.describe_ring(keyspace))
-                    {
-                        Range<Token> range = new Range<>(tkFactory.fromString(tr.start_token), tkFactory.fromString(tr.end_token));
-                        for (String ep : tr.endpoints)
-                        {
-                            addRangeForEndpoint(range, InetAddress.getByName(ep));
-                        }
-                    }
-
-                    String query = String.format("SELECT * FROM %s.%s WHERE keyspace_name = '%s'",
-                                                 Keyspace.SYSTEM_KS,
-                                                 SystemKeyspace.SCHEMA_COLUMNFAMILIES_CF,
-                                                 keyspace);
-                    CqlResult result = client.execute_cql3_query(ByteBufferUtil.bytes(query), Compression.NONE, ConsistencyLevel.ONE);
-                    for (CqlRow row : result.rows)
-                    {
-                        CFMetaData metadata = CFMetaData.fromThriftCqlRow(row);
-                        knownCfs.put(metadata.cfName, metadata);
-                    }
-                    break;
-                }
-                catch (Exception e)
-                {
-                    if (!hostiter.hasNext())
-                        throw new RuntimeException("Could not retrieve endpoint ranges: ", e);
-                }
-            }
+            sslContext = SSLFactory.createSSLContext(clientEncryptionOptions, true);
+        }
+        catch (IOException e)
+        {
+            throw new RuntimeException("Could not create SSL Context.", e);
         }
 
-        public CFMetaData getCFMetaData(String keyspace, String cfName)
-        {
-            return knownCfs.get(cfName);
-        }
-
-        private static Cassandra.Client createThriftClient(String host, int port, String user, String passwd) throws Exception
-        {
-            TSocket socket = new TSocket(host, port);
-            TTransport trans = new TFramedTransport(socket);
-            trans.open();
-            TProtocol protocol = new TBinaryProtocol(trans);
-            Cassandra.Client client = new Cassandra.Client(protocol);
-            if (user != null && passwd != null)
-            {
-                Map<String, String> credentials = new HashMap<String, String>();
-                credentials.put(IAuthenticator.USERNAME_KEY, user);
-                credentials.put(IAuthenticator.PASSWORD_KEY, passwd);
-                AuthenticationRequest authenticationRequest = new AuthenticationRequest(credentials);
-                client.login(authenticationRequest);
-            }
-            return client;
-        }
+        return JdkSSLOptions.builder()
+                            .withSSLContext(sslContext)
+                            .withCipherSuites(clientEncryptionOptions.cipher_suites.toArray(new String[0]))
+                            .build();
     }
 
-    static class LoaderOptions
+    static class ExternalClient extends NativeSSTableLoaderClient
     {
-        public final File directory;
+        private final int sslStoragePort;
+        private final EncryptionOptions.ServerEncryptionOptions serverEncOptions;
 
-        public boolean debug;
-        public boolean verbose;
-        public boolean noProgress;
-        public int rpcPort = 9160;
-        public String user;
-        public String passwd;
-        public int throttle = 0;
-
-        public final Set<InetAddress> hosts = new HashSet<InetAddress>();
-        public final Set<InetAddress> ignores = new HashSet<InetAddress>();
-
-        LoaderOptions(File directory)
+        public ExternalClient(Set<InetSocketAddress> hosts,
+                              int storagePort,
+                              AuthProvider authProvider,
+                              int sslStoragePort,
+                              EncryptionOptions.ServerEncryptionOptions serverEncryptionOptions,
+                              SSLOptions sslOptions)
         {
-            this.directory = directory;
+            super(hosts, storagePort, authProvider, sslOptions);
+            this.sslStoragePort = sslStoragePort;
+            serverEncOptions = serverEncryptionOptions;
         }
 
-        public static LoaderOptions parseArgs(String cmdArgs[])
+        @Override
+        public StreamConnectionFactory getConnectionFactory()
         {
-            CommandLineParser parser = new GnuParser();
-            CmdLineOptions options = getCmdLineOptions();
-            try
-            {
-                CommandLine cmd = parser.parse(options, cmdArgs, false);
-
-                if (cmd.hasOption(HELP_OPTION))
-                {
-                    printUsage(options);
-                    System.exit(0);
-                }
-
-                String[] args = cmd.getArgs();
-                if (args.length == 0)
-                {
-                    System.err.println("Missing sstable directory argument");
-                    printUsage(options);
-                    System.exit(1);
-                }
-
-                if (args.length > 1)
-                {
-                    System.err.println("Too many arguments");
-                    printUsage(options);
-                    System.exit(1);
-                }
-
-                String dirname = args[0];
-                File dir = new File(dirname);
-
-                if (!dir.exists())
-                    errorMsg("Unknown directory: " + dirname, options);
-
-                if (!dir.isDirectory())
-                    errorMsg(dirname + " is not a directory", options);
-
-                LoaderOptions opts = new LoaderOptions(dir);
-
-                opts.debug = cmd.hasOption(DEBUG_OPTION);
-                opts.verbose = cmd.hasOption(VERBOSE_OPTION);
-                opts.noProgress = cmd.hasOption(NOPROGRESS_OPTION);
-
-                if (cmd.hasOption(THROTTLE_MBITS))
-                    opts.throttle = Integer.parseInt(cmd.getOptionValue(THROTTLE_MBITS));
-
-                if (cmd.hasOption(RPC_PORT_OPTION))
-                    opts.rpcPort = Integer.parseInt(cmd.getOptionValue(RPC_PORT_OPTION));
-
-                if (cmd.hasOption(USER_OPTION))
-                    opts.user = cmd.getOptionValue(USER_OPTION);
-
-                if (cmd.hasOption(PASSWD_OPTION))
-                    opts.passwd = cmd.getOptionValue(PASSWD_OPTION);
-
-                if (cmd.hasOption(INITIAL_HOST_ADDRESS_OPTION))
-                {
-                    String[] nodes = cmd.getOptionValue(INITIAL_HOST_ADDRESS_OPTION).split(",");
-                    try
-                    {
-                        for (String node : nodes)
-                        {
-                            opts.hosts.add(InetAddress.getByName(node.trim()));
-                        }
-                    }
-                    catch (UnknownHostException e)
-                    {
-                        errorMsg("Unknown host: " + e.getMessage(), options);
-                    }
-
-                }
-                else
-                {
-                    System.err.println("Initial hosts must be specified (-d)");
-                    printUsage(options);
-                    System.exit(1);
-                }
-
-                if (cmd.hasOption(IGNORE_NODES_OPTION))
-                {
-                    String[] nodes = cmd.getOptionValue(IGNORE_NODES_OPTION).split(",");
-                    try
-                    {
-                        for (String node : nodes)
-                        {
-                            opts.ignores.add(InetAddress.getByName(node.trim()));
-                        }
-                    }
-                    catch (UnknownHostException e)
-                    {
-                        errorMsg("Unknown host: " + e.getMessage(), options);
-                    }
-                }
-
-                return opts;
-            }
-            catch (ParseException e)
-            {
-                errorMsg(e.getMessage(), options);
-                return null;
-            }
-        }
-
-        private static void errorMsg(String msg, CmdLineOptions options)
-        {
-            System.err.println(msg);
-            printUsage(options);
-            System.exit(1);
-        }
-        private static CmdLineOptions getCmdLineOptions()
-        {
-            CmdLineOptions options = new CmdLineOptions();
-            options.addOption(null, DEBUG_OPTION,        "display stack traces");
-            options.addOption("v",  VERBOSE_OPTION,      "verbose output");
-            options.addOption("h",  HELP_OPTION,         "display this help message");
-            options.addOption(null, NOPROGRESS_OPTION,   "don't display progress");
-            options.addOption("i",  IGNORE_NODES_OPTION, "NODES", "don't stream to this (comma separated) list of nodes");
-            options.addOption("d",  INITIAL_HOST_ADDRESS_OPTION, "initial hosts", "try to connect to these hosts (comma separated) initially for ring information");
-            options.addOption("p",  RPC_PORT_OPTION, "rpc port", "port used for rpc (default 9160)");
-            options.addOption("t",  THROTTLE_MBITS, "throttle", "throttle speed in Mbits (default unlimited)");
-            options.addOption("u",  USER_OPTION, "username", "username for cassandra authentication");
-            options.addOption("pw", PASSWD_OPTION, "password", "password for cassandra authentication");
-            return options;
-        }
-
-        public static void printUsage(Options options)
-        {
-            String usage = String.format("%s [options] <dir_path>", TOOL_NAME);
-            StringBuilder header = new StringBuilder();
-            header.append("--\n");
-            header.append("Bulk load the sstables found in the directory <dir_path> to the configured cluster." );
-            header.append("The parent directory of <dir_path> is used as the keyspace name. ");
-            header.append("So for instance, to load an sstable named Standard1-g-1-Data.db into keyspace Keyspace1, ");
-            header.append("you will need to have the files Standard1-g-1-Data.db and Standard1-g-1-Index.db in a ");
-            header.append("directory Keyspace1/Standard1/ in the directory and call: sstableloader Keyspace1/Standard1");
-            header.append("\n--\n");
-            header.append("Options are:");
-            new HelpFormatter().printHelp(usage, header.toString(), options, "");
+            return new BulkLoadConnectionFactory(sslStoragePort, serverEncOptions, false);
         }
     }
 
@@ -428,6 +305,23 @@ public class BulkLoader
         {
             Option option = new Option(opt, longOpt, true, description);
             option.setArgName(argName);
+
+            return addOption(option);
+        }
+
+        /**
+         * Add option with argument and argument name that accepts being defined multiple times as a list
+         * @param opt shortcut for option name
+         * @param longOpt complete option name
+         * @param argName argument name
+         * @param description description of the option
+         * @return updated Options object
+         */
+        public Options addOptionList(String opt, String longOpt, String argName, String description)
+        {
+            Option option = new Option(opt, longOpt, true, description);
+            option.setArgName(argName);
+            option.setArgs(Option.UNLIMITED_VALUES);
 
             return addOption(option);
         }

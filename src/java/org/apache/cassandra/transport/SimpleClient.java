@@ -17,6 +17,7 @@
  */
 package org.apache.cassandra.transport;
 
+import java.io.Closeable;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
@@ -25,42 +26,43 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.SynchronousQueue;
-import javax.net.ssl.SSLContext;
-import javax.net.ssl.SSLEngine;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import io.netty.bootstrap.Bootstrap;
+import io.netty.channel.ChannelHandler;
+import io.netty.channel.ChannelInitializer;
+import io.netty.channel.ChannelOption;
+import io.netty.channel.SimpleChannelInboundHandler;
+import io.netty.channel.nio.NioEventLoopGroup;
+import io.netty.handler.ssl.SslContext;
+import io.netty.util.internal.logging.InternalLoggerFactory;
+import io.netty.util.internal.logging.Slf4JLoggerFactory;
+import org.apache.cassandra.config.EncryptionOptions;
 import org.apache.cassandra.cql3.QueryOptions;
 import org.apache.cassandra.db.ConsistencyLevel;
 import org.apache.cassandra.security.SSLFactory;
-import org.apache.cassandra.transport.messages.CredentialsMessage;
+import org.apache.cassandra.transport.frame.checksum.ChecksummingTransformer;
+import org.apache.cassandra.transport.frame.compress.CompressingTransformer;
+import org.apache.cassandra.transport.frame.compress.Compressor;
+import org.apache.cassandra.transport.frame.compress.LZ4Compressor;
 import org.apache.cassandra.transport.messages.ErrorMessage;
+import org.apache.cassandra.transport.messages.EventMessage;
 import org.apache.cassandra.transport.messages.ExecuteMessage;
 import org.apache.cassandra.transport.messages.PrepareMessage;
 import org.apache.cassandra.transport.messages.QueryMessage;
 import org.apache.cassandra.transport.messages.ResultMessage;
 import org.apache.cassandra.transport.messages.StartupMessage;
-import org.apache.cassandra.utils.MD5Digest;
-import org.jboss.netty.bootstrap.ClientBootstrap;
-import org.jboss.netty.channel.Channel;
-import org.jboss.netty.channel.ChannelFuture;
-import org.jboss.netty.channel.ChannelHandlerContext;
-import org.jboss.netty.channel.ChannelPipeline;
-import org.jboss.netty.channel.ChannelPipelineFactory;
-import org.jboss.netty.channel.Channels;
-import org.jboss.netty.channel.ExceptionEvent;
-import org.jboss.netty.channel.MessageEvent;
-import org.jboss.netty.channel.SimpleChannelUpstreamHandler;
-import org.jboss.netty.channel.socket.nio.NioClientSocketChannelFactory;
-import org.jboss.netty.handler.ssl.SslHandler;
-import org.jboss.netty.logging.InternalLoggerFactory;
-import org.jboss.netty.logging.Slf4JLoggerFactory;
-import static org.apache.cassandra.config.EncryptionOptions.ClientEncryptionOptions;
+import io.netty.channel.Channel;
+import io.netty.channel.ChannelFuture;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelPipeline;
+import org.apache.cassandra.utils.ChecksumType;
 
-public class SimpleClient
+public class SimpleClient implements Closeable
 {
     static
     {
@@ -70,86 +72,119 @@ public class SimpleClient
     private static final Logger logger = LoggerFactory.getLogger(SimpleClient.class);
     public final String host;
     public final int port;
-    private final ClientEncryptionOptions encryptionOptions;
+    private final EncryptionOptions encryptionOptions;
 
     protected final ResponseHandler responseHandler = new ResponseHandler();
     protected final Connection.Tracker tracker = new ConnectionTracker();
+    protected final ProtocolVersion version;
     // We don't track connection really, so we don't need one Connection per channel
-    protected final Connection connection = new Connection(null, Server.CURRENT_VERSION, tracker);
-    protected ClientBootstrap bootstrap;
+    protected Connection connection;
+    protected Bootstrap bootstrap;
     protected Channel channel;
     protected ChannelFuture lastWriteFuture;
 
     private final Connection.Factory connectionFactory = new Connection.Factory()
     {
-        public Connection newConnection(Channel channel, int version)
+        public Connection newConnection(Channel channel, ProtocolVersion version)
         {
-            assert version == Server.CURRENT_VERSION;
             return connection;
         }
     };
 
-    public SimpleClient(String host, int port, ClientEncryptionOptions encryptionOptions)
+    public SimpleClient(String host, int port, ProtocolVersion version, EncryptionOptions encryptionOptions)
+    {
+        this(host, port, version, false, encryptionOptions);
+    }
+
+    public SimpleClient(String host, int port, EncryptionOptions encryptionOptions)
+    {
+        this(host, port, ProtocolVersion.CURRENT, encryptionOptions);
+    }
+
+    public SimpleClient(String host, int port, ProtocolVersion version)
+    {
+        this(host, port, version, new EncryptionOptions());
+    }
+
+    public SimpleClient(String host, int port, ProtocolVersion version, boolean useBeta, EncryptionOptions encryptionOptions)
     {
         this.host = host;
         this.port = port;
+        if (version.isBeta() && !useBeta)
+            throw new IllegalArgumentException(String.format("Beta version of server used (%s), but USE_BETA flag is not set", version));
+
+        this.version = version;
         this.encryptionOptions = encryptionOptions;
     }
 
     public SimpleClient(String host, int port)
     {
-        this(host, port, new ClientEncryptionOptions());
+        this(host, port, new EncryptionOptions());
     }
 
-    public void connect(boolean useCompression) throws IOException
+    public SimpleClient connect(boolean useCompression, boolean useChecksums) throws IOException
+    {
+        return connect(useCompression, useChecksums, false);
+    }
+
+    public SimpleClient connect(boolean useCompression, boolean useChecksums, boolean throwOnOverload) throws IOException
     {
         establishConnection();
 
-        Map<String, String> options = new HashMap<String, String>();
+        Map<String, String> options = new HashMap<>();
         options.put(StartupMessage.CQL_VERSION, "3.0.0");
-        if (useCompression)
+        if (throwOnOverload)
+            options.put(StartupMessage.THROW_ON_OVERLOAD, "1");
+        connection.setThrowOnOverload(throwOnOverload);
+
+        if (useChecksums)
         {
-            options.put(StartupMessage.COMPRESSION, "snappy");
-            connection.setCompressor(FrameCompressor.SnappyCompressor.instance);
+            Compressor compressor = useCompression ? LZ4Compressor.INSTANCE : null;
+            connection.setTransformer(ChecksummingTransformer.getTransformer(ChecksumType.CRC32, compressor));
+            options.put(StartupMessage.CHECKSUM, "crc32");
+            options.put(StartupMessage.COMPRESSION, "lz4");
         }
+        else if (useCompression)
+        {
+            connection.setTransformer(CompressingTransformer.getTransformer(LZ4Compressor.INSTANCE));
+            options.put(StartupMessage.COMPRESSION, "lz4");
+        }
+
         execute(new StartupMessage(options));
+        return this;
+    }
+
+    public void setEventHandler(EventHandler eventHandler)
+    {
+        responseHandler.eventHandler = eventHandler;
     }
 
     protected void establishConnection() throws IOException
     {
         // Configure the client.
-        bootstrap = new ClientBootstrap(
-                        new NioClientSocketChannelFactory(
-                            Executors.newCachedThreadPool(),
-                            Executors.newCachedThreadPool()));
-
-        bootstrap.setOption("tcpNoDelay", true);
+        bootstrap = new Bootstrap()
+                    .group(new NioEventLoopGroup())
+                    .channel(io.netty.channel.socket.nio.NioSocketChannel.class)
+                    .option(ChannelOption.TCP_NODELAY, true);
 
         // Configure the pipeline factory.
-        if(encryptionOptions.enabled)
+        if(encryptionOptions.isEnabled())
         {
-            bootstrap.setPipelineFactory(new SecurePipelineFactory());
+            bootstrap.handler(new SecureInitializer());
         }
         else
         {
-            bootstrap.setPipelineFactory(new PipelineFactory());
+            bootstrap.handler(new Initializer());
         }
         ChannelFuture future = bootstrap.connect(new InetSocketAddress(host, port));
 
         // Wait until the connection attempt succeeds or fails.
-        channel = future.awaitUninterruptibly().getChannel();
+        channel = future.awaitUninterruptibly().channel();
         if (!future.isSuccess())
         {
-            bootstrap.releaseExternalResources();
-            throw new IOException("Connection Error", future.getCause());
+            bootstrap.group().shutdownGracefully();
+            throw new IOException("Connection Error", future.cause());
         }
-    }
-
-    public void login(Map<String, String> credentials)
-    {
-        CredentialsMessage msg = new CredentialsMessage();
-        msg.credentials.putAll(credentials);
-        execute(msg);
     }
 
     public ResultMessage execute(String query, ConsistencyLevel consistency)
@@ -159,21 +194,21 @@ public class SimpleClient
 
     public ResultMessage execute(String query, List<ByteBuffer> values, ConsistencyLevel consistencyLevel)
     {
-        Message.Response msg = execute(new QueryMessage(query, new QueryOptions(consistencyLevel, values)));
+        Message.Response msg = execute(new QueryMessage(query, QueryOptions.forInternalCalls(consistencyLevel, values)));
         assert msg instanceof ResultMessage;
         return (ResultMessage)msg;
     }
 
     public ResultMessage.Prepared prepare(String query)
     {
-        Message.Response msg = execute(new PrepareMessage(query));
+        Message.Response msg = execute(new PrepareMessage(query, null));
         assert msg instanceof ResultMessage.Prepared;
         return (ResultMessage.Prepared)msg;
     }
 
-    public ResultMessage executePrepared(byte[] statementId, List<ByteBuffer> values, ConsistencyLevel consistency)
+    public ResultMessage executePrepared(ResultMessage.Prepared prepared, List<ByteBuffer> values, ConsistencyLevel consistency)
     {
-        Message.Response msg = execute(new ExecuteMessage(MD5Digest.wrap(statementId), new QueryOptions(consistency, values)));
+        Message.Response msg = execute(new ExecuteMessage(prepared.statementId, prepared.resultMetadataId, QueryOptions.forInternalCalls(consistency, values)));
         assert msg instanceof ResultMessage;
         return (ResultMessage)msg;
     }
@@ -189,15 +224,15 @@ public class SimpleClient
         channel.close().awaitUninterruptibly();
 
         // Shut down all thread pools to exit.
-        bootstrap.releaseExternalResources();
+        bootstrap.group().shutdownGracefully();
     }
 
-    protected Message.Response execute(Message.Request request)
+    public Message.Response execute(Message.Request request)
     {
         try
         {
             request.attach(connection);
-            lastWriteFuture = channel.write(request);
+            lastWriteFuture = channel.writeAndFlush(request);
             Message.Response msg = responseHandler.responses.take();
             if (msg instanceof ErrorMessage)
                 throw new RuntimeException((Throwable)((ErrorMessage)msg).error);
@@ -209,74 +244,88 @@ public class SimpleClient
         }
     }
 
+    public interface EventHandler
+    {
+        void onEvent(Event event);
+    }
+
+    public static class SimpleEventHandler implements EventHandler
+    {
+        public final LinkedBlockingQueue<Event> queue = new LinkedBlockingQueue<>();
+
+        public void onEvent(Event event)
+        {
+            queue.add(event);
+        }
+    }
+
     // Stateless handlers
     private static final Message.ProtocolDecoder messageDecoder = new Message.ProtocolDecoder();
     private static final Message.ProtocolEncoder messageEncoder = new Message.ProtocolEncoder();
-    private static final Frame.Decompressor frameDecompressor = new Frame.Decompressor();
-    private static final Frame.Compressor frameCompressor = new Frame.Compressor();
+    private static final Frame.InboundBodyTransformer inboundFrameTransformer = new Frame.InboundBodyTransformer();
+    private static final Frame.OutboundBodyTransformer outboundFrameTransformer = new Frame.OutboundBodyTransformer();
     private static final Frame.Encoder frameEncoder = new Frame.Encoder();
 
     private static class ConnectionTracker implements Connection.Tracker
     {
         public void addConnection(Channel ch, Connection connection) {}
-        public void closeAll() {}
+
+        public boolean isRegistered(Event.Type type, Channel ch)
+        {
+            return false;
+        }
     }
 
-    private class PipelineFactory implements ChannelPipelineFactory
+    private class Initializer extends ChannelInitializer<Channel>
     {
-        public ChannelPipeline getPipeline() throws Exception
+        protected void initChannel(Channel channel) throws Exception
         {
-            ChannelPipeline pipeline = Channels.pipeline();
+            connection = new Connection(channel, version, tracker);
+            channel.attr(Connection.attributeKey).set(connection);
 
-            //pipeline.addLast("debug", new LoggingHandler());
-
+            ChannelPipeline pipeline = channel.pipeline();
             pipeline.addLast("frameDecoder", new Frame.Decoder(connectionFactory));
             pipeline.addLast("frameEncoder", frameEncoder);
 
-            pipeline.addLast("frameDecompressor", frameDecompressor);
-            pipeline.addLast("frameCompressor", frameCompressor);
+            pipeline.addLast("inboundFrameTransformer", inboundFrameTransformer);
+            pipeline.addLast("outboundFrameTransformer", outboundFrameTransformer);
 
             pipeline.addLast("messageDecoder", messageDecoder);
             pipeline.addLast("messageEncoder", messageEncoder);
 
             pipeline.addLast("handler", responseHandler);
-
-            return pipeline;
         }
     }
 
-    private class SecurePipelineFactory extends PipelineFactory
+    private class SecureInitializer extends Initializer
     {
-        private final SSLContext sslContext;
-
-        public SecurePipelineFactory() throws IOException
+        protected void initChannel(Channel channel) throws Exception
         {
-            this.sslContext = SSLFactory.createSSLContext(encryptionOptions, true);
-        }
-
-        public ChannelPipeline getPipeline() throws Exception
-        {
-            SSLEngine sslEngine = sslContext.createSSLEngine();
-            sslEngine.setUseClientMode(true);
-            sslEngine.setEnabledCipherSuites(encryptionOptions.cipher_suites);
-            ChannelPipeline pipeline = super.getPipeline();
-
-            pipeline.addFirst("ssl", new SslHandler(sslEngine));
-            return pipeline;
+            super.initChannel(channel);
+            SslContext sslContext = SSLFactory.getOrCreateSslContext(encryptionOptions, encryptionOptions.require_client_auth,
+                                                                     SSLFactory.SocketType.CLIENT);
+            channel.pipeline().addFirst("ssl", sslContext.newHandler(channel.alloc()));
         }
     }
 
-    private static class ResponseHandler extends SimpleChannelUpstreamHandler
+    @ChannelHandler.Sharable
+    private static class ResponseHandler extends SimpleChannelInboundHandler<Message.Response>
     {
-        public final BlockingQueue<Message.Response> responses = new SynchronousQueue<Message.Response>(true);
+        public final BlockingQueue<Message.Response> responses = new SynchronousQueue<>(true);
+        public EventHandler eventHandler;
 
         @Override
-        public void messageReceived(ChannelHandlerContext ctx, MessageEvent e)
+        public void channelRead0(ChannelHandlerContext ctx, Message.Response r)
         {
-            assert e.getMessage() instanceof Message.Response;
             try
             {
-                responses.put((Message.Response)e.getMessage());
+                if (r instanceof EventMessage)
+                {
+                    if (eventHandler != null)
+                        eventHandler.onEvent(((EventMessage) r).event);
+                }
+                else
+                    responses.put(r);
             }
             catch (InterruptedException ie)
             {
@@ -284,11 +333,11 @@ public class SimpleClient
             }
         }
 
-        public void exceptionCaught(ChannelHandlerContext ctx, ExceptionEvent e) throws Exception
+        public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception
         {
-            if (this == ctx.getPipeline().getLast())
-                logger.error("Exception in response", e.getCause());
-            ctx.sendUpstream(e);
+            if (this == ctx.pipeline().last())
+                logger.error("Exception in response", cause);
+            ctx.fireExceptionCaught(cause);
         }
     }
 }

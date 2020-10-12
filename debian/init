@@ -19,13 +19,10 @@ NAME=cassandra
 PIDFILE=/var/run/$NAME/$NAME.pid
 SCRIPTNAME=/etc/init.d/$NAME
 CONFDIR=/etc/cassandra
-JSVC=/usr/bin/jsvc
 WAIT_FOR_START=10
 CASSANDRA_HOME=/usr/share/cassandra
+CASSANDRA_CONF=$CONFDIR
 FD_LIMIT=100000
-
-# The first existing directory is used for JAVA_HOME if needed.
-JVM_SEARCH_DIRS="/usr/lib/jvm/default-java"
 
 [ -e /usr/share/cassandra/apache-cassandra.jar ] || exit 0
 [ -e /etc/cassandra/cassandra.yaml ] || exit 0
@@ -34,41 +31,8 @@ JVM_SEARCH_DIRS="/usr/lib/jvm/default-java"
 # Read configuration variable file if it is present
 [ -r /etc/default/$NAME ] && . /etc/default/$NAME
 
-# If JAVA_HOME has not been set, try to determine it.
-if [ -z "$JAVA_HOME" ]; then
-    # If java is in PATH, use a JAVA_HOME that corresponds to that. This is
-    # both consistent with how the upstream startup script works, and how
-    # Debian works (read: the use of alternatives to set a system JVM).
-    if [ -n "`which java`" ]; then
-        java=`which java`
-        # Dereference symlink(s)
-        while true; do
-            if [ -h "$java" ]; then
-                java=`readlink "$java"`
-                continue
-            fi
-            break
-        done
-        JAVA_HOME="`dirname $java`/../"
-    # No JAVA_HOME set and no java found in PATH, search for a JVM.
-    else
-        for jdir in $JVM_SEARCH_DIRS; do
-            if [ -x "$jdir/bin/java" ]; then
-                JAVA_HOME="$jdir"
-                break
-            fi
-        done
-    fi
-fi
-JAVA="$JAVA_HOME/bin/java"
-
-# Read Cassandra environment file.
-. /etc/cassandra/cassandra-env.sh
-
-if [ -z "$JVM_OPTS" ]; then
-    echo "Initialization failed; \$JVM_OPTS not set!" >&2
-    exit 3
-fi
+# Export JAVA_HOME, if set.
+[ -n "$JAVA_HOME" ] && export JAVA_HOME
 
 # Load the VERBOSE setting and other rcS variables
 . /lib/init/vars.sh
@@ -77,10 +41,6 @@ fi
 # Depend on lsb-base (>= 3.0-6) to ensure that this file is present.
 . /lib/lsb/init-functions
 
-# If JNA is installed, add it to EXTRA_CLASSPATH
-#
-EXTRA_CLASSPATH="/usr/share/java/jna.jar:$EXTRA_CLASSPATH"
-
 #
 # Function that returns 0 if process is running, or nonzero if not.
 #
@@ -88,7 +48,7 @@ EXTRA_CLASSPATH="/usr/share/java/jna.jar:$EXTRA_CLASSPATH"
 # process is not running but the pidfile exists (to match the exit codes for
 # the "status" command; see LSB core spec 3.1, section 20.2)
 #
-CMD_PATT="cassandra.+CassandraDaemon"
+CMD_PATT="Dcassandra-pidfile=.*cassandra\.pid"
 is_running()
 {
     if [ -f $PIDFILE ]; then
@@ -117,9 +77,9 @@ do_start()
     error_log_f="$cassandra_home/hs_err_`date +%s`.log"
 
     [ -e `dirname "$PIDFILE"` ] || \
-        install -d -ocassandra -gcassandra -m750 `dirname $PIDFILE`
+        install -d -ocassandra -gcassandra -m755 `dirname $PIDFILE`
 
-    export EXTRA_CLASSPATH
+
 
     start-stop-daemon -S -c cassandra -a /usr/sbin/cassandra -q -p "$PIDFILE" -t >/dev/null || return 1
 
@@ -138,7 +98,7 @@ do_stop()
     #   1 if daemon was already stopped
     #   2 if daemon could not be stopped
     #   other if a failure occurred
-    start-stop-daemon -K -p "$PIDFILE" -R TERM/30/KILL/5 >/dev/null
+    start-stop-daemon -K -u cassandra -p "$PIDFILE" -R TERM/30/KILL/5 >/dev/null
     RET=$?
     rm -f "$PIDFILE"
     return $RET

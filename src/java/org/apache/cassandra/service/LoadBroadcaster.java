@@ -17,40 +17,42 @@
  */
 package org.apache.cassandra.service;
 
-import java.net.InetAddress;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.TimeUnit;
 
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.metrics.StorageMetrics;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.cassandra.concurrent.ScheduledExecutors;
 import org.apache.cassandra.gms.*;
 
 public class LoadBroadcaster implements IEndpointStateChangeSubscriber
 {
-    static final int BROADCAST_INTERVAL = 60 * 1000;
+    static final int BROADCAST_INTERVAL = Integer.getInteger("cassandra.broadcast_interval_ms", 60 * 1000);
 
     public static final LoadBroadcaster instance = new LoadBroadcaster();
 
     private static final Logger logger = LoggerFactory.getLogger(LoadBroadcaster.class);
 
-    private ConcurrentMap<InetAddress, Double> loadInfo = new ConcurrentHashMap<InetAddress, java.lang.Double>();
+    private ConcurrentMap<InetAddressAndPort, Double> loadInfo = new ConcurrentHashMap<>();
 
     private LoadBroadcaster()
     {
         Gossiper.instance.register(this);
     }
 
-    public void onChange(InetAddress endpoint, ApplicationState state, VersionedValue value)
+    public void onChange(InetAddressAndPort endpoint, ApplicationState state, VersionedValue value)
     {
         if (state != ApplicationState.LOAD)
             return;
         loadInfo.put(endpoint, Double.valueOf(value.value));
     }
 
-    public void onJoin(InetAddress endpoint, EndpointState epState)
+    public void onJoin(InetAddressAndPort endpoint, EndpointState epState)
     {
         VersionedValue localValue = epState.getApplicationState(ApplicationState.LOAD);
         if (localValue != null)
@@ -59,20 +61,20 @@ public class LoadBroadcaster implements IEndpointStateChangeSubscriber
         }
     }
     
-    public void beforeChange(InetAddress endpoint, EndpointState currentState, ApplicationState newStateKey, VersionedValue newValue) {}
+    public void beforeChange(InetAddressAndPort endpoint, EndpointState currentState, ApplicationState newStateKey, VersionedValue newValue) {}
 
-    public void onAlive(InetAddress endpoint, EndpointState state) {}
+    public void onAlive(InetAddressAndPort endpoint, EndpointState state) {}
 
-    public void onDead(InetAddress endpoint, EndpointState state) {}
+    public void onDead(InetAddressAndPort endpoint, EndpointState state) {}
 
-    public void onRestart(InetAddress endpoint, EndpointState state) {}
+    public void onRestart(InetAddressAndPort endpoint, EndpointState state) {}
 
-    public void onRemove(InetAddress endpoint)
+    public void onRemove(InetAddressAndPort endpoint)
     {
         loadInfo.remove(endpoint);
     }
 
-    public Map<InetAddress, Double> getLoadInfo()
+    public Map<InetAddressAndPort, Double> getLoadInfo()
     {
         return Collections.unmodifiableMap(loadInfo);
     }
@@ -85,13 +87,13 @@ public class LoadBroadcaster implements IEndpointStateChangeSubscriber
         {
             public void run()
             {
-                if (logger.isDebugEnabled())
-                    logger.debug("Disseminating load info ...");
+                if (logger.isTraceEnabled())
+                    logger.trace("Disseminating load info ...");
                 Gossiper.instance.addLocalApplicationState(ApplicationState.LOAD,
-                                                           StorageService.instance.valueFactory.load(StorageService.instance.getLoad()));
+                                                           StorageService.instance.valueFactory.load(StorageMetrics.load.getCount()));
             }
         };
-        StorageService.scheduledTasks.scheduleWithFixedDelay(runnable, 2 * Gossiper.intervalInMillis, BROADCAST_INTERVAL, TimeUnit.MILLISECONDS);
+        ScheduledExecutors.scheduledTasks.scheduleWithFixedDelay(runnable, 2 * Gossiper.intervalInMillis, BROADCAST_INTERVAL, TimeUnit.MILLISECONDS);
     }
 }
 

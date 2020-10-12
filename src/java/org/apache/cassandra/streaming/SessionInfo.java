@@ -18,21 +18,25 @@
 package org.apache.cassandra.streaming;
 
 import java.io.Serializable;
-import java.net.InetAddress;
 import java.util.Collection;
-import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 import com.google.common.base.Predicate;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Iterables;
+
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.utils.FBUtilities;
 
 /**
  * Stream session info.
  */
 public final class SessionInfo implements Serializable
 {
-    public final InetAddress peer;
+    public final InetAddressAndPort peer;
+    public final int sessionIndex;
+    public final InetAddressAndPort connecting;
     /** Immutable collection of receiving summaries */
     public final Collection<StreamSummary> receivingSummaries;
     /** Immutable collection of sending summaries*/
@@ -43,16 +47,20 @@ public final class SessionInfo implements Serializable
     private final Map<String, ProgressInfo> receivingFiles;
     private final Map<String, ProgressInfo> sendingFiles;
 
-    public SessionInfo(InetAddress peer,
+    public SessionInfo(InetAddressAndPort peer,
+                       int sessionIndex,
+                       InetAddressAndPort connecting,
                        Collection<StreamSummary> receivingSummaries,
                        Collection<StreamSummary> sendingSummaries,
                        StreamSession.State state)
     {
         this.peer = peer;
+        this.sessionIndex = sessionIndex;
+        this.connecting = connecting;
         this.receivingSummaries = ImmutableSet.copyOf(receivingSummaries);
         this.sendingSummaries = ImmutableSet.copyOf(sendingSummaries);
-        this.receivingFiles = new HashMap<>();
-        this.sendingFiles = new HashMap<>();
+        this.receivingFiles = new ConcurrentHashMap<>();
+        this.sendingFiles = new ConcurrentHashMap<>();
         this.state = state;
     }
 
@@ -62,11 +70,11 @@ public final class SessionInfo implements Serializable
     }
 
     /**
-     * Update progress of receiving/sending file.
+     * Update progress of receiving/sending stream.
      *
      * @param newProgress new progress info
      */
-    public synchronized void updateProgress(ProgressInfo newProgress)
+    public void updateProgress(ProgressInfo newProgress)
     {
         assert peer.equals(newProgress.peer);
 
@@ -149,11 +157,11 @@ public final class SessionInfo implements Serializable
         return getTotalSizes(sendingSummaries);
     }
 
-    private long getTotalSizeInProgress(Collection<ProgressInfo> files)
+    private long getTotalSizeInProgress(Collection<ProgressInfo> streams)
     {
         long total = 0;
-        for (ProgressInfo file : files)
-            total += file.currentBytes;
+        for (ProgressInfo stream : streams)
+            total += stream.currentBytes;
         return total;
     }
 
@@ -183,5 +191,10 @@ public final class SessionInfo implements Serializable
             }
         });
         return Iterables.size(completed);
+    }
+
+    public SessionSummary createSummary()
+    {
+        return new SessionSummary(FBUtilities.getBroadcastAddressAndPort(), peer, receivingSummaries, sendingSummaries);
     }
 }

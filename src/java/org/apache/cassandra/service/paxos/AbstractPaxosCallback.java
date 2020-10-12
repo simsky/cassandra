@@ -1,4 +1,3 @@
-package org.apache.cassandra.service.paxos;
 /*
  * 
  * Licensed to the Apache Software Foundation (ASF) under one
@@ -19,31 +18,31 @@ package org.apache.cassandra.service.paxos;
  * under the License.
  * 
  */
-
+package org.apache.cassandra.service.paxos;
 
 import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.TimeUnit;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.ConsistencyLevel;
 import org.apache.cassandra.db.WriteType;
 import org.apache.cassandra.exceptions.WriteTimeoutException;
-import org.apache.cassandra.net.IAsyncCallback;
+import org.apache.cassandra.net.RequestCallback;
 
-public abstract class AbstractPaxosCallback<T> implements IAsyncCallback<T>
+import static java.util.concurrent.TimeUnit.NANOSECONDS;
+
+public abstract class AbstractPaxosCallback<T> implements RequestCallback<T>
 {
     protected final CountDownLatch latch;
     protected final int targets;
+    private final ConsistencyLevel consistency;
+    private final long queryStartNanoTime;
 
-    public AbstractPaxosCallback(int targets)
+    public AbstractPaxosCallback(int targets, ConsistencyLevel consistency, long queryStartNanoTime)
     {
         this.targets = targets;
+        this.consistency = consistency;
         latch = new CountDownLatch(targets);
-    }
-
-    public boolean isLatencyForSnitch()
-    {
-        return false;
+        this.queryStartNanoTime = queryStartNanoTime;
     }
 
     public int getResponseCount()
@@ -55,8 +54,9 @@ public abstract class AbstractPaxosCallback<T> implements IAsyncCallback<T>
     {
         try
         {
-            if (!latch.await(DatabaseDescriptor.getWriteRpcTimeout(), TimeUnit.MILLISECONDS))
-                throw new WriteTimeoutException(WriteType.CAS, ConsistencyLevel.SERIAL, getResponseCount(), targets);
+            long timeout = DatabaseDescriptor.getWriteRpcTimeout(NANOSECONDS) - (System.nanoTime() - queryStartNanoTime);
+            if (!latch.await(timeout, NANOSECONDS))
+                throw new WriteTimeoutException(WriteType.CAS, consistency, getResponseCount(), targets);
         }
         catch (InterruptedException ex)
         {

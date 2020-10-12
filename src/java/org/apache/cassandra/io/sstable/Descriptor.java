@@ -18,11 +18,22 @@
 package org.apache.cassandra.io.sstable;
 
 import java.io.File;
-import java.util.StringTokenizer;
+import java.io.IOError;
+import java.io.IOException;
+import java.util.*;
+import java.util.regex.Pattern;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Objects;
+import com.google.common.base.Splitter;
 
+import org.apache.cassandra.db.Directories;
+import org.apache.cassandra.io.sstable.format.SSTableFormat;
+import org.apache.cassandra.io.sstable.format.Version;
+import org.apache.cassandra.io.sstable.metadata.IMetadataSerializer;
+import org.apache.cassandra.io.sstable.metadata.MetadataSerializer;
 import org.apache.cassandra.utils.Pair;
+import org.apache.cassandra.utils.UUIDGen;
 
 import static org.apache.cassandra.io.sstable.Component.separator;
 
@@ -35,225 +46,286 @@ import static org.apache.cassandra.io.sstable.Component.separator;
  */
 public class Descriptor
 {
-    // versions are denoted as [major][minor].  Minor versions must be forward-compatible:
-    // new fields are allowed in e.g. the metadata component, but fields can't be removed
-    // or have their size changed.
-    //
-    // Minor versions were introduced with version "hb" for Cassandra 1.0.3; prior to that,
-    // we always incremented the major version.
-    public static class Version
-    {
-        // This needs to be at the beginning for initialization sake
-        public static final String current_version = "jc";
+    private final static String LEGACY_TMP_REGEX_STR = "^((.*)\\-(.*)\\-)?tmp(link)?\\-((?:l|k).)\\-(\\d)*\\-(.*)$";
+    private final static Pattern LEGACY_TMP_REGEX = Pattern.compile(LEGACY_TMP_REGEX_STR);
 
-        // ic (1.2.5): omits per-row bloom filter of column names
-        // ja (2.0.0): super columns are serialized as composites (note that there is no real format change,
-        //               this is mostly a marker to know if we should expect super columns or not. We do need
-        //               a major version bump however, because we should not allow streaming of super columns
-        //               into this new format)
-        //             tracks max local deletiontime in sstable metadata
-        //             records bloom_filter_fp_chance in metadata component
-        //             remove data size and column count from data file (CASSANDRA-4180)
-        //             tracks max/min column values (according to comparator)
-        // jb (2.0.1): switch from crc32 to adler32 for compression checksums
-        //             checksum the compressed data
-        // jc (2.1.0): index summaries can be downsampled and the sampling level is persisted
+    public static String TMP_EXT = ".tmp";
 
-        public static final Version CURRENT = new Version(current_version);
+    private static final Splitter filenameSplitter = Splitter.on('-');
 
-        private final String version;
-
-        public final boolean isLatestVersion;
-        public final boolean hasSuperColumns;
-        public final boolean tracksMaxLocalDeletionTime;
-        public final boolean hasBloomFilterFPChance;
-        public final boolean offHeapSummaries;
-        public final boolean hasRowSizeAndColumnCount;
-        public final boolean tracksMaxMinColumnNames;
-        public final boolean hasPostCompressionAdlerChecksums;
-        public final boolean hasSamplingLevel;
-
-        public Version(String version)
-        {
-            this.version = version;
-            tracksMaxLocalDeletionTime = version.compareTo("ja") >= 0;
-            isLatestVersion = version.compareTo(current_version) == 0;
-            hasSuperColumns = version.compareTo("ja") < 0;
-            hasBloomFilterFPChance = version.compareTo("ja") >= 0;
-            offHeapSummaries = version.compareTo("ja") >= 0;
-            hasRowSizeAndColumnCount = version.compareTo("ja") < 0;
-            tracksMaxMinColumnNames = version.compareTo("ja") >= 0;
-            hasPostCompressionAdlerChecksums = version.compareTo("jb") >= 0;
-            hasSamplingLevel = version.compareTo("jc") >= 0;
-        }
-
-        /**
-         * @param ver SSTable version
-         * @return True if the given version string matches the format.
-         * @see #version
-         */
-        static boolean validate(String ver)
-        {
-            return ver != null && ver.matches("[a-z]+");
-        }
-
-        public boolean isCompatible()
-        {
-            return version.compareTo("ic") >= 0 && version.charAt(0) <= CURRENT.version.charAt(0);
-        }
-
-        public boolean isStreamCompatible()
-        {
-            return isCompatible() && version.charAt(0) >= 'j';
-        }
-
-        @Override
-        public String toString()
-        {
-            return version;
-        }
-
-        @Override
-        public boolean equals(Object o)
-        {
-            if (o == this)
-                return true;
-            if (!(o instanceof Version))
-                return false;
-            return version.equals(((Version)o).version);
-        }
-
-        @Override
-        public int hashCode()
-        {
-            return version.hashCode();
-        }
-    }
-
+    /** canonicalized path to the directory where SSTable resides */
     public final File directory;
     /** version has the following format: <code>[a-z]+</code> */
     public final Version version;
     public final String ksname;
     public final String cfname;
     public final int generation;
-    public final boolean temporary;
+    public final SSTableFormat.Type formatType;
     private final int hashCode;
 
     /**
      * A descriptor that assumes CURRENT_VERSION.
      */
-    public Descriptor(File directory, String ksname, String cfname, int generation, boolean temp)
+    @VisibleForTesting
+    public Descriptor(File directory, String ksname, String cfname, int generation)
     {
-        this(Version.CURRENT, directory, ksname, cfname, generation, temp);
+        this(SSTableFormat.Type.current().info.getLatestVersion(), directory, ksname, cfname, generation, SSTableFormat.Type.current());
     }
 
-    public Descriptor(String version, File directory, String ksname, String cfname, int generation, boolean temp)
+    /**
+     * Constructor for sstable writers only.
+     */
+    public Descriptor(File directory, String ksname, String cfname, int generation, SSTableFormat.Type formatType)
     {
-        this(new Version(version), directory, ksname, cfname, generation, temp);
+        this(formatType.info.getLatestVersion(), directory, ksname, cfname, generation, formatType);
     }
 
-    public Descriptor(Version version, File directory, String ksname, String cfname, int generation, boolean temp)
+    public Descriptor(Version version, File directory, String ksname, String cfname, int generation, SSTableFormat.Type formatType)
     {
-        assert version != null && directory != null && ksname != null && cfname != null;
+        assert version != null && directory != null && ksname != null && cfname != null && formatType.info.getLatestVersion().getClass().equals(version.getClass());
         this.version = version;
-        this.directory = directory;
+        try
+        {
+            this.directory = directory.getCanonicalFile();
+        }
+        catch (IOException e)
+        {
+            throw new IOError(e);
+        }
         this.ksname = ksname;
         this.cfname = cfname;
         this.generation = generation;
-        temporary = temp;
-        hashCode = Objects.hashCode(directory, generation, ksname, cfname, temp);
+        this.formatType = formatType;
+
+        hashCode = Objects.hashCode(version, this.directory, generation, ksname, cfname, formatType);
     }
 
     public Descriptor withGeneration(int newGeneration)
     {
-        return new Descriptor(version, directory, ksname, cfname, newGeneration, temporary);
+        return new Descriptor(version, directory, ksname, cfname, newGeneration, formatType);
+    }
+
+    public Descriptor withFormatType(SSTableFormat.Type newType)
+    {
+        return new Descriptor(newType.info.getLatestVersion(), directory, ksname, cfname, generation, newType);
+    }
+
+    public String tmpFilenameFor(Component component)
+    {
+        return filenameFor(component) + TMP_EXT;
+    }
+
+    /**
+     * @return a unique temporary file name for given component during entire-sstable-streaming.
+     */
+    public String tmpFilenameForStreaming(Component component)
+    {
+        // Use UUID to handle concurrent streamings on the same sstable.
+        // TMP_EXT allows temp file to be removed by {@link ColumnFamilyStore#scrubDataDirectories}
+        return String.format("%s.%s%s", filenameFor(component), UUIDGen.getTimeUUID(), TMP_EXT);
     }
 
     public String filenameFor(Component component)
     {
-        return filenameFor(component.name());
+        return baseFilename() + separator + component.name();
     }
 
     public String baseFilename()
     {
         StringBuilder buff = new StringBuilder();
         buff.append(directory).append(File.separatorChar);
-        buff.append(ksname).append(separator);
-        buff.append(cfname).append(separator);
-        if (temporary)
-            buff.append(SSTable.TEMPFILE_MARKER).append(separator);
-        buff.append(version).append(separator);
-        buff.append(generation);
+        appendFileName(buff);
         return buff.toString();
     }
 
-    /**
-     * @param suffix A component suffix, such as 'Data.db'/'Index.db'/etc
-     * @return A filename for this descriptor with the given suffix.
-     */
-    public String filenameFor(String suffix)
+    private void appendFileName(StringBuilder buff)
     {
-        return baseFilename() + separator + suffix;
+        buff.append(version).append(separator);
+        buff.append(generation);
+        buff.append(separator).append(formatType.name);
+    }
+
+    public String relativeFilenameFor(Component component)
+    {
+        final StringBuilder buff = new StringBuilder();
+        if (Directories.isSecondaryIndexFolder(directory))
+        {
+            buff.append(directory.getName()).append(File.separator);
+        }
+
+        appendFileName(buff);
+        buff.append(separator).append(component.name());
+        return buff.toString();
+    }
+
+    public SSTableFormat getFormat()
+    {
+        return formatType.info;
+    }
+
+    /** Return any temporary files found in the directory */
+    public List<File> getTemporaryFiles()
+    {
+        File[] tmpFiles = directory.listFiles((dir, name) ->
+                                              name.endsWith(Descriptor.TMP_EXT));
+
+        List<File> ret = new ArrayList<>(tmpFiles.length);
+        for (File tmpFile : tmpFiles)
+            ret.add(tmpFile);
+
+        return ret;
+    }
+
+    public static boolean isValidFile(File file)
+    {
+        String filename = file.getName();
+        return filename.endsWith(".db") && !LEGACY_TMP_REGEX.matcher(filename).matches();
     }
 
     /**
-     * @see #fromFilename(File directory, String name)
-     * @param filename The SSTable filename
-     * @return Descriptor of the SSTable initialized from filename
+     * Parse a sstable filename into a Descriptor.
+     * <p>
+     * This is a shortcut for {@code fromFilename(new File(filename))}.
+     *
+     * @param filename the filename to a sstable component.
+     * @return the descriptor for the parsed file.
+     *
+     * @throws IllegalArgumentException if the provided {@code file} does point to a valid sstable filename. This could
+     * mean either that the filename doesn't look like a sstable file, or that it is for an old and unsupported
+     * versions.
      */
     public static Descriptor fromFilename(String filename)
     {
-        File file = new File(filename);
-        return fromFilename(file.getParentFile(), file.getName()).left;
+        return fromFilename(new File(filename));
     }
 
     /**
-     * Filename of the form "<ksname>-<cfname>-[tmp-][<version>-]<gen>-<component>"
+     * Parse a sstable filename into a Descriptor.
+     * <p>
+     * SSTables files are all located within subdirectories of the form {@code <keyspace>/<table>/}. Normal sstables are
+     * are directly within that subdirectory structure while 2ndary index, backups and snapshot are each inside an
+     * additional subdirectory. The file themselves have the form:
+     *   {@code <version>-<gen>-<format>-<component>}.
+     * <p>
+     * Note that this method will only sucessfully parse sstable files of supported versions.
      *
-     * @param directory The directory of the SSTable files
-     * @param name The name of the SSTable file
+     * @param file the {@code File} object for the filename to parse.
+     * @return the descriptor for the parsed file.
      *
-     * @return A Descriptor for the SSTable, and the Component remainder.
+     * @throws IllegalArgumentException if the provided {@code file} does point to a valid sstable filename. This could
+     * mean either that the filename doesn't look like a sstable file, or that it is for an old and unsupported
+     * versions.
      */
-    public static Pair<Descriptor,String> fromFilename(File directory, String name)
+    public static Descriptor fromFilename(File file)
     {
-        // tokenize the filename
-        StringTokenizer st = new StringTokenizer(name, String.valueOf(separator));
-        String nexttok;
+        return fromFilenameWithComponent(file).left;
+    }
 
-        // all filenames must start with keyspace and column family
-        String ksname = st.nextToken();
-        String cfname = st.nextToken();
+    /**
+     * Parse a sstable filename, extracting both the {@code Descriptor} and {@code Component} part.
+     *
+     * @param file the {@code File} object for the filename to parse.
+     * @return a pair of the descriptor and component corresponding to the provided {@code file}.
+     *
+     * @throws IllegalArgumentException if the provided {@code file} does point to a valid sstable filename. This could
+     * mean either that the filename doesn't look like a sstable file, or that it is for an old and unsupported
+     * versions.
+     */
+    public static Pair<Descriptor, Component> fromFilenameWithComponent(File file)
+    {
+        // We need to extract the keyspace and table names from the parent directories, so make sure we deal with the
+        // absolute path.
+        if (!file.isAbsolute())
+            file = file.getAbsoluteFile();
 
-        // optional temporary marker
-        nexttok = st.nextToken();
-        boolean temporary = false;
-        if (nexttok.equals(SSTable.TEMPFILE_MARKER))
+        String name = file.getName();
+        List<String> tokens = filenameSplitter.splitToList(name);
+        int size = tokens.size();
+
+        if (size != 4)
         {
-            temporary = true;
-            nexttok = st.nextToken();
+            // This is an invalid sstable file for this version. But to provide a more helpful error message, we detect
+            // old format sstable, which had the format:
+            //   <keyspace>-<table>-(tmp-)?<version>-<gen>-<component>
+            // Note that we assume it's an old format sstable if it has the right number of tokens: this is not perfect
+            // but we're just trying to be helpful, not perfect.
+            if (size == 5 || size == 6)
+                throw new IllegalArgumentException(String.format("%s is of version %s which is now unsupported and cannot be read.",
+                                                                 name,
+                                                                 tokens.get(size - 3)));
+            throw new IllegalArgumentException(String.format("Invalid sstable file %s: the name doesn't look like a supported sstable file name", name));
         }
 
-        if (!Version.validate(nexttok))
-            throw new UnsupportedOperationException("SSTable " + name + " is too old to open.  Upgrade to 1.2.5 first, and run upgradesstables");
-        Version version = new Version(nexttok);
+        String versionString = tokens.get(0);
+        if (!Version.validate(versionString))
+            throw invalidSSTable(name, "invalid version %s", versionString);
 
-        nexttok = st.nextToken();
-        int generation = Integer.parseInt(nexttok);
+        int generation;
+        try
+        {
+            generation = Integer.parseInt(tokens.get(1));
+        }
+        catch (NumberFormatException e)
+        {
+            throw invalidSSTable(name, "the 'generation' part of the name doesn't parse as a number");
+        }
 
-        // component suffix
-        String component = st.nextToken();
-        directory = directory != null ? directory : new File(".");
-        return Pair.create(new Descriptor(version, directory, ksname, cfname, generation, temporary), component);
+        String formatString = tokens.get(2);
+        SSTableFormat.Type format;
+        try
+        {
+            format = SSTableFormat.Type.validate(formatString);
+        }
+        catch (IllegalArgumentException e)
+        {
+            throw invalidSSTable(name, "unknown 'format' part (%s)", formatString);
+        }
+
+        Component component = Component.parse(tokens.get(3));
+
+        Version version = format.info.getVersion(versionString);
+        if (!version.isCompatible())
+            throw invalidSSTable(name, "incompatible sstable version (%s); you should have run upgradesstables before upgrading", versionString);
+
+        File directory = parentOf(name, file);
+        File tableDir = directory;
+
+        // Check if it's a 2ndary index directory (not that it doesn't exclude it to be also a backup or snapshot)
+        String indexName = "";
+        if (Directories.isSecondaryIndexFolder(tableDir))
+        {
+            indexName = tableDir.getName();
+            tableDir = parentOf(name, tableDir);
+        }
+
+        // Then it can be a backup or a snapshot
+        if (tableDir.getName().equals(Directories.BACKUPS_SUBDIR))
+            tableDir = tableDir.getParentFile();
+        else if (parentOf(name, tableDir).getName().equals(Directories.SNAPSHOT_SUBDIR))
+            tableDir = parentOf(name, parentOf(name, tableDir));
+
+        String table = tableDir.getName().split("-")[0] + indexName;
+        String keyspace = parentOf(name, tableDir).getName();
+
+        return Pair.create(new Descriptor(version, directory, keyspace, table, generation, format), component);
     }
 
-    /**
-     * @param temporary temporary flag
-     * @return A clone of this descriptor with the given 'temporary' status.
-     */
-    public Descriptor asTemporary(boolean temporary)
+    private static File parentOf(String name, File file)
     {
-        return new Descriptor(version, directory, ksname, cfname, generation, temporary);
+        File parent = file.getParentFile();
+        if (parent == null)
+            throw invalidSSTable(name, "cannot extract keyspace and table name; make sure the sstable is in the proper sub-directories");
+        return parent;
+    }
+
+    private static IllegalArgumentException invalidSSTable(String name, String msgFormat, Object... parameters)
+    {
+        throw new IllegalArgumentException(String.format("Invalid sstable file " + name + ": " + msgFormat, parameters));
+    }
+
+    public IMetadataSerializer getMetadataSerializer()
+    {
+        return new MetadataSerializer();
     }
 
     /**
@@ -262,17 +334,6 @@ public class Descriptor
     public boolean isCompatible()
     {
         return version.isCompatible();
-    }
-
-    /**
-     * @return true if the current Cassandra version can stream the given sstable version
-     * from another node.  This is stricter than opening it locally [isCompatible] because
-     * streaming needs to rebuild all the non-data components, and it only knows how to write
-     * the latest version.
-     */
-    public boolean isStreamCompatible()
-    {
-        return version.isStreamCompatible();
     }
 
     @Override
@@ -289,7 +350,11 @@ public class Descriptor
         if (!(o instanceof Descriptor))
             return false;
         Descriptor that = (Descriptor)o;
-        return that.directory.equals(this.directory) && that.generation == this.generation && that.ksname.equals(this.ksname) && that.cfname.equals(this.cfname) && that.temporary == this.temporary;
+        return that.directory.equals(this.directory)
+                       && that.generation == this.generation
+                       && that.ksname.equals(this.ksname)
+                       && that.cfname.equals(this.cfname)
+                       && that.formatType == this.formatType;
     }
 
     @Override

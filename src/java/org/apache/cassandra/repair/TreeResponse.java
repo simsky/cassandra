@@ -17,21 +17,20 @@
  */
 package org.apache.cassandra.repair;
 
-import java.net.InetAddress;
-
-import org.apache.cassandra.utils.MerkleTree;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.utils.MerkleTrees;
 
 /**
  * Merkle tree response sent from given endpoint.
  */
 public class TreeResponse
 {
-    public final InetAddress endpoint;
-    public final MerkleTree tree;
+    public final InetAddressAndPort endpoint;
+    public final MerkleTrees trees;
 
-    public TreeResponse(InetAddress endpoint, MerkleTree tree)
+    public TreeResponse(InetAddressAndPort endpoint, MerkleTrees trees)
     {
         this.endpoint = endpoint;
-        this.tree = tree;
+        this.trees = trees;
     }
 }

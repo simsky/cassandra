@@ -33,42 +33,26 @@ public interface CompactionManagerMBean
     public TabularData getCompactionHistory();
 
     /**
-     * @see org.apache.cassandra.metrics.CompactionMetrics#pendingTasks
-     * @return estimated number of compactions remaining to perform
-     */
-    @Deprecated
-    public int getPendingTasks();
-
-    /**
-     * @see org.apache.cassandra.metrics.CompactionMetrics#completedTasks
-     * @return number of completed compactions since server [re]start
-     */
-    @Deprecated
-    public long getCompletedTasks();
-
-    /**
-     * @see org.apache.cassandra.metrics.CompactionMetrics#bytesCompacted
-     * @return total number of bytes compacted since server [re]start
-     */
-    @Deprecated
-    public long getTotalBytesCompacted();
-
-    /**
-     * @see org.apache.cassandra.metrics.CompactionMetrics#totalCompactionsCompleted
-     * @return total number of compactions since server [re]start
-     */
-    @Deprecated
-    public long getTotalCompactionsCompleted();
-
-    /**
      * Triggers the compaction of user specified sstables.
      * You can specify files from various keyspaces and columnfamilies.
      * If you do so, user defined compaction is performed several times to the groups of files
      * in the same keyspace/columnfamily.
      *
-     * @param dataFiles a comma separated list of sstable filename to compact
+     * @param dataFiles a comma separated list of sstable file to compact.
+     *                  must contain keyspace and columnfamily name in path(for 2.1+) or file name itself.
      */
     public void forceUserDefinedCompaction(String dataFiles);
+
+    /**
+     * Triggers the cleanup of user specified sstables.
+     * You can specify files from various keyspaces and columnfamilies.
+     * If you do so, cleanup is performed each file individually
+     *
+     * @param dataFiles a comma separated list of sstable file to cleanup.
+     *                  must contain keyspace and columnfamily name in path(for 2.1+) or file name itself.
+     */
+    public void forceUserDefinedCleanup(String dataFiles);
+
 
     /**
      * Stop all running compaction-like tasks having the provided {@code type}.
@@ -80,6 +64,14 @@ public interface CompactionManagerMBean
      *   - INDEX_BUILD
      */
     public void stopCompaction(String type);
+
+    /**
+     * Stop an individual running compaction using the compactionId.
+     * @param compactionId Compaction ID of compaction to stop. Such IDs can be found in
+     *                     the transaction log files whose name starts with compaction_,
+     *                     located in the table transactions folder.
+     */
+    public void stopCompactionById(String compactionId);
 
     /**
      * Returns core size of compaction thread pool
@@ -124,4 +116,53 @@ public interface CompactionManagerMBean
      * @param number New maximum of validator threads
      */
     public void setMaximumValidatorThreads(int number);
+
+    /**
+     * Returns core size of view build thread pool
+     */
+    public int getCoreViewBuildThreads();
+
+    /**
+     * Enable / disable STCS in L0
+     */
+    public boolean getDisableSTCSInL0();
+    public void setDisableSTCSInL0(boolean disabled);
+
+    /**
+     * Allows user to resize maximum size of the view build thread pool.
+     * @param number New maximum of view build threads
+     */
+    public void setCoreViewBuildThreads(int number);
+
+    /**
+     * Returns size of view build thread pool
+     */
+    public int getMaximumViewBuildThreads();
+
+    /**
+     * Allows user to resize maximum size of the view build thread pool.
+     * @param number New maximum of view build threads
+     */
+    public void setMaximumViewBuildThreads(int number);
+
+    /**
+     * Get automatic sstable upgrade enabled
+     */
+    public boolean getAutomaticSSTableUpgradeEnabled();
+    /**
+     * Set if automatic sstable upgrade should be enabled
+     */
+    public void setAutomaticSSTableUpgradeEnabled(boolean enabled);
+
+    /**
+     * Get the number of concurrent sstable upgrade tasks we should run
+     * when automatic sstable upgrades are enabled
+     */
+    public int getMaxConcurrentAutoUpgradeTasks();
+
+    /**
+     * Set the number of concurrent sstable upgrade tasks we should run
+     * when automatic sstable upgrades are enabled
+     */
+    public void setMaxConcurrentAutoUpgradeTasks(int value);
 }

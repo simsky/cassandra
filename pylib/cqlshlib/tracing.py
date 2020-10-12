@@ -14,69 +14,80 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from datetime import datetime, timedelta
 import time
-from cql.cqltypes import UTF8Type, InetAddressType, Int32Type
+
+from cassandra.query import QueryTrace, TraceUnavailable
 from cqlshlib.displaying import MAGENTA
+from cqlshlib.formatting import CqlType
 
-TRACING_KS = 'system_traces'
-SESSIONS_CF = 'sessions'
-EVENTS_CF = 'events'
 
-def print_trace_session(shell, cursor, session_id):
-    rows  = fetch_trace_session(cursor, session_id)
-    if not rows:
+def print_trace_session(shell, session, session_id, partial_session=False):
+    """
+    Lookup a trace by session and trace session ID, then print it.
+    """
+    trace = QueryTrace(session_id, session)
+    try:
+        wait_for_complete = not partial_session
+        trace.populate(wait_for_complete=wait_for_complete)
+    except TraceUnavailable:
         shell.printerr("Session %s wasn't found." % session_id)
-        return
-    names = ['activity', 'timestamp', 'source', 'source_elapsed']
-    types = [UTF8Type, UTF8Type, InetAddressType, Int32Type]
+    else:
+        print_trace(shell, trace)
 
-    formatted_names = [shell.myformat_colname(name, UTF8Type) for name in names]
-    formatted_values = [map(shell.myformat_value, row, types) for row in rows]
+
+def print_trace(shell, trace):
+    """
+    Print an already populated cassandra.query.QueryTrace instance.
+    """
+    rows = make_trace_rows(trace)
+    if not rows:
+        shell.printerr("No rows for session %s found." % (trace.trace_id,))
+        return
+    names = ['activity', 'timestamp', 'source', 'source_elapsed', 'client']
+
+    formatted_names = list(map(shell.myformat_colname, names))
+    formatted_values = [list(map(shell.myformat_value, row)) for row in rows]
 
     shell.writeresult('')
     shell.writeresult('Tracing session: ', color=MAGENTA, newline=False)
-    shell.writeresult(session_id)
+    shell.writeresult(trace.trace_id)
     shell.writeresult('')
-    shell.print_formatted_result(formatted_names, formatted_values)
+    shell.print_formatted_result(formatted_names, formatted_values, with_header=True, tty=shell.tty)
     shell.writeresult('')
 
-def fetch_trace_session(cursor, session_id):
-    cursor.execute("SELECT request, coordinator, started_at, duration "
-                   "FROM %s.%s "
-                   "WHERE session_id = %s" % (TRACING_KS, SESSIONS_CF, session_id),
-                   consistency_level='ONE')
-    session = cursor.fetchone()
-    if not session:
+
+def make_trace_rows(trace):
+    if not trace.events:
         return []
-    (request, coordinator, started_at, duration) = session
-    cursor.execute("SELECT activity, event_id, source, source_elapsed "
-                   "FROM %s.%s "
-                   "WHERE session_id = %s" % (TRACING_KS, EVENTS_CF, session_id),
-                   consistency_level='ONE')
-    events = cursor.fetchall()
 
-    rows = []
-    # append header row (from sessions table).
-    rows.append([request, format_timestamp(started_at), coordinator, 0])
+    rows = [[trace.request_type, str(datetime_from_utc_to_local(trace.started_at)), trace.coordinator, 0, trace.client]]
+
     # append main rows (from events table).
-    for activity, event_id, source, source_elapsed in events:
-        rows.append([activity, format_timeuuid(event_id), source, source_elapsed])
+    for event in trace.events:
+        rows.append(["%s [%s]" % (event.description, event.thread_name),
+                     str(datetime_from_utc_to_local(event.datetime)),
+                     event.source,
+                     total_micro_seconds(event.source_elapsed),
+                     trace.client])
     # append footer row (from sessions table).
-    if duration:
-        finished_at = format_timestamp(started_at + (duration / 1000000.))
+    if trace.duration:
+        finished_at = (datetime_from_utc_to_local(trace.started_at) + trace.duration)
+        rows.append(['Request complete', str(finished_at), trace.coordinator, total_micro_seconds(trace.duration), trace.client])
     else:
-        finished_at = duration = "--"
-
-    rows.append(['Request complete', finished_at, coordinator, duration])
+        finished_at = trace.duration = "--"
 
     return rows
 
-def format_timestamp(value):
-    return format_time(int(value * 1000))
 
-def format_timeuuid(value):
-    return format_time((value.get_time() - 0x01b21dd213814000) / 10000)
+def total_micro_seconds(td):
+    """
+    Convert a timedelta into total microseconds
+    """
+    return int((td.microseconds + (td.seconds + td.days * 24 * 3600) * 10 ** 6)) if td else "--"
 
-def format_time(millis):
-    s, ms = divmod(millis, 1000)
-    return time.strftime('%H:%M:%S', time.localtime(s)) + ',' + str(ms).rjust(3, '0')
+
+def datetime_from_utc_to_local(utc_datetime):
+    now_timestamp = time.time()
+    offset = datetime.fromtimestamp(now_timestamp) - datetime.utcfromtimestamp(now_timestamp)
+    return utc_datetime + offset

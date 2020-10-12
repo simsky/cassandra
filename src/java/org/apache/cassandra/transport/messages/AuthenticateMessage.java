@@ -17,10 +17,11 @@
  */
 package org.apache.cassandra.transport.messages;
 
-import org.jboss.netty.buffer.ChannelBuffer;
+import io.netty.buffer.ByteBuf;
 
 import org.apache.cassandra.transport.CBUtil;
 import org.apache.cassandra.transport.Message;
+import org.apache.cassandra.transport.ProtocolVersion;
 
 /**
  * Message to indicate that the server is ready to receive requests.
@@ -29,20 +30,21 @@ public class AuthenticateMessage extends Message.Response
 {
     public static final Message.Codec<AuthenticateMessage> codec = new Message.Codec<AuthenticateMessage>()
     {
-        public AuthenticateMessage decode(ChannelBuffer body, int version)
+        public AuthenticateMessage decode(ByteBuf body, ProtocolVersion version)
         {
             String authenticator = CBUtil.readString(body);
             return new AuthenticateMessage(authenticator);
         }
 
-        public void encode(AuthenticateMessage msg, ChannelBuffer dest, int version)
+        public void encode(AuthenticateMessage msg, ByteBuf dest, ProtocolVersion version)
         {
-            CBUtil.writeString(msg.authenticator, dest);
+            // Safe to skip. `msg.authenticator` is a FQCN string. All characters are ASCII encoded.
+            CBUtil.writeAsciiString(msg.authenticator, dest);
         }
 
-        public int encodedSize(AuthenticateMessage msg, int version)
+        public int encodedSize(AuthenticateMessage msg, ProtocolVersion version)
         {
-            return CBUtil.sizeOfString(msg.authenticator);
+            return CBUtil.sizeOfAsciiString(msg.authenticator);
         }
     };
 

@@ -18,17 +18,17 @@
 package org.apache.cassandra.locator;
 
 import java.lang.reflect.Constructor;
-import java.net.InetAddress;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.util.*;
-import java.util.concurrent.locks.Lock;
 
 import com.google.common.annotations.VisibleForTesting;
-import com.google.common.collect.HashMultimap;
-import com.google.common.collect.Multimap;
-import com.google.common.util.concurrent.Striped;
+import com.google.common.base.Preconditions;
+import org.apache.cassandra.locator.ReplicaCollection.Builder.Conflict;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.ConsistencyLevel;
 import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.db.WriteType;
@@ -41,6 +41,7 @@ import org.apache.cassandra.service.DatacenterSyncWriteResponseHandler;
 import org.apache.cassandra.service.DatacenterWriteResponseHandler;
 import org.apache.cassandra.service.WriteResponseHandler;
 import org.apache.cassandra.utils.FBUtilities;
+
 import org.cliffc.high_scale_lib.NonBlockingHashMap;
 
 /**
@@ -56,18 +57,12 @@ public abstract class AbstractReplicationStrategy
     public final Map<String, String> configOptions;
     private final TokenMetadata tokenMetadata;
 
-    // We want to make updating our replicas asynchronous vs the "master" TokenMetadata instance,
-    // so that our ownership calculations never block Gossip from processing an ownership change.
-    // But, we also can't afford to re-clone TM for each range after cache invalidation (CASSANDRA-6345),
-    // so we keep our own copy here.
-    //
-    // Writes to tokenMetadataClone should be synchronized.
-    private volatile TokenMetadata tokenMetadataClone = null;
-    private volatile long clonedTokenMetadataVersion = 0;
+    // track when the token range changes, signaling we need to invalidate our endpoint cache
+    private volatile long lastInvalidatedVersion = 0;
 
     public IEndpointSnitch snitch;
 
-    AbstractReplicationStrategy(String keyspaceName, TokenMetadata tokenMetadata, IEndpointSnitch snitch, Map<String, String> configOptions)
+    protected AbstractReplicationStrategy(String keyspaceName, TokenMetadata tokenMetadata, IEndpointSnitch snitch, Map<String, String> configOptions)
     {
         assert keyspaceName != null;
         assert snitch != null;
@@ -79,27 +74,26 @@ public abstract class AbstractReplicationStrategy
         // lazy-initialize keyspace itself since we don't create them until after the replication strategies
     }
 
-    private final Map<Token, ArrayList<InetAddress>> cachedEndpoints = new NonBlockingHashMap<Token, ArrayList<InetAddress>>();
+    private final Map<Token, EndpointsForRange> cachedReplicas = new NonBlockingHashMap<>();
 
-    public ArrayList<InetAddress> getCachedEndpoints(Token t)
+    public EndpointsForRange getCachedReplicas(Token t)
     {
         long lastVersion = tokenMetadata.getRingVersion();
 
-        if (lastVersion > clonedTokenMetadataVersion)
+        if (lastVersion > lastInvalidatedVersion)
         {
             synchronized (this)
             {
-                if (lastVersion > clonedTokenMetadataVersion)
+                if (lastVersion > lastInvalidatedVersion)
                 {
-                    logger.debug("clearing cached endpoints");
-                    tokenMetadataClone = null;
-                    cachedEndpoints.clear();
-                    clonedTokenMetadataVersion = lastVersion;
+                    logger.trace("clearing cached endpoints");
+                    cachedReplicas.clear();
+                    lastInvalidatedVersion = lastVersion;
                 }
             }
         }
 
-        return cachedEndpoints.get(t);
+        return cachedReplicas.get(t);
     }
 
     /**
@@ -109,54 +103,105 @@ public abstract class AbstractReplicationStrategy
      * @param searchPosition the position the natural endpoints are requested for
      * @return a copy of the natural endpoints for the given token
      */
-    public ArrayList<InetAddress> getNaturalEndpoints(RingPosition searchPosition)
+    public EndpointsForToken getNaturalReplicasForToken(RingPosition searchPosition)
+    {
+        return getNaturalReplicas(searchPosition).forToken(searchPosition.getToken());
+    }
+
+    public EndpointsForRange getNaturalReplicas(RingPosition searchPosition)
     {
         Token searchToken = searchPosition.getToken();
         Token keyToken = TokenMetadata.firstToken(tokenMetadata.sortedTokens(), searchToken);
-        ArrayList<InetAddress> endpoints = getCachedEndpoints(keyToken);
+        EndpointsForRange endpoints = getCachedReplicas(keyToken);
         if (endpoints == null)
         {
-            if (tokenMetadataClone == null)
-            {
-                // synchronize to prevent thundering herd post-invalidation
-                synchronized (this)
-                {
-                    if (tokenMetadataClone == null)
-                        tokenMetadataClone = tokenMetadata.cloneOnlyTokenMap();
-                }
-                // if our clone got invalidated, it's possible there is a new token to account for too
-                keyToken = TokenMetadata.firstToken(tokenMetadataClone.sortedTokens(), searchToken);
-            }
-
-            endpoints = new ArrayList<InetAddress>(calculateNaturalEndpoints(searchToken, tokenMetadataClone));
-            cachedEndpoints.put(keyToken, endpoints);
+            TokenMetadata tm = tokenMetadata.cachedOnlyTokenMap();
+            // if our cache got invalidated, it's possible there is a new token to account for too
+            keyToken = TokenMetadata.firstToken(tm.sortedTokens(), searchToken);
+            endpoints = calculateNaturalReplicas(searchToken, tm);
+            cachedReplicas.put(keyToken, endpoints);
         }
 
-        return new ArrayList<InetAddress>(endpoints);
+        return endpoints;
+    }
+
+    public Replica getLocalReplicaFor(RingPosition searchPosition)
+    {
+        return getNaturalReplicas(searchPosition)
+               .byEndpoint()
+               .get(FBUtilities.getBroadcastAddressAndPort());
     }
 
     /**
-     * calculate the natural endpoints for the given token
+     * Calculate the natural endpoints for the given token. Endpoints are returned in the order
+     * they occur in the ring following the searchToken, as defined by the replication strategy.
      *
-     * @see #getNaturalEndpoints(org.apache.cassandra.dht.RingPosition)
+     * Note that the order of the replicas is _implicitly relied upon_ by the definition of
+     * "primary" range in
+     * {@link org.apache.cassandra.service.StorageService#getPrimaryRangesForEndpoint(String, InetAddressAndPort)}
+     * which is in turn relied on by various components like repair and size estimate calculations.
      *
-     * @param searchToken the token the natural endpoints are requested for
+     * @see #getNaturalReplicasForToken(org.apache.cassandra.dht.RingPosition)
+     *
+     * @param tokenMetadata the token metadata used to find the searchToken, e.g. contains token to endpoint
+     *                      mapping information
+     * @param searchToken the token to find the natural endpoints for
      * @return a copy of the natural endpoints for the given token
      */
-    public abstract List<InetAddress> calculateNaturalEndpoints(Token searchToken, TokenMetadata tokenMetadata);
+    public abstract EndpointsForRange calculateNaturalReplicas(Token searchToken, TokenMetadata tokenMetadata);
 
-    public AbstractWriteResponseHandler getWriteResponseHandler(Collection<InetAddress> naturalEndpoints, Collection<InetAddress> pendingEndpoints, ConsistencyLevel consistency_level, Runnable callback, WriteType writeType)
+    public <T> AbstractWriteResponseHandler<T> getWriteResponseHandler(ReplicaPlan.ForTokenWrite replicaPlan,
+                                                                       Runnable callback,
+                                                                       WriteType writeType,
+                                                                       long queryStartNanoTime)
     {
-        if (consistency_level.isDatacenterLocal())
+        return getWriteResponseHandler(replicaPlan, callback, writeType, queryStartNanoTime, DatabaseDescriptor.getIdealConsistencyLevel());
+    }
+
+    public <T> AbstractWriteResponseHandler<T> getWriteResponseHandler(ReplicaPlan.ForTokenWrite replicaPlan,
+                                                                       Runnable callback,
+                                                                       WriteType writeType,
+                                                                       long queryStartNanoTime,
+                                                                       ConsistencyLevel idealConsistencyLevel)
+    {
+        AbstractWriteResponseHandler resultResponseHandler;
+        if (replicaPlan.consistencyLevel().isDatacenterLocal())
         {
             // block for in this context will be localnodes block.
-            return new DatacenterWriteResponseHandler(naturalEndpoints, pendingEndpoints, consistency_level, getKeyspace(), callback, writeType);
+            resultResponseHandler = new DatacenterWriteResponseHandler<T>(replicaPlan, callback, writeType, queryStartNanoTime);
         }
-        else if (consistency_level == ConsistencyLevel.EACH_QUORUM)
+        else if (replicaPlan.consistencyLevel() == ConsistencyLevel.EACH_QUORUM && (this instanceof NetworkTopologyStrategy))
         {
-            return new DatacenterSyncWriteResponseHandler(naturalEndpoints, pendingEndpoints, consistency_level, getKeyspace(), callback, writeType);
+            resultResponseHandler = new DatacenterSyncWriteResponseHandler<T>(replicaPlan, callback, writeType, queryStartNanoTime);
         }
-        return new WriteResponseHandler(naturalEndpoints, pendingEndpoints, consistency_level, getKeyspace(), callback, writeType);
+        else
+        {
+            resultResponseHandler = new WriteResponseHandler<T>(replicaPlan, callback, writeType, queryStartNanoTime);
+        }
+
+        //Check if tracking the ideal consistency level is configured
+        if (idealConsistencyLevel != null)
+        {
+            //If ideal and requested are the same just use this handler to track the ideal consistency level
+            //This is also used so that the ideal consistency level handler when constructed knows it is the ideal
+            //one for tracking purposes
+            if (idealConsistencyLevel == replicaPlan.consistencyLevel())
+            {
+                resultResponseHandler.setIdealCLResponseHandler(resultResponseHandler);
+            }
+            else
+            {
+                //Construct a delegate response handler to use to track the ideal consistency level
+                AbstractWriteResponseHandler idealHandler = getWriteResponseHandler(replicaPlan.withConsistencyLevel(idealConsistencyLevel),
+                                                                                    callback,
+                                                                                    writeType,
+                                                                                    queryStartNanoTime,
+                                                                                    idealConsistencyLevel);
+                resultResponseHandler.setIdealCLResponseHandler(idealHandler);
+            }
+        }
+
+        return resultResponseHandler;
     }
 
     private Keyspace getKeyspace()
@@ -172,7 +217,12 @@ public abstract class AbstractReplicationStrategy
      *
      * @return the replication factor
      */
-    public abstract int getReplicationFactor();
+    public abstract ReplicationFactor getReplicationFactor();
+
+    public boolean hasTransientReplicas()
+    {
+        return getReplicationFactor().hasTransientReplicas();
+    }
 
     /*
      * NOTE: this is pretty inefficient. also the inverse (getRangeAddresses) below.
@@ -180,53 +230,81 @@ public abstract class AbstractReplicationStrategy
      * (fixing this would probably require merging tokenmetadata into replicationstrategy,
      * so we could cache/invalidate cleanly.)
      */
-    public Multimap<InetAddress, Range<Token>> getAddressRanges(TokenMetadata metadata)
+    public RangesByEndpoint getAddressReplicas(TokenMetadata metadata)
     {
-        Multimap<InetAddress, Range<Token>> map = HashMultimap.create();
+        RangesByEndpoint.Builder map = new RangesByEndpoint.Builder();
 
         for (Token token : metadata.sortedTokens())
         {
             Range<Token> range = metadata.getPrimaryRangeFor(token);
-            for (InetAddress ep : calculateNaturalEndpoints(token, metadata))
+            for (Replica replica : calculateNaturalReplicas(token, metadata))
             {
-                map.put(ep, range);
+                // LocalStrategy always returns (min, min] ranges for it's replicas, so we skip the check here
+                Preconditions.checkState(range.equals(replica.range()) || this instanceof LocalStrategy);
+                map.put(replica.endpoint(), replica);
             }
         }
 
-        return map;
+        return map.build();
     }
 
-    public Multimap<Range<Token>, InetAddress> getRangeAddresses(TokenMetadata metadata)
+    public RangesAtEndpoint getAddressReplicas(TokenMetadata metadata, InetAddressAndPort endpoint)
     {
-        Multimap<Range<Token>, InetAddress> map = HashMultimap.create();
+        RangesAtEndpoint.Builder builder = RangesAtEndpoint.builder(endpoint);
+        for (Token token : metadata.sortedTokens())
+        {
+            Range<Token> range = metadata.getPrimaryRangeFor(token);
+            Replica replica = calculateNaturalReplicas(token, metadata)
+                    .byEndpoint().get(endpoint);
+            if (replica != null)
+            {
+                // LocalStrategy always returns (min, min] ranges for it's replicas, so we skip the check here
+                Preconditions.checkState(range.equals(replica.range()) || this instanceof LocalStrategy);
+                builder.add(replica, Conflict.DUPLICATE);
+            }
+        }
+        return builder.build();
+    }
+
+
+    public EndpointsByRange getRangeAddresses(TokenMetadata metadata)
+    {
+        EndpointsByRange.Builder map = new EndpointsByRange.Builder();
 
         for (Token token : metadata.sortedTokens())
         {
             Range<Token> range = metadata.getPrimaryRangeFor(token);
-            for (InetAddress ep : calculateNaturalEndpoints(token, metadata))
+            for (Replica replica : calculateNaturalReplicas(token, metadata))
             {
-                map.put(range, ep);
+                // LocalStrategy always returns (min, min] ranges for it's replicas, so we skip the check here
+                Preconditions.checkState(range.equals(replica.range()) || this instanceof LocalStrategy);
+                map.put(range, replica);
             }
         }
 
-        return map;
+        return map.build();
     }
 
-    public Multimap<InetAddress, Range<Token>> getAddressRanges()
+    public RangesByEndpoint getAddressReplicas()
     {
-        return getAddressRanges(tokenMetadata.cloneOnlyTokenMap());
+        return getAddressReplicas(tokenMetadata.cloneOnlyTokenMap());
     }
 
-    public Collection<Range<Token>> getPendingAddressRanges(TokenMetadata metadata, Token pendingToken, InetAddress pendingAddress)
+    public RangesAtEndpoint getAddressReplicas(InetAddressAndPort endpoint)
     {
-        return getPendingAddressRanges(metadata, Arrays.asList(pendingToken), pendingAddress);
+        return getAddressReplicas(tokenMetadata.cloneOnlyTokenMap(), endpoint);
     }
 
-    public Collection<Range<Token>> getPendingAddressRanges(TokenMetadata metadata, Collection<Token> pendingTokens, InetAddress pendingAddress)
+    public RangesAtEndpoint getPendingAddressRanges(TokenMetadata metadata, Token pendingToken, InetAddressAndPort pendingAddress)
+    {
+        return getPendingAddressRanges(metadata, Collections.singleton(pendingToken), pendingAddress);
+    }
+
+    public RangesAtEndpoint getPendingAddressRanges(TokenMetadata metadata, Collection<Token> pendingTokens, InetAddressAndPort pendingAddress)
     {
         TokenMetadata temp = metadata.cloneOnlyTokenMap();
         temp.updateNormalTokens(pendingTokens, pendingAddress);
-        return getAddressRanges(temp).get(pendingAddress);
+        return getAddressReplicas(temp, pendingAddress);
     }
 
     public abstract void validateOptions() throws ConfigurationException;
@@ -256,6 +334,11 @@ public abstract class AbstractReplicationStrategy
             Constructor<? extends AbstractReplicationStrategy> constructor = strategyClass.getConstructor(parameterTypes);
             strategy = constructor.newInstance(keyspaceName, tokenMetadata, snitch, strategyOptions);
         }
+        catch (InvocationTargetException e)
+        {
+            Throwable targetException = e.getTargetException();
+            throw new ConfigurationException(targetException.getMessage(), targetException);
+        }
         catch (Exception e)
         {
             throw new ConfigurationException("Error constructing replication strategy class", e);
@@ -269,27 +352,52 @@ public abstract class AbstractReplicationStrategy
                                                                         IEndpointSnitch snitch,
                                                                         Map<String, String> strategyOptions)
     {
+        AbstractReplicationStrategy strategy = createInternal(keyspaceName, strategyClass, tokenMetadata, snitch, strategyOptions);
+
+        // Because we used to not properly validate unrecognized options, we only log a warning if we find one.
         try
         {
-            AbstractReplicationStrategy strategy = createInternal(keyspaceName, strategyClass, tokenMetadata, snitch, strategyOptions);
-
-            // Because we used to not properly validate unrecognized options, we only log a warning if we find one.
-            try
-            {
-                strategy.validateExpectedOptions();
-            }
-            catch (ConfigurationException e)
-            {
-                logger.warn("Ignoring {}", e.getMessage());
-            }
-
-            strategy.validateOptions();
-            return strategy;
+            strategy.validateExpectedOptions();
         }
         catch (ConfigurationException e)
         {
-            // If that happens at this point, there is nothing we can do about it.
-            throw new RuntimeException();
+            logger.warn("Ignoring {}", e.getMessage());
+        }
+
+        strategy.validateOptions();
+        return strategy;
+    }
+
+    /**
+     * Before constructing the ARS we first give it a chance to prepare the options map in any way it
+     * would like to. For example datacenter auto-expansion or other templating to make the user interface
+     * more usable. Note that this may mutate the passed strategyOptions Map.
+     *
+     * We do this prior to the construction of the strategyClass itself because at that point the option
+     * map is already immutable and comes from {@link org.apache.cassandra.schema.ReplicationParams}
+     * (and should probably stay that way so we don't start having bugs related to ReplicationParams being mutable).
+     * Instead ARS classes get a static hook here via the prepareOptions(Map, Map) method to mutate the user input
+     * before it becomes an immutable part of the ReplicationParams.
+     *
+     * @param strategyClass The class to call prepareOptions on
+     * @param strategyOptions The proposed strategy options that will be potentially mutated by the prepareOptions
+     *                        method.
+     * @param previousStrategyOptions In the case of an ALTER statement, the previous strategy options of this class.
+     *                                This map cannot be mutated.
+     */
+    public static void prepareReplicationStrategyOptions(Class<? extends AbstractReplicationStrategy> strategyClass,
+                                                         Map<String, String> strategyOptions,
+                                                         Map<String, String> previousStrategyOptions)
+    {
+        try
+        {
+            Method method = strategyClass.getDeclaredMethod("prepareOptions", Map.class, Map.class);
+            method.invoke(null, strategyOptions, previousStrategyOptions);
+        }
+        catch (NoSuchMethodException | IllegalAccessException | InvocationTargetException ign)
+        {
+            // If the subclass doesn't specify a prepareOptions method, then that means that it
+            // doesn't want to do anything to the options. So do nothing on reflection related exceptions.
         }
     }
 
@@ -302,6 +410,10 @@ public abstract class AbstractReplicationStrategy
         AbstractReplicationStrategy strategy = createInternal(keyspaceName, strategyClass, tokenMetadata, snitch, strategyOptions);
         strategy.validateExpectedOptions();
         strategy.validateOptions();
+        if (strategy.hasTransientReplicas() && !DatabaseDescriptor.isTransientReplicationEnabled())
+        {
+            throw new ConfigurationException("Transient replication is disabled. Enable in cassandra.yaml to use.");
+        }
     }
 
     public static Class<AbstractReplicationStrategy> getClass(String cls) throws ConfigurationException
@@ -315,22 +427,29 @@ public abstract class AbstractReplicationStrategy
         return strategyClass;
     }
 
-    protected void validateReplicationFactor(String rf) throws ConfigurationException
+    public boolean hasSameSettings(AbstractReplicationStrategy other)
+    {
+        return getClass().equals(other.getClass()) && getReplicationFactor().equals(other.getReplicationFactor());
+    }
+
+    protected void validateReplicationFactor(String s) throws ConfigurationException
     {
         try
         {
-            if (Integer.parseInt(rf) < 0)
+            ReplicationFactor rf = ReplicationFactor.fromString(s);
+            if (rf.hasTransientReplicas())
             {
-                throw new ConfigurationException("Replication factor must be non-negative; found " + rf);
+                if (DatabaseDescriptor.getNumTokens() > 1)
+                    throw new ConfigurationException(String.format("Transient replication is not supported with vnodes yet"));
             }
         }
-        catch (NumberFormatException e2)
+        catch (IllegalArgumentException e)
         {
-            throw new ConfigurationException("Replication factor must be numeric; found " + rf);
+            throw new ConfigurationException(e.getMessage());
         }
     }
 
-    private void validateExpectedOptions() throws ConfigurationException
+    protected void validateExpectedOptions() throws ConfigurationException
     {
         Collection expectedOptions = recognizedOptions();
         if (expectedOptions == null)

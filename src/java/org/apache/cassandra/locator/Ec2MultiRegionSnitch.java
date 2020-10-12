@@ -19,6 +19,7 @@ package org.apache.cassandra.locator;
 
 import java.io.IOException;
 import java.net.InetAddress;
+import java.net.UnknownHostException;
 
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.config.DatabaseDescriptor;
@@ -41,23 +42,38 @@ public class Ec2MultiRegionSnitch extends Ec2Snitch
 {
     private static final String PUBLIC_IP_QUERY_URL = "http://169.254.169.254/latest/meta-data/public-ipv4";
     private static final String PRIVATE_IP_QUERY_URL = "http://169.254.169.254/latest/meta-data/local-ipv4";
-    private final InetAddress localPublicAddress;
     private final String localPrivateAddress;
 
     public Ec2MultiRegionSnitch() throws IOException, ConfigurationException
     {
         super();
-        localPublicAddress = InetAddress.getByName(awsApiCall(PUBLIC_IP_QUERY_URL));
+        InetAddress localPublicAddress = InetAddress.getByName(awsApiCall(PUBLIC_IP_QUERY_URL));
         logger.info("EC2Snitch using publicIP as identifier: {}", localPublicAddress);
         localPrivateAddress = awsApiCall(PRIVATE_IP_QUERY_URL);
         // use the Public IP to broadcast Address to other nodes.
         DatabaseDescriptor.setBroadcastAddress(localPublicAddress);
+        if (DatabaseDescriptor.getBroadcastRpcAddress() == null)
+        {
+            logger.info("broadcast_rpc_address unset, broadcasting public IP as rpc_address: {}", localPublicAddress);
+            DatabaseDescriptor.setBroadcastRpcAddress(localPublicAddress);
+        }
     }
 
+    @Override
     public void gossiperStarting()
     {
         super.gossiperStarting();
-        Gossiper.instance.addLocalApplicationState(ApplicationState.INTERNAL_IP, StorageService.instance.valueFactory.internalIP(localPrivateAddress));
+        InetAddressAndPort address;
+        try
+        {
+            address = InetAddressAndPort.getByName(localPrivateAddress);
+        }
+        catch (UnknownHostException e)
+        {
+            throw new RuntimeException(e);
+        }
+        Gossiper.instance.addLocalApplicationState(ApplicationState.INTERNAL_ADDRESS_AND_PORT, StorageService.instance.valueFactory.internalAddressAndPort(address));
+        Gossiper.instance.addLocalApplicationState(ApplicationState.INTERNAL_IP, StorageService.instance.valueFactory.internalIP(address.address));
         Gossiper.instance.register(new ReconnectableSnitchHelper(this, ec2region, true));
     }
 }

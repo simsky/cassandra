@@ -17,26 +17,49 @@
  */
 package org.apache.cassandra.auth;
 
+import java.util.Set;
+
 import com.google.common.base.Objects;
+
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.dht.Datacenters;
 
 /**
  * Returned from IAuthenticator#authenticate(), represents an authenticated user everywhere internally.
+ *
+ * Holds the name of the user and the roles that have been granted to the user. The roles will be cached
+ * for roles_validity_in_ms.
  */
 public class AuthenticatedUser
 {
+    public static final String SYSTEM_USERNAME = "system";
+    public static final AuthenticatedUser SYSTEM_USER = new AuthenticatedUser(SYSTEM_USERNAME);
+
     public static final String ANONYMOUS_USERNAME = "anonymous";
     public static final AuthenticatedUser ANONYMOUS_USER = new AuthenticatedUser(ANONYMOUS_USERNAME);
 
+    // User-level permissions cache.
+    private static final PermissionsCache permissionsCache = new PermissionsCache(DatabaseDescriptor.getAuthorizer());
+    private static final NetworkAuthCache networkAuthCache = new NetworkAuthCache(DatabaseDescriptor.getNetworkAuthorizer());
+
     private final String name;
+    // primary Role of the logged in user
+    private final RoleResource role;
 
     public AuthenticatedUser(String name)
     {
         this.name = name;
+        this.role = RoleResource.role(name);
     }
 
     public String getName()
     {
         return name;
+    }
+
+    public RoleResource getPrimaryRole()
+    {
+        return role;
     }
 
     /**
@@ -47,7 +70,7 @@ public class AuthenticatedUser
      */
     public boolean isSuper()
     {
-        return !isAnonymous() && Auth.isSuperuser(name);
+        return !isAnonymous() && Roles.hasSuperuserStatus(role);
     }
 
     /**
@@ -56,6 +79,64 @@ public class AuthenticatedUser
     public boolean isAnonymous()
     {
         return this == ANONYMOUS_USER;
+    }
+
+    /**
+     * Some internal operations are performed on behalf of Cassandra itself, in those cases
+     * the system user should be used where an identity is required
+     * see CreateRoleStatement#execute() and overrides of AlterSchemaStatement#createdResources()
+     */
+    public boolean isSystem()
+    {
+        return this == SYSTEM_USER;
+    }
+
+    /**
+     * Get the roles that have been granted to the user via the IRoleManager
+     *
+     * @return a set of identifiers for the roles that have been granted to the user
+     */
+    public Set<RoleResource> getRoles()
+    {
+        return Roles.getRoles(role);
+    }
+
+    /**
+     * Get the detailed info on roles granted to the user via IRoleManager
+     *
+     * @return a set of Role objects detailing the roles granted to the user
+     */
+    public Set<Role> getRoleDetails()
+    {
+       return Roles.getRoleDetails(role);
+    }
+
+    public Set<Permission> getPermissions(IResource resource)
+    {
+        return permissionsCache.getPermissions(this, resource);
+    }
+
+    /**
+     * Check whether this user has login privileges.
+     * LOGIN is not inherited from granted roles, so must be directly granted to the primary role for this user
+     *
+     * @return true if the user is permitted to login, false otherwise.
+     */
+    public boolean canLogin()
+    {
+        return Roles.canLogin(getPrimaryRole());
+    }
+
+    /**
+     * Verify that there is not DC level restriction on this user accessing this node.
+     * Further extends the login privilege check by verifying that the primary role for this user is permitted
+     * to perform operations in the local (to this node) datacenter. Like LOGIN, this is not inherited from
+     * granted roles.
+     * @return true if the user is permitted to access nodes in this node's datacenter, false otherwise
+     */
+    public boolean hasLocalAccess()
+    {
+        return networkAuthCache.get(this.getPrimaryRole()).canAccess(Datacenters.thisDatacenter());
     }
 
     @Override
@@ -83,4 +164,5 @@ public class AuthenticatedUser
     {
         return Objects.hashCode(name);
     }
+
 }

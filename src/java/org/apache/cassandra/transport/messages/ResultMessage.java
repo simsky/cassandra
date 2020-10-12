@@ -17,39 +17,32 @@
  */
 package org.apache.cassandra.transport.messages;
 
-import java.util.*;
 
-import org.jboss.netty.buffer.ChannelBuffer;
-import org.jboss.netty.buffer.ChannelBuffers;
+import com.google.common.annotations.VisibleForTesting;
 
-import org.apache.cassandra.cql3.ColumnSpecification;
-import org.apache.cassandra.cql3.CQLStatement;
+import io.netty.buffer.ByteBuf;
+
 import org.apache.cassandra.cql3.ResultSet;
-import org.apache.cassandra.cql3.statements.SelectStatement;
-import org.apache.cassandra.cql3.statements.ParsedStatement;
 import org.apache.cassandra.transport.*;
-import org.apache.cassandra.thrift.CqlPreparedResult;
-import org.apache.cassandra.thrift.CqlResult;
-import org.apache.cassandra.thrift.CqlResultType;
 import org.apache.cassandra.utils.MD5Digest;
 
 public abstract class ResultMessage extends Message.Response
 {
     public static final Message.Codec<ResultMessage> codec = new Message.Codec<ResultMessage>()
     {
-        public ResultMessage decode(ChannelBuffer body, int version)
+        public ResultMessage decode(ByteBuf body, ProtocolVersion version)
         {
             Kind kind = Kind.fromId(body.readInt());
             return kind.subcodec.decode(body, version);
         }
 
-        public void encode(ResultMessage msg, ChannelBuffer dest, int version)
+        public void encode(ResultMessage msg, ByteBuf dest, ProtocolVersion version)
         {
             dest.writeInt(msg.kind.id);
             msg.kind.subcodec.encode(msg, dest, version);
         }
 
-        public int encodedSize(ResultMessage msg, int version)
+        public int encodedSize(ResultMessage msg, ProtocolVersion version)
         {
             return 4 + msg.kind.subcodec.encodedSize(msg, version);
         }
@@ -57,12 +50,12 @@ public abstract class ResultMessage extends Message.Response
 
     public enum Kind
     {
-        VOID         (1, Void.subcodec),
-        ROWS         (2, Rows.subcodec),
-        SET_KEYSPACE (3, SetKeyspace.subcodec),
-        PREPARED     (4, Prepared.subcodec),
-        SCHEMA_CHANGE(5, SchemaChange.subcodec);
 
+        VOID               (1, Void.subcodec),
+        ROWS               (2, Rows.subcodec),
+        SET_KEYSPACE       (3, SetKeyspace.subcodec),
+        PREPARED           (4, Prepared.subcodec),
+        SCHEMA_CHANGE      (5, SchemaChange.subcodec);
         public final int id;
         public final Message.Codec<ResultMessage> subcodec;
 
@@ -104,8 +97,6 @@ public abstract class ResultMessage extends Message.Response
         this.kind = kind;
     }
 
-    public abstract CqlResult toThriftResult();
-
     public static class Void extends ResultMessage
     {
         // Even though we have no specific information here, don't make a
@@ -117,26 +108,21 @@ public abstract class ResultMessage extends Message.Response
 
         public static final Message.Codec<ResultMessage> subcodec = new Message.Codec<ResultMessage>()
         {
-            public ResultMessage decode(ChannelBuffer body, int version)
+            public ResultMessage decode(ByteBuf body, ProtocolVersion version)
             {
                 return new Void();
             }
 
-            public void encode(ResultMessage msg, ChannelBuffer dest, int version)
+            public void encode(ResultMessage msg, ByteBuf dest, ProtocolVersion version)
             {
                 assert msg instanceof Void;
             }
 
-            public int encodedSize(ResultMessage msg, int version)
+            public int encodedSize(ResultMessage msg, ProtocolVersion version)
             {
                 return 0;
             }
         };
-
-        public CqlResult toThriftResult()
-        {
-            return new CqlResult(CqlResultType.VOID);
-        }
 
         @Override
         public String toString()
@@ -157,29 +143,24 @@ public abstract class ResultMessage extends Message.Response
 
         public static final Message.Codec<ResultMessage> subcodec = new Message.Codec<ResultMessage>()
         {
-            public ResultMessage decode(ChannelBuffer body, int version)
+            public ResultMessage decode(ByteBuf body, ProtocolVersion version)
             {
                 String keyspace = CBUtil.readString(body);
                 return new SetKeyspace(keyspace);
             }
 
-            public void encode(ResultMessage msg, ChannelBuffer dest, int version)
+            public void encode(ResultMessage msg, ByteBuf dest, ProtocolVersion version)
             {
                 assert msg instanceof SetKeyspace;
-                CBUtil.writeString(((SetKeyspace)msg).keyspace, dest);
+                CBUtil.writeAsciiString(((SetKeyspace)msg).keyspace, dest);
             }
 
-            public int encodedSize(ResultMessage msg, int version)
+            public int encodedSize(ResultMessage msg, ProtocolVersion version)
             {
                 assert msg instanceof SetKeyspace;
-                return CBUtil.sizeOfString(((SetKeyspace)msg).keyspace);
+                return CBUtil.sizeOfAsciiString(((SetKeyspace)msg).keyspace);
             }
         };
-
-        public CqlResult toThriftResult()
-        {
-            return new CqlResult(CqlResultType.VOID);
-        }
 
         @Override
         public String toString()
@@ -192,19 +173,19 @@ public abstract class ResultMessage extends Message.Response
     {
         public static final Message.Codec<ResultMessage> subcodec = new Message.Codec<ResultMessage>()
         {
-            public ResultMessage decode(ChannelBuffer body, int version)
+            public ResultMessage decode(ByteBuf body, ProtocolVersion version)
             {
                 return new Rows(ResultSet.codec.decode(body, version));
             }
 
-            public void encode(ResultMessage msg, ChannelBuffer dest, int version)
+            public void encode(ResultMessage msg, ByteBuf dest, ProtocolVersion version)
             {
                 assert msg instanceof Rows;
                 Rows rowMsg = (Rows)msg;
                 ResultSet.codec.encode(rowMsg.result, dest, version);
             }
 
-            public int encodedSize(ResultMessage msg, int version)
+            public int encodedSize(ResultMessage msg, ProtocolVersion version)
             {
                 assert msg instanceof Rows;
                 Rows rowMsg = (Rows)msg;
@@ -220,48 +201,48 @@ public abstract class ResultMessage extends Message.Response
             this.result = result;
         }
 
-        public CqlResult toThriftResult()
-        {
-            return result.toThriftResult();
-        }
-
         @Override
         public String toString()
         {
             return "ROWS " + result;
         }
-
     }
 
     public static class Prepared extends ResultMessage
     {
         public static final Message.Codec<ResultMessage> subcodec = new Message.Codec<ResultMessage>()
         {
-            public ResultMessage decode(ChannelBuffer body, int version)
+            public ResultMessage decode(ByteBuf body, ProtocolVersion version)
             {
                 MD5Digest id = MD5Digest.wrap(CBUtil.readBytes(body));
-                ResultSet.Metadata metadata = ResultSet.Metadata.codec.decode(body, version);
+                MD5Digest resultMetadataId = null;
+                if (version.isGreaterOrEqualTo(ProtocolVersion.V5))
+                    resultMetadataId = MD5Digest.wrap(CBUtil.readBytes(body));
+                ResultSet.PreparedMetadata metadata = ResultSet.PreparedMetadata.codec.decode(body, version);
 
-                ResultSet.Metadata resultMetadata = ResultSet.Metadata.EMPTY;
-                if (version > 1)
-                    resultMetadata = ResultSet.Metadata.codec.decode(body, version);
+                ResultSet.ResultMetadata resultMetadata = ResultSet.ResultMetadata.EMPTY;
+                if (version.isGreaterThan(ProtocolVersion.V1))
+                    resultMetadata = ResultSet.ResultMetadata.codec.decode(body, version);
 
-                return new Prepared(id, -1, metadata, resultMetadata);
+                return new Prepared(id, resultMetadataId, metadata, resultMetadata);
             }
 
-            public void encode(ResultMessage msg, ChannelBuffer dest, int version)
+            public void encode(ResultMessage msg, ByteBuf dest, ProtocolVersion version)
             {
                 assert msg instanceof Prepared;
                 Prepared prepared = (Prepared)msg;
                 assert prepared.statementId != null;
 
                 CBUtil.writeBytes(prepared.statementId.bytes, dest);
-                ResultSet.Metadata.codec.encode(prepared.metadata, dest, version);
-                if (version > 1)
-                    ResultSet.Metadata.codec.encode(prepared.resultMetadata, dest, version);
+                if (version.isGreaterOrEqualTo(ProtocolVersion.V5))
+                    CBUtil.writeBytes(prepared.resultMetadataId.bytes, dest);
+
+                ResultSet.PreparedMetadata.codec.encode(prepared.metadata, dest, version);
+                if (version.isGreaterThan(ProtocolVersion.V1))
+                    ResultSet.ResultMetadata.codec.encode(prepared.resultMetadata, dest, version);
             }
 
-            public int encodedSize(ResultMessage msg, int version)
+            public int encodedSize(ResultMessage msg, ProtocolVersion version)
             {
                 assert msg instanceof Prepared;
                 Prepared prepared = (Prepared)msg;
@@ -269,62 +250,37 @@ public abstract class ResultMessage extends Message.Response
 
                 int size = 0;
                 size += CBUtil.sizeOfBytes(prepared.statementId.bytes);
-                size += ResultSet.Metadata.codec.encodedSize(prepared.metadata, version);
-                if (version > 1)
-                    size += ResultSet.Metadata.codec.encodedSize(prepared.resultMetadata, version);
+                if (version.isGreaterOrEqualTo(ProtocolVersion.V5))
+                    size += CBUtil.sizeOfBytes(prepared.resultMetadataId.bytes);
+                size += ResultSet.PreparedMetadata.codec.encodedSize(prepared.metadata, version);
+                if (version.isGreaterThan(ProtocolVersion.V1))
+                    size += ResultSet.ResultMetadata.codec.encodedSize(prepared.resultMetadata, version);
                 return size;
             }
         };
 
         public final MD5Digest statementId;
-        public final ResultSet.Metadata metadata;
-        public final ResultSet.Metadata resultMetadata;
+        public final MD5Digest resultMetadataId;
 
-        // statement id for CQL-over-thrift compatibility. The binary protocol ignore that.
-        private final int thriftStatementId;
+        /** Describes the variables to be bound in the prepared statement */
+        public final ResultSet.PreparedMetadata metadata;
 
-        public Prepared(MD5Digest statementId, ParsedStatement.Prepared prepared)
-        {
-            this(statementId, -1, new ResultSet.Metadata(prepared.boundNames), extractResultMetadata(prepared.statement));
-        }
+        /** Describes the results of executing this prepared statement */
+        public final ResultSet.ResultMetadata resultMetadata;
 
-        public static Prepared forThrift(int statementId, List<ColumnSpecification> names)
-        {
-            return new Prepared(null, statementId, new ResultSet.Metadata(names), ResultSet.Metadata.EMPTY);
-        }
-
-        private Prepared(MD5Digest statementId, int thriftStatementId, ResultSet.Metadata metadata, ResultSet.Metadata resultMetadata)
+        public Prepared(MD5Digest statementId, MD5Digest resultMetadataId, ResultSet.PreparedMetadata metadata, ResultSet.ResultMetadata resultMetadata)
         {
             super(Kind.PREPARED);
             this.statementId = statementId;
-            this.thriftStatementId = thriftStatementId;
+            this.resultMetadataId = resultMetadataId;
             this.metadata = metadata;
             this.resultMetadata = resultMetadata;
         }
 
-        private static ResultSet.Metadata extractResultMetadata(CQLStatement statement)
+        @VisibleForTesting
+        public Prepared withResultMetadata(ResultSet.ResultMetadata resultMetadata)
         {
-            if (!(statement instanceof SelectStatement))
-                return ResultSet.Metadata.EMPTY;
-
-            return ((SelectStatement)statement).getResultMetadata();
-        }
-
-        public CqlResult toThriftResult()
-        {
-            throw new UnsupportedOperationException();
-        }
-
-        public CqlPreparedResult toThriftPreparedResult()
-        {
-            List<String> namesString = new ArrayList<String>(metadata.names.size());
-            List<String> typesString = new ArrayList<String>(metadata.names.size());
-            for (ColumnSpecification name : metadata.names)
-            {
-                namesString.add(name.toString());
-                typesString.add(name.type.toString());
-            }
-            return new CqlPreparedResult(thriftStatementId, metadata.names.size()).setVariable_types(typesString).setVariable_names(namesString);
+            return new Prepared(statementId, resultMetadata.getResultMetadataId(), metadata, resultMetadata);
         }
 
         @Override
@@ -336,68 +292,40 @@ public abstract class ResultMessage extends Message.Response
 
     public static class SchemaChange extends ResultMessage
     {
-        public enum Change { CREATED, UPDATED, DROPPED }
+        public final Event.SchemaChange change;
 
-        public final Change change;
-        public final String keyspace;
-        public final String columnFamily;
-
-        public SchemaChange(Change change, String keyspace)
-        {
-            this(change, keyspace, "");
-        }
-
-        public SchemaChange(Change change, String keyspace, String columnFamily)
+        public SchemaChange(Event.SchemaChange change)
         {
             super(Kind.SCHEMA_CHANGE);
             this.change = change;
-            this.keyspace = keyspace;
-            this.columnFamily = columnFamily;
         }
 
         public static final Message.Codec<ResultMessage> subcodec = new Message.Codec<ResultMessage>()
         {
-            public ResultMessage decode(ChannelBuffer body, int version)
+            public ResultMessage decode(ByteBuf body, ProtocolVersion version)
             {
-                Change change = CBUtil.readEnumValue(Change.class, body);
-                String keyspace = CBUtil.readString(body);
-                String columnFamily = CBUtil.readString(body);
-                return new SchemaChange(change, keyspace, columnFamily);
-
+                return new SchemaChange(Event.SchemaChange.deserializeEvent(body, version));
             }
 
-            public void encode(ResultMessage msg, ChannelBuffer dest, int version)
+            public void encode(ResultMessage msg, ByteBuf dest, ProtocolVersion version)
             {
                 assert msg instanceof SchemaChange;
                 SchemaChange scm = (SchemaChange)msg;
-
-                CBUtil.writeEnumValue(scm.change, dest);
-                CBUtil.writeString(scm.keyspace, dest);
-                CBUtil.writeString(scm.columnFamily, dest);
+                scm.change.serializeEvent(dest, version);
             }
 
-            public int encodedSize(ResultMessage msg, int version)
+            public int encodedSize(ResultMessage msg, ProtocolVersion version)
             {
                 assert msg instanceof SchemaChange;
                 SchemaChange scm = (SchemaChange)msg;
-
-                int size = 0;
-                size += CBUtil.sizeOfEnumValue(scm.change);
-                size += CBUtil.sizeOfString(scm.keyspace);
-                size += CBUtil.sizeOfString(scm.columnFamily);
-                return size;
+                return scm.change.eventSerializedSize(version);
             }
         };
-
-        public CqlResult toThriftResult()
-        {
-            return new CqlResult(CqlResultType.VOID);
-        }
 
         @Override
         public String toString()
         {
-            return "RESULT schema change " + change + " on " + keyspace + (columnFamily.isEmpty() ? "" : "." + columnFamily);
+            return "RESULT schema change " + change;
         }
     }
 }

@@ -3,8 +3,7 @@ package org.apache.cassandra;
  *
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
+ * distributed with this work for additional information * regarding copyright ownership.  The ASF licenses this file
  * to you under the Apache License, Version 2.0 (the
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
@@ -20,104 +19,143 @@ package org.apache.cassandra;
  *
  */
 
-import java.io.*;
-import java.net.InetAddress;
+import java.io.Closeable;
+import java.io.EOFException;
+import java.io.File;
+import java.io.IOError;
 import java.net.UnknownHostException;
 import java.nio.ByteBuffer;
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.List;
-import java.util.UUID;
+import java.util.*;
 import java.util.concurrent.Callable;
-import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Supplier;
+import java.util.stream.Collectors;
+
+import com.google.common.base.Function;
+import com.google.common.base.Preconditions;
+import com.google.common.collect.Iterables;
+import com.google.common.collect.Iterators;
+import org.apache.commons.lang3.StringUtils;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import afu.org.checkerframework.checker.oigj.qual.O;
+import org.apache.cassandra.db.compaction.ActiveCompactionsTracker;
+import org.apache.cassandra.db.compaction.CompactionTasks;
+import org.apache.cassandra.db.compaction.OperationType;
+import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.locator.ReplicaCollection;
+import org.apache.cassandra.schema.ColumnMetadata;
+import org.apache.cassandra.schema.TableId;
+import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.cql3.ColumnIdentifier;
 
 import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.Directories.DataDirectory;
 import org.apache.cassandra.db.compaction.AbstractCompactionTask;
 import org.apache.cassandra.db.compaction.CompactionManager;
-import org.apache.cassandra.db.columniterator.IdentityQueryFilter;
-import org.apache.cassandra.db.filter.IDiskAtomFilter;
-import org.apache.cassandra.db.filter.QueryFilter;
-import org.apache.cassandra.db.filter.SliceQueryFilter;
-import org.apache.cassandra.db.marshal.CompositeType;
-import org.apache.cassandra.dht.*;
+import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.db.marshal.AsciiType;
+import org.apache.cassandra.db.marshal.Int32Type;
+import org.apache.cassandra.db.partitions.*;
+import org.apache.cassandra.db.rows.*;
+import org.apache.cassandra.dht.IPartitioner;
+
+import org.apache.cassandra.dht.RandomPartitioner.BigIntegerToken;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.gms.ApplicationState;
 import org.apache.cassandra.gms.Gossiper;
 import org.apache.cassandra.gms.VersionedValue;
 import org.apache.cassandra.io.sstable.Descriptor;
-import org.apache.cassandra.io.sstable.SSTableReader;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.service.pager.PagingState;
+import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.CounterId;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.FilterFactory;
 
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertThat;
 import static org.junit.Assert.assertTrue;
 
 public class Util
 {
-    private static List<UUID> hostIdPool = new ArrayList<UUID>();
+    private static final Logger logger = LoggerFactory.getLogger(Util.class);
+
+    private static List<UUID> hostIdPool = new ArrayList<>();
+
+    public static IPartitioner testPartitioner()
+    {
+        return DatabaseDescriptor.getPartitioner();
+    }
 
     public static DecoratedKey dk(String key)
     {
-        return StorageService.getPartitioner().decorateKey(ByteBufferUtil.bytes(key));
+        return testPartitioner().decorateKey(ByteBufferUtil.bytes(key));
+    }
+
+    public static DecoratedKey dk(String key, AbstractType<?> type)
+    {
+        return testPartitioner().decorateKey(type.fromString(key));
     }
 
     public static DecoratedKey dk(ByteBuffer key)
     {
-        return StorageService.getPartitioner().decorateKey(key);
+        return testPartitioner().decorateKey(key);
     }
 
-    public static RowPosition rp(String key)
+    public static PartitionPosition rp(String key)
     {
-        return rp(key, StorageService.getPartitioner());
+        return rp(key, testPartitioner());
     }
 
-    public static RowPosition rp(String key, IPartitioner partitioner)
+    public static PartitionPosition rp(String key, IPartitioner partitioner)
     {
-        return RowPosition.forKey(ByteBufferUtil.bytes(key), partitioner);
+        return PartitionPosition.ForKey.get(ByteBufferUtil.bytes(key), partitioner);
     }
 
-    public static Column column(String name, String value, long timestamp)
+    public static Clustering<?> clustering(ClusteringComparator comparator, Object... o)
     {
-        return new Column(ByteBufferUtil.bytes(name), ByteBufferUtil.bytes(value), timestamp);
-    }
-
-    public static Column expiringColumn(String name, String value, long timestamp, int ttl)
-    {
-        return new ExpiringColumn(ByteBufferUtil.bytes(name), ByteBufferUtil.bytes(value), timestamp, ttl);
-    }
-
-    public static Column counterColumn(String name, long value, long timestamp)
-    {
-        return new CounterUpdateColumn(ByteBufferUtil.bytes(name), value, timestamp);
+        return comparator.make(o);
     }
 
     public static Token token(String key)
     {
-        return StorageService.getPartitioner().getToken(ByteBufferUtil.bytes(key));
+        return testPartitioner().getToken(ByteBufferUtil.bytes(key));
     }
 
-    public static Range<RowPosition> range(String left, String right)
+    public static Range<PartitionPosition> range(String left, String right)
     {
-        return new Range<RowPosition>(rp(left), rp(right));
+        return new Range<>(rp(left), rp(right));
     }
 
-    public static Range<RowPosition> range(IPartitioner p, String left, String right)
+    public static Range<PartitionPosition> range(IPartitioner p, String left, String right)
     {
-        return new Range<RowPosition>(rp(left, p), rp(right, p));
+        return new Range<>(rp(left, p), rp(right, p));
     }
 
-    public static Bounds<RowPosition> bounds(String left, String right)
+    //Test helper to make an iterator iterable once
+    public static <T> Iterable<T> once(final Iterator<T> source)
     {
-        return new Bounds<RowPosition>(rp(left), rp(right));
-    }
-
-    public static void addMutation(RowMutation rm, String columnFamilyName, String superColumnName, long columnName, String value, long timestamp)
-    {
-        ByteBuffer cname = superColumnName == null
-                         ? getBytes(columnName)
-                         : CompositeType.build(ByteBufferUtil.bytes(superColumnName), getBytes(columnName));
-        rm.add(columnFamilyName, cname, ByteBufferUtil.bytes(value), timestamp);
+        return new Iterable<T>()
+        {
+            private AtomicBoolean exhausted = new AtomicBoolean();
+            public Iterator<T> iterator()
+            {
+                Preconditions.checkState(!exhausted.getAndSet(true));
+                return source;
+            }
+        };
     }
 
     public static ByteBuffer getBytes(long v)
@@ -138,67 +176,24 @@ public class Util
         return bb;
     }
 
-    public static List<Row> getRangeSlice(ColumnFamilyStore cfs) throws IOException, ExecutionException, InterruptedException
-    {
-        return getRangeSlice(cfs, null);
-    }
-
-    public static List<Row> getRangeSlice(ColumnFamilyStore cfs, ByteBuffer superColumn) throws IOException, ExecutionException, InterruptedException
-    {
-        IDiskAtomFilter filter = superColumn == null
-                               ? new IdentityQueryFilter()
-                               : new SliceQueryFilter(SuperColumns.startOf(superColumn), SuperColumns.endOf(superColumn), false, Integer.MAX_VALUE);
-
-        Token min = StorageService.getPartitioner().getMinimumToken();
-        return cfs.getRangeSlice(new Bounds<Token>(min, min).toRowBounds(), null, filter, 10000);
-    }
-
     /**
      * Writes out a bunch of mutations for a single column family.
      *
-     * @param mutations A group of RowMutations for the same keyspace and column family.
+     * @param mutations A group of Mutations for the same keyspace and column family.
      * @return The ColumnFamilyStore that was used.
      */
-    public static ColumnFamilyStore writeColumnFamily(List<IMutation> mutations) throws IOException, ExecutionException, InterruptedException
+    public static ColumnFamilyStore writeColumnFamily(List<Mutation> mutations)
     {
         IMutation first = mutations.get(0);
         String keyspaceName = first.getKeyspaceName();
-        UUID cfid = first.getColumnFamilyIds().iterator().next();
+        TableId tableId = first.getTableIds().iterator().next();
 
-        for (IMutation rm : mutations)
-            rm.apply();
+        for (Mutation rm : mutations)
+            rm.applyUnsafe();
 
-        ColumnFamilyStore store = Keyspace.open(keyspaceName).getColumnFamilyStore(cfid);
+        ColumnFamilyStore store = Keyspace.open(keyspaceName).getColumnFamilyStore(tableId);
         store.forceBlockingFlush();
         return store;
-    }
-
-    public static ColumnFamily getColumnFamily(Keyspace keyspace, DecoratedKey key, String cfName) throws IOException
-    {
-        ColumnFamilyStore cfStore = keyspace.getColumnFamilyStore(cfName);
-        assert cfStore != null : "Column family " + cfName + " has not been defined";
-        return cfStore.getColumnFamily(QueryFilter.getIdentityFilter(key, cfName, System.currentTimeMillis()));
-    }
-
-    public static byte[] concatByteArrays(byte[] first, byte[]... remaining)
-    {
-        int length = first.length;
-        for (byte[] array : remaining)
-        {
-            length += array.length;
-        }
-
-        byte[] result = new byte[length];
-        System.arraycopy(first, 0, result, 0, first.length);
-        int offset = first.length;
-
-        for (byte[] array : remaining)
-        {
-            System.arraycopy(array, 0, result, offset, array.length);
-            offset += array.length;
-        }
-
-        return result;
     }
 
     public static boolean equalsCounterId(CounterId n, ByteBuffer context, int offset)
@@ -206,34 +201,34 @@ public class Util
         return CounterId.wrap(context, context.position() + offset).equals(n);
     }
 
-    public static ColumnFamily cloneAndRemoveDeleted(ColumnFamily cf, int gcBefore)
-    {
-        return ColumnFamilyStore.removeDeleted(cf.cloneMe(), gcBefore);
-    }
-
     /**
      * Creates initial set of nodes and tokens. Nodes are added to StorageService as 'normal'
      */
     public static void createInitialRing(StorageService ss, IPartitioner partitioner, List<Token> endpointTokens,
-                                   List<Token> keyTokens, List<InetAddress> hosts, List<UUID> hostIds, int howMany)
+                                         List<Token> keyTokens, List<InetAddressAndPort> hosts, List<UUID> hostIds, int howMany)
         throws UnknownHostException
     {
         // Expand pool of host IDs as necessary
         for (int i = hostIdPool.size(); i < howMany; i++)
             hostIdPool.add(UUID.randomUUID());
 
+        boolean endpointTokenPrefilled = endpointTokens != null && !endpointTokens.isEmpty();
         for (int i=0; i<howMany; i++)
         {
-            endpointTokens.add(new BigIntegerToken(String.valueOf(10 * i)));
+            if(!endpointTokenPrefilled)
+                endpointTokens.add(new BigIntegerToken(String.valueOf(10 * i)));
             keyTokens.add(new BigIntegerToken(String.valueOf(10 * i + 5)));
             hostIds.add(hostIdPool.get(i));
         }
 
         for (int i=0; i<endpointTokens.size(); i++)
         {
-            InetAddress ep = InetAddress.getByName("127.0.0." + String.valueOf(i + 1));
+            InetAddressAndPort ep = InetAddressAndPort.getByName("127.0.0." + String.valueOf(i + 1));
             Gossiper.instance.initializeNodeUnsafe(ep, hostIds.get(i), 1);
             Gossiper.instance.injectApplicationState(ep, ApplicationState.TOKENS, new VersionedValue.VersionedValueFactory(partitioner).tokens(Collections.singleton(endpointTokens.get(i))));
+            ss.onChange(ep,
+                        ApplicationState.STATUS_WITH_PORT,
+                        new VersionedValue.VersionedValueFactory(partitioner).normal(Collections.singleton(endpointTokens.get(i))));
             ss.onChange(ep,
                         ApplicationState.STATUS,
                         new VersionedValue.VersionedValueFactory(partitioner).normal(Collections.singleton(endpointTokens.get(i))));
@@ -245,19 +240,22 @@ public class Util
             assertTrue(ss.getTokenMetadata().isMember(hosts.get(i)));
     }
 
-    public static Future<?> compactAll(ColumnFamilyStore cfs)
+    public static Future<?> compactAll(ColumnFamilyStore cfs, int gcBefore)
     {
-        List<Descriptor> descriptors = new ArrayList<Descriptor>();
-        for (SSTableReader sstable : cfs.getSSTables())
+        List<Descriptor> descriptors = new ArrayList<>();
+        for (SSTableReader sstable : cfs.getLiveSSTables())
             descriptors.add(sstable.descriptor);
-        return CompactionManager.instance.submitUserDefined(cfs, descriptors, Integer.MAX_VALUE);
+        return CompactionManager.instance.submitUserDefined(cfs, descriptors, gcBefore);
     }
 
     public static void compact(ColumnFamilyStore cfs, Collection<SSTableReader> sstables)
     {
-        int gcBefore = cfs.gcBefore(System.currentTimeMillis());
-        AbstractCompactionTask task = cfs.getCompactionStrategy().getUserDefinedTask(sstables, gcBefore);
-        task.execute(null);
+        int gcBefore = cfs.gcBefore(FBUtilities.nowInSeconds());
+        try (CompactionTasks tasks = cfs.getCompactionStrategyManager().getUserDefinedTasks(sstables, gcBefore))
+        {
+            for (AbstractCompactionTask task : tasks)
+                task.execute(ActiveCompactionsTracker.NOOP);
+        }
     }
 
     public static void expectEOF(Callable<?> callable)
@@ -280,5 +278,522 @@ public class Util
         }
 
         assert thrown : exception.getName() + " not received";
+    }
+
+    public static AbstractReadCommandBuilder.SinglePartitionBuilder cmd(ColumnFamilyStore cfs, Object... partitionKey)
+    {
+        return new AbstractReadCommandBuilder.SinglePartitionBuilder(cfs, makeKey(cfs.metadata(), partitionKey));
+    }
+
+    public static AbstractReadCommandBuilder.PartitionRangeBuilder cmd(ColumnFamilyStore cfs)
+    {
+        return new AbstractReadCommandBuilder.PartitionRangeBuilder(cfs);
+    }
+
+    static DecoratedKey makeKey(TableMetadata metadata, Object... partitionKey)
+    {
+        if (partitionKey.length == 1 && partitionKey[0] instanceof DecoratedKey)
+            return (DecoratedKey)partitionKey[0];
+
+        ByteBuffer key = metadata.partitionKeyAsClusteringComparator().make(partitionKey).serializeAsPartitionKey();
+        return metadata.partitioner.decorateKey(key);
+    }
+
+    public static void assertEmptyUnfiltered(ReadCommand command)
+    {
+        try (ReadExecutionController executionController = command.executionController();
+             UnfilteredPartitionIterator iterator = command.executeLocally(executionController))
+        {
+            if (iterator.hasNext())
+            {
+                try (UnfilteredRowIterator partition = iterator.next())
+                {
+                    throw new AssertionError("Expected no results for query " + command.toCQLString() + " but got key " + command.metadata().partitionKeyType.getString(partition.partitionKey().getKey()));
+                }
+            }
+        }
+    }
+
+    public static void assertEmpty(ReadCommand command)
+    {
+        try (ReadExecutionController executionController = command.executionController();
+             PartitionIterator iterator = command.executeInternal(executionController))
+        {
+            if (iterator.hasNext())
+            {
+                try (RowIterator partition = iterator.next())
+                {
+                    throw new AssertionError("Expected no results for query " + command.toCQLString() + " but got key " + command.metadata().partitionKeyType.getString(partition.partitionKey().getKey()));
+                }
+            }
+        }
+    }
+
+    public static List<ImmutableBTreePartition> getAllUnfiltered(ReadCommand command)
+    {
+        List<ImmutableBTreePartition> results = new ArrayList<>();
+        try (ReadExecutionController executionController = command.executionController();
+             UnfilteredPartitionIterator iterator = command.executeLocally(executionController))
+        {
+            while (iterator.hasNext())
+            {
+                try (UnfilteredRowIterator partition = iterator.next())
+                {
+                    results.add(ImmutableBTreePartition.create(partition));
+                }
+            }
+        }
+        return results;
+    }
+
+    public static List<FilteredPartition> getAll(ReadCommand command)
+    {
+        List<FilteredPartition> results = new ArrayList<>();
+        try (ReadExecutionController executionController = command.executionController();
+             PartitionIterator iterator = command.executeInternal(executionController))
+        {
+            while (iterator.hasNext())
+            {
+                try (RowIterator partition = iterator.next())
+                {
+                    results.add(FilteredPartition.create(partition));
+                }
+            }
+        }
+        return results;
+    }
+
+    public static Row getOnlyRowUnfiltered(ReadCommand cmd)
+    {
+        try (ReadExecutionController executionController = cmd.executionController();
+             UnfilteredPartitionIterator iterator = cmd.executeLocally(executionController))
+        {
+            assert iterator.hasNext() : "Expecting one row in one partition but got nothing";
+            try (UnfilteredRowIterator partition = iterator.next())
+            {
+                assert !iterator.hasNext() : "Expecting a single partition but got more";
+
+                assert partition.hasNext() : "Expecting one row in one partition but got an empty partition";
+                Row row = ((Row)partition.next());
+                assert !partition.hasNext() : "Expecting a single row but got more";
+                return row;
+            }
+        }
+    }
+
+    public static Row getOnlyRow(ReadCommand cmd)
+    {
+        try (ReadExecutionController executionController = cmd.executionController();
+             PartitionIterator iterator = cmd.executeInternal(executionController))
+        {
+            assert iterator.hasNext() : "Expecting one row in one partition but got nothing";
+            try (RowIterator partition = iterator.next())
+            {
+                assert !iterator.hasNext() : "Expecting a single partition but got more";
+                assert partition.hasNext() : "Expecting one row in one partition but got an empty partition";
+                Row row = partition.next();
+                assert !partition.hasNext() : "Expecting a single row but got more";
+                return row;
+            }
+        }
+    }
+
+    public static ImmutableBTreePartition getOnlyPartitionUnfiltered(ReadCommand cmd)
+    {
+        try (ReadExecutionController executionController = cmd.executionController();
+             UnfilteredPartitionIterator iterator = cmd.executeLocally(executionController))
+        {
+            assert iterator.hasNext() : "Expecting a single partition but got nothing";
+            try (UnfilteredRowIterator partition = iterator.next())
+            {
+                assert !iterator.hasNext() : "Expecting a single partition but got more";
+                return ImmutableBTreePartition.create(partition);
+            }
+        }
+    }
+
+    public static FilteredPartition getOnlyPartition(ReadCommand cmd)
+    {
+        try (ReadExecutionController executionController = cmd.executionController();
+             PartitionIterator iterator = cmd.executeInternal(executionController))
+        {
+            assert iterator.hasNext() : "Expecting a single partition but got nothing";
+            try (RowIterator partition = iterator.next())
+            {
+                assert !iterator.hasNext() : "Expecting a single partition but got more";
+                return FilteredPartition.create(partition);
+            }
+        }
+    }
+
+    public static UnfilteredRowIterator apply(Mutation mutation)
+    {
+        mutation.apply();
+        assert mutation.getPartitionUpdates().size() == 1;
+        return mutation.getPartitionUpdates().iterator().next().unfilteredIterator();
+    }
+
+    public static Cell<?> cell(ColumnFamilyStore cfs, Row row, String columnName)
+    {
+        ColumnMetadata def = cfs.metadata().getColumn(ByteBufferUtil.bytes(columnName));
+        assert def != null;
+        return row.getCell(def);
+    }
+
+    public static Row row(Partition partition, Object... clustering)
+    {
+        return partition.getRow(partition.metadata().comparator.make(clustering));
+    }
+
+    public static void assertCellValue(Object value, ColumnFamilyStore cfs, Row row, String columnName)
+    {
+        Cell<?> cell = cell(cfs, row, columnName);
+        assert cell != null : "Row " + row.toString(cfs.metadata()) + " has no cell for " + columnName;
+        assertEquals(value, Cells.composeValue(cell, cell.column().type));
+    }
+
+    public static void consume(UnfilteredRowIterator iter)
+    {
+        try (UnfilteredRowIterator iterator = iter)
+        {
+            while (iter.hasNext())
+                iter.next();
+        }
+    }
+
+    public static void consume(UnfilteredPartitionIterator iterator)
+    {
+        while (iterator.hasNext())
+        {
+            consume(iterator.next());
+        }
+    }
+
+    public static int size(PartitionIterator iter)
+    {
+        int size = 0;
+        while (iter.hasNext())
+        {
+            ++size;
+            iter.next().close();
+        }
+        return size;
+    }
+
+    public static boolean equal(UnfilteredRowIterator a, UnfilteredRowIterator b)
+    {
+        return Objects.equals(a.columns(), b.columns())
+            && Objects.equals(a.stats(), b.stats())
+            && sameContent(a, b);
+    }
+
+    // Test equality of the iterators, but without caring too much about the "metadata" of said iterator. This is often
+    // what we want in tests. In particular, the columns() reported by the iterators will sometimes differ because they
+    // are a superset of what the iterator actually contains, and depending on the method used to get each iterator
+    // tested, one may include a defined column the other don't while there is not actual content for that column.
+    public static boolean sameContent(UnfilteredRowIterator a, UnfilteredRowIterator b)
+    {
+        return Objects.equals(a.metadata(), b.metadata())
+            && Objects.equals(a.isReverseOrder(), b.isReverseOrder())
+            && Objects.equals(a.partitionKey(), b.partitionKey())
+            && Objects.equals(a.partitionLevelDeletion(), b.partitionLevelDeletion())
+            && Objects.equals(a.staticRow(), b.staticRow())
+            && Iterators.elementsEqual(a, b);
+    }
+
+    public static boolean sameContent(RowIterator a, RowIterator b)
+    {
+        return Objects.equals(a.metadata(), b.metadata())
+               && Objects.equals(a.isReverseOrder(), b.isReverseOrder())
+               && Objects.equals(a.partitionKey(), b.partitionKey())
+               && Objects.equals(a.staticRow(), b.staticRow())
+               && Iterators.elementsEqual(a, b);
+    }
+
+    public static boolean sameContent(Mutation a, Mutation b)
+    {
+        if (!a.key().equals(b.key()) || !a.getTableIds().equals(b.getTableIds()))
+            return false;
+
+        for (PartitionUpdate update : a.getPartitionUpdates())
+        {
+            if (!sameContent(update.unfilteredIterator(), b.getPartitionUpdate(update.metadata()).unfilteredIterator()))
+                return false;
+        }
+        return true;
+    }
+
+    // moved & refactored from KeyspaceTest in < 3.0
+    public static void assertColumns(Row row, String... expectedColumnNames)
+    {
+        Iterator<Cell<?>> cells = row == null ? Collections.emptyIterator() : row.cells().iterator();
+        String[] actual = Iterators.toArray(Iterators.transform(cells, new Function<Cell<?>, String>()
+        {
+            public String apply(Cell<?> cell)
+            {
+                return cell.column().name.toString();
+            }
+        }), String.class);
+
+        assert Arrays.equals(actual, expectedColumnNames)
+        : String.format("Columns [%s])] is not expected [%s]",
+                        ((row == null) ? "" : row.columns().toString()),
+                        StringUtils.join(expectedColumnNames, ","));
+    }
+
+    public static void assertColumn(TableMetadata cfm, Row row, String name, String value, long timestamp)
+    {
+        Cell<?> cell = row.getCell(cfm.getColumn(new ColumnIdentifier(name, true)));
+        assertColumn(cell, value, timestamp);
+    }
+
+    public static void assertColumn(Cell<?> cell, String value, long timestamp)
+    {
+        assertNotNull(cell);
+        assertEquals(0, ByteBufferUtil.compareUnsigned(cell.buffer(), ByteBufferUtil.bytes(value)));
+        assertEquals(timestamp, cell.timestamp());
+    }
+
+    public static void assertClustering(TableMetadata cfm, Row row, Object... clusteringValue)
+    {
+        assertEquals(row.clustering().size(), clusteringValue.length);
+        assertEquals(0, cfm.comparator.compare(row.clustering(), cfm.comparator.make(clusteringValue)));
+    }
+
+    public static PartitionerSwitcher switchPartitioner(IPartitioner p)
+    {
+        return new PartitionerSwitcher(p);
+    }
+
+    public static class PartitionerSwitcher implements AutoCloseable
+    {
+        final IPartitioner oldP;
+        final IPartitioner newP;
+
+        public PartitionerSwitcher(IPartitioner partitioner)
+        {
+            newP = partitioner;
+            oldP = StorageService.instance.setPartitionerUnsafe(partitioner);
+        }
+
+        public void close()
+        {
+            IPartitioner p = StorageService.instance.setPartitionerUnsafe(oldP);
+            assert p == newP;
+        }
+    }
+
+    public static void spinAssertEquals(Object expected, Supplier<Object> actualSupplier, int timeoutInSeconds)
+    {
+        spinAssertEquals(null, expected, actualSupplier, timeoutInSeconds, TimeUnit.SECONDS);
+    }
+
+    public static <T> void spinAssertEquals(String message, T expected, Supplier<? extends T> actualSupplier, long timeout, TimeUnit timeUnit)
+    {
+        long startNano = System.nanoTime();
+        long expireAtNano = startNano + timeUnit.toNanos(timeout);
+        T actual = null;
+        while (System.nanoTime() < expireAtNano)
+        {
+            actual = actualSupplier.get();
+            if (actual.equals(expected))
+                break;
+            Thread.yield();
+        }
+        assertEquals(message, expected, actual);
+    }
+
+    public static void joinThread(Thread thread) throws InterruptedException
+    {
+        thread.join(10000);
+    }
+
+    public static AssertionError runCatchingAssertionError(Runnable test)
+    {
+        try
+        {
+            test.run();
+            return null;
+        }
+        catch (AssertionError e)
+        {
+            return e;
+        }
+    }
+
+    /**
+     * Wrapper function used to run a test that can sometimes flake for uncontrollable reasons.
+     *
+     * If the given test fails on the first run, it is executed the given number of times again, expecting all secondary
+     * runs to succeed. If they do, the failure is understood as a flake and the test is treated as passing.
+     *
+     * Do not use this if the test is deterministic and its success is not influenced by external factors (such as time,
+     * selection of random seed, network failures, etc.). If the test can be made independent of such factors, it is
+     * probably preferable to do so rather than use this method.
+     *
+     * @param test The test to run.
+     * @param rerunsOnFailure How many times to re-run it if it fails. All reruns must pass.
+     * @param message Message to send to System.err on initial failure.
+     */
+    public static void flakyTest(Runnable test, int rerunsOnFailure, String message)
+    {
+        AssertionError e = runCatchingAssertionError(test);
+        if (e == null)
+            return;     // success
+
+        logger.info("Test failed. {}", message, e);
+        logger.info("Re-running {} times to verify it isn't failing more often than it should.", rerunsOnFailure);
+
+        int rerunsFailed = 0;
+        for (int i = 0; i < rerunsOnFailure; ++i)
+        {
+            AssertionError t = runCatchingAssertionError(test);
+            if (t != null)
+            {
+                ++rerunsFailed;
+                e.addSuppressed(t);
+
+                logger.debug("Test failed again, total num failures: {}", rerunsFailed, t);
+            }
+        }
+        if (rerunsFailed > 0)
+        {
+            logger.error("Test failed in {} of the {} reruns.", rerunsFailed, rerunsOnFailure);
+            throw e;
+        }
+
+        logger.info("All reruns succeeded. Failure treated as flake.");
+    }
+
+    // for use with Optional in tests, can be used as an argument to orElseThrow
+    public static Supplier<AssertionError> throwAssert(final String message)
+    {
+        return () -> new AssertionError(message);
+    }
+
+    public static class UnfilteredSource extends AbstractUnfilteredRowIterator implements UnfilteredRowIterator
+    {
+        Iterator<Unfiltered> content;
+
+        public UnfilteredSource(TableMetadata metadata, DecoratedKey partitionKey, Row staticRow, Iterator<Unfiltered> content)
+        {
+            super(metadata,
+                  partitionKey,
+                  DeletionTime.LIVE,
+                  metadata.regularAndStaticColumns(),
+                  staticRow != null ? staticRow : Rows.EMPTY_STATIC_ROW,
+                  false,
+                  EncodingStats.NO_STATS);
+            this.content = content;
+        }
+
+        @Override
+        protected Unfiltered computeNext()
+        {
+            return content.hasNext() ? content.next() : endOfData();
+        }
+    }
+
+    public static UnfilteredPartitionIterator executeLocally(PartitionRangeReadCommand command,
+                                                             ColumnFamilyStore cfs,
+                                                             ReadExecutionController controller)
+    {
+        return command.queryStorage(cfs, controller);
+    }
+
+    public static Closeable markDirectoriesUnwriteable(ColumnFamilyStore cfs)
+    {
+        try
+        {
+            for ( ; ; )
+            {
+                DataDirectory dir = cfs.getDirectories().getWriteableLocation(1);
+                DisallowedDirectories.maybeMarkUnwritable(cfs.getDirectories().getLocationForDisk(dir));
+            }
+        }
+        catch (IOError e)
+        {
+            // Expected -- marked all directories as unwritable
+        }
+        return () -> DisallowedDirectories.clearUnwritableUnsafe();
+    }
+
+    public static PagingState makeSomePagingState(ProtocolVersion protocolVersion)
+    {
+        return makeSomePagingState(protocolVersion, Integer.MAX_VALUE);
+    }
+
+    public static PagingState makeSomePagingState(ProtocolVersion protocolVersion, int remainingInPartition)
+    {
+        TableMetadata metadata =
+            TableMetadata.builder("ks", "tbl")
+                         .addPartitionKeyColumn("k", AsciiType.instance)
+                         .addClusteringColumn("c1", AsciiType.instance)
+                         .addClusteringColumn("c2", Int32Type.instance)
+                         .addRegularColumn("myCol", AsciiType.instance)
+                         .build();
+
+        ByteBuffer pk = ByteBufferUtil.bytes("someKey");
+
+        ColumnMetadata def = metadata.getColumn(new ColumnIdentifier("myCol", false));
+        Clustering<?> c = Clustering.make(ByteBufferUtil.bytes("c1"), ByteBufferUtil.bytes(42));
+        Row row = BTreeRow.singleCellRow(c, BufferCell.live(def, 0, ByteBufferUtil.EMPTY_BYTE_BUFFER));
+        PagingState.RowMark mark = PagingState.RowMark.create(metadata, row, protocolVersion);
+        return new PagingState(pk, mark, 10, remainingInPartition);
+    }
+
+    public static void assertRCEquals(ReplicaCollection<?> a, ReplicaCollection<?> b)
+    {
+        assertTrue(a + " not equal to " + b, Iterables.elementsEqual(a, b));
+    }
+
+    public static void assertNotRCEquals(ReplicaCollection<?> a, ReplicaCollection<?> b)
+    {
+        assertFalse(a + " equal to " + b, Iterables.elementsEqual(a, b));
+    }
+
+    /**
+     * Makes sure that the sstables on disk are the same ones as the cfs live sstables (that they have the same generation)
+     */
+    public static void assertOnDiskState(ColumnFamilyStore cfs, int expectedSSTableCount)
+    {
+        LifecycleTransaction.waitForDeletions();
+        assertEquals(expectedSSTableCount, cfs.getLiveSSTables().size());
+        Set<Integer> liveGenerations = cfs.getLiveSSTables().stream().map(sstable -> sstable.descriptor.generation).collect(Collectors.toSet());
+        int fileCount = 0;
+        for (File f : cfs.getDirectories().getCFDirectories())
+        {
+            for (File sst : f.listFiles())
+            {
+                if (sst.getName().contains("Data"))
+                {
+                    Descriptor d = Descriptor.fromFilename(sst.getAbsolutePath());
+                    assertTrue(liveGenerations.contains(d.generation));
+                    fileCount++;
+                }
+            }
+        }
+        assertEquals(expectedSSTableCount, fileCount);
+    }
+
+    /**
+     * Disable bloom filter on all sstables of given table
+     */
+    public static void disableBloomFilter(ColumnFamilyStore cfs)
+    {
+        Collection<SSTableReader> sstables = cfs.getLiveSSTables();
+        try (LifecycleTransaction txn = cfs.getTracker().tryModify(sstables, OperationType.UNKNOWN))
+        {
+            for (SSTableReader sstable : sstables)
+            {
+                sstable = sstable.cloneAndReplace(FilterFactory.AlwaysPresent);
+                txn.update(sstable, true);
+                txn.checkpoint();
+            }
+            txn.finish();
+        }
+
+        for (SSTableReader reader : cfs.getLiveSSTables())
+            assertEquals(FilterFactory.AlwaysPresent, reader.getBloomFilter());
     }
 }

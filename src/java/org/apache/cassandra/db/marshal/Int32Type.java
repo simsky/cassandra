@@ -18,38 +18,41 @@
 package org.apache.cassandra.db.marshal;
 
 import java.nio.ByteBuffer;
+import java.util.Objects;
 
 import org.apache.cassandra.cql3.CQL3Type;
-import org.apache.cassandra.serializers.TypeSerializer;
+import org.apache.cassandra.cql3.Constants;
+import org.apache.cassandra.cql3.Term;
 import org.apache.cassandra.serializers.Int32Serializer;
 import org.apache.cassandra.serializers.MarshalException;
+import org.apache.cassandra.transport.ProtocolVersion;
+import org.apache.cassandra.serializers.TypeSerializer;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
-public class Int32Type extends AbstractType<Integer>
+public class Int32Type extends NumberType<Integer>
 {
     public static final Int32Type instance = new Int32Type();
 
     Int32Type()
     {
+        super(ComparisonType.CUSTOM);
     } // singleton
 
-    public int compare(ByteBuffer o1, ByteBuffer o2)
+    public boolean isEmptyValueMeaningless()
     {
-        if (o1.remaining() == 0)
-        {
-            return o2.remaining() == 0 ? 0 : -1;
-        }
-        if (o2.remaining() == 0)
-        {
-            return 1;
-        }
+        return true;
+    }
 
-        int diff = o1.get(o1.position()) - o2.get(o2.position());
+    public <VL, VR> int compareCustom(VL left, ValueAccessor<VL> accessorL, VR right, ValueAccessor<VR> accessorR)
+    {
+        if (accessorL.isEmpty(left) || accessorR.isEmpty(right))
+            return Boolean.compare(accessorR.isEmpty(right), accessorL.isEmpty(left));
+
+        int diff = accessorL.getByte(left, 0) - accessorR.getByte(right, 0);
         if (diff != 0)
             return diff;
 
-
-        return ByteBufferUtil.compareUnsigned(o1, o2);
+        return ValueAccessor.compare(left, accessorL, right, accessorR);
     }
 
     public ByteBuffer fromString(String source) throws MarshalException
@@ -66,10 +69,37 @@ public class Int32Type extends AbstractType<Integer>
         }
         catch (Exception e)
         {
-            throw new MarshalException(String.format("unable to make int from '%s'", source), e);
+            throw new MarshalException(String.format("Unable to make int from '%s'", source), e);
         }
 
         return decompose(int32Type);
+    }
+
+    @Override
+    public Term fromJSONObject(Object parsed) throws MarshalException
+    {
+        try
+        {
+            if (parsed instanceof String)
+                return new Constants.Value(fromString((String) parsed));
+
+            Number parsedNumber = (Number) parsed;
+            if (!(parsedNumber instanceof Integer))
+                throw new MarshalException(String.format("Expected an int value, but got a %s: %s", parsed.getClass().getSimpleName(), parsed));
+
+            return new Constants.Value(getSerializer().serialize(parsedNumber.intValue()));
+        }
+        catch (ClassCastException exc)
+        {
+            throw new MarshalException(String.format(
+                    "Expected an int value, but got a %s: %s", parsed.getClass().getSimpleName(), parsed));
+        }
+    }
+
+    @Override
+    public String toJSONString(ByteBuffer buffer, ProtocolVersion protocolVersion)
+    {
+        return Objects.toString(getSerializer().deserialize(buffer), "\"\"");
     }
 
     public CQL3Type asCQL3Type()
@@ -80,5 +110,53 @@ public class Int32Type extends AbstractType<Integer>
     public TypeSerializer<Integer> getSerializer()
     {
         return Int32Serializer.instance;
+    }
+
+    @Override
+    public int valueLengthIfFixed()
+    {
+        return 4;
+    }
+
+    @Override
+    protected int toInt(ByteBuffer value)
+    {
+        return ByteBufferUtil.toInt(value);
+    }
+
+    @Override
+    protected float toFloat(ByteBuffer value)
+    {
+        return toInt(value);
+    }
+
+    public ByteBuffer add(NumberType<?> leftType, ByteBuffer left, NumberType<?> rightType, ByteBuffer right)
+    {
+        return ByteBufferUtil.bytes(leftType.toInt(left) + rightType.toInt(right));
+    }
+
+    public ByteBuffer substract(NumberType<?> leftType, ByteBuffer left, NumberType<?> rightType, ByteBuffer right)
+    {
+        return ByteBufferUtil.bytes(leftType.toInt(left) - rightType.toInt(right));
+    }
+
+    public ByteBuffer multiply(NumberType<?> leftType, ByteBuffer left, NumberType<?> rightType, ByteBuffer right)
+    {
+        return ByteBufferUtil.bytes(leftType.toInt(left) * rightType.toInt(right));
+    }
+
+    public ByteBuffer divide(NumberType<?> leftType, ByteBuffer left, NumberType<?> rightType, ByteBuffer right)
+    {
+        return ByteBufferUtil.bytes(leftType.toInt(left) / rightType.toInt(right));
+    }
+
+    public ByteBuffer mod(NumberType<?> leftType, ByteBuffer left, NumberType<?> rightType, ByteBuffer right)
+    {
+        return ByteBufferUtil.bytes(leftType.toInt(left) % rightType.toInt(right));
+    }
+
+    public ByteBuffer negate(ByteBuffer input)
+    {
+        return ByteBufferUtil.bytes(-toInt(input));
     }
 }

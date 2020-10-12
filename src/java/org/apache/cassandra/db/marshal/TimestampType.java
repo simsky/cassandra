@@ -18,9 +18,12 @@
 package org.apache.cassandra.db.marshal;
 
 import java.nio.ByteBuffer;
-import java.text.ParseException;
 import java.util.Date;
-import java.util.regex.Pattern;
+
+import org.apache.cassandra.cql3.Constants;
+import org.apache.cassandra.cql3.Duration;
+import org.apache.cassandra.cql3.Term;
+import org.apache.cassandra.cql3.statements.RequestValidations;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -28,8 +31,10 @@ import org.apache.cassandra.cql3.CQL3Type;
 import org.apache.cassandra.serializers.TypeSerializer;
 import org.apache.cassandra.serializers.MarshalException;
 import org.apache.cassandra.serializers.TimestampSerializer;
+import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.ByteBufferUtil;
-import org.apache.commons.lang3.time.DateUtils;
+
+import static org.apache.cassandra.cql3.statements.RequestValidations.invalidRequest;
 
 /**
  * Type for date-time values.
@@ -38,19 +43,22 @@ import org.apache.commons.lang3.time.DateUtils;
  * pre-unix-epoch dates, sorting them *after* post-unix-epoch ones (due to it's
  * use of unsigned bytes comparison).
  */
-public class TimestampType extends AbstractType<Date>
+public class TimestampType extends TemporalType<Date>
 {
     private static final Logger logger = LoggerFactory.getLogger(TimestampType.class);
 
     public static final TimestampType instance = new TimestampType();
 
-    private static final Pattern timestampPattern = Pattern.compile("^-?\\d+$");
+    private TimestampType() {super(ComparisonType.CUSTOM);} // singleton
 
-    private TimestampType() {} // singleton
-
-    public int compare(ByteBuffer o1, ByteBuffer o2)
+    public boolean isEmptyValueMeaningless()
     {
-        return LongType.compareLongs(o1, o2);
+        return true;
+    }
+
+    public <VL, VR> int compareCustom(VL left, ValueAccessor<VL> accessorL, VR right, ValueAccessor<VR> accessorR)
+    {
+        return LongType.compareLongs(left, accessorL, right, accessorR);
     }
 
     public ByteBuffer fromString(String source) throws MarshalException
@@ -59,43 +67,48 @@ public class TimestampType extends AbstractType<Date>
       if (source.isEmpty())
           return ByteBufferUtil.EMPTY_BYTE_BUFFER;
 
-      return ByteBufferUtil.bytes(dateStringToTimestamp(source));
+      return ByteBufferUtil.bytes(TimestampSerializer.dateStringToTimestamp(source));
     }
 
-    public static long dateStringToTimestamp(String source) throws MarshalException
+    @Override
+    public ByteBuffer fromTimeInMillis(long millis) throws MarshalException
     {
-      long millis;
+        return ByteBufferUtil.bytes(millis);
+    }
 
-      if (source.toLowerCase().equals("now"))
-      {
-          millis = System.currentTimeMillis();
-      }
-      // Milliseconds since epoch?
-      else if (timestampPattern.matcher(source).matches())
-      {
-          try
-          {
-              millis = Long.parseLong(source);
-          }
-          catch (NumberFormatException e)
-          {
-              throw new MarshalException(String.format("unable to make long (for date) from: '%s'", source), e);
-          }
-      }
-      // Last chance, attempt to parse as date-time string
-      else
-      {
-          try
-          {
-              millis = DateUtils.parseDateStrictly(source, TimestampSerializer.iso8601Patterns).getTime();
-          }
-          catch (ParseException e1)
-          {
-              throw new MarshalException(String.format("unable to coerce '%s' to a  formatted date (long)", source), e1);
-          }
-      }
+    @Override
+    public long toTimeInMillis(ByteBuffer value)
+    {
+        return ByteBufferUtil.toLong(value);
+    }
 
-      return millis;
+    @Override
+    public Term fromJSONObject(Object parsed) throws MarshalException
+    {
+        if (parsed instanceof Long)
+            return new Constants.Value(ByteBufferUtil.bytes((Long) parsed));
+
+        try
+        {
+            return new Constants.Value(TimestampType.instance.fromString((String) parsed));
+        }
+        catch (ClassCastException exc)
+        {
+            throw new MarshalException(String.format(
+                    "Expected a long or a datestring representation of a timestamp value, but got a %s: %s",
+                    parsed.getClass().getSimpleName(), parsed));
+        }
+    }
+
+    private String toString(Date date)
+    {
+        return date != null ? TimestampSerializer.getJsonDateFormatter().format(date) : "";
+    }
+
+    @Override
+    public String toJSONString(ByteBuffer buffer, ProtocolVersion protocolVersion)
+    {
+        return '"' + toString(TimestampSerializer.instance.deserialize(buffer)) + '"';
     }
 
     @Override
@@ -115,6 +128,12 @@ public class TimestampType extends AbstractType<Date>
         return false;
     }
 
+    @Override
+    public boolean isValueCompatibleWithInternal(AbstractType<?> otherType)
+    {
+        return this == otherType || otherType == DateType.instance || otherType == LongType.instance;
+    }
+
     public CQL3Type asCQL3Type()
     {
         return CQL3Type.Native.TIMESTAMP;
@@ -123,5 +142,18 @@ public class TimestampType extends AbstractType<Date>
     public TypeSerializer<Date> getSerializer()
     {
         return TimestampSerializer.instance;
+    }
+
+    @Override
+    public int valueLengthIfFixed()
+    {
+        return 8;
+    }
+
+    @Override
+    protected void validateDuration(Duration duration)
+    {
+        if (!duration.hasMillisecondPrecision())
+            throw invalidRequest("The duration must have a millisecond precision. Was: %s", duration);
     }
 }

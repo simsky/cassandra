@@ -17,21 +17,18 @@
  */
 package org.apache.cassandra.cql3;
 
+import java.math.BigDecimal;
+import java.math.BigInteger;
 import java.nio.ByteBuffer;
-import java.util.List;
 
-import org.apache.cassandra.serializers.MarshalException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
-import org.apache.cassandra.db.ColumnFamily;
-import org.apache.cassandra.db.marshal.AbstractType;
-import org.apache.cassandra.db.marshal.BytesType;
-import org.apache.cassandra.db.marshal.CollectionType;
-import org.apache.cassandra.db.marshal.CounterColumnType;
-import org.apache.cassandra.db.marshal.LongType;
-import org.apache.cassandra.db.marshal.ReversedType;
+import org.apache.cassandra.schema.ColumnMetadata;
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.marshal.*;
 import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.serializers.MarshalException;
+import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
 /**
@@ -43,51 +40,142 @@ public abstract class Constants
 
     public enum Type
     {
-        STRING, INTEGER, UUID, FLOAT, BOOLEAN, HEX;
+        STRING,
+        INTEGER
+        {
+            public AbstractType<?> getPreferedTypeFor(String text)
+            {
+                // We only try to determine the smallest possible type between int, long and BigInteger
+                BigInteger b = new BigInteger(text);
+
+                if (b.equals(BigInteger.valueOf(b.intValue())))
+                    return Int32Type.instance;
+
+                if (b.equals(BigInteger.valueOf(b.longValue())))
+                    return LongType.instance;
+
+                return IntegerType.instance;
+            }
+        },
+        UUID,
+        FLOAT
+        {
+            public AbstractType<?> getPreferedTypeFor(String text)
+            {
+                if ("NaN".equals(text) || "-NaN".equals(text) || "Infinity".equals(text) || "-Infinity".equals(text))
+                    return DoubleType.instance;
+
+                // We only try to determine the smallest possible type between double and BigDecimal
+                BigDecimal b = new BigDecimal(text);
+
+                if (b.compareTo(BigDecimal.valueOf(b.doubleValue())) == 0)
+                    return DoubleType.instance;
+
+                return DecimalType.instance;
+            }
+        },
+        BOOLEAN,
+        HEX,
+        DURATION;
+
+        /**
+         * Returns the exact type for the specified text
+         *
+         * @param text the text for which the type must be determined
+         * @return the exact type or {@code null} if it is not known.
+         */
+        public AbstractType<?> getPreferedTypeFor(String text)
+        {
+            return null;
+        }
     }
 
-    public static final Term.Raw NULL_LITERAL = new Term.Raw()
+    private static class UnsetLiteral extends Term.Raw
     {
-        private final Term.Terminal NULL_VALUE = new Value(null)
+        public Term prepare(String keyspace, ColumnSpecification receiver) throws InvalidRequestException
         {
-            @Override
-            public Terminal bind(List<ByteBuffer> values)
-            {
-                // We return null because that makes life easier for collections
-                return null;
-            }
-        };
+            return UNSET_VALUE;
+        }
 
-        public Term prepare(ColumnSpecification receiver) throws InvalidRequestException
+        public AssignmentTestable.TestResult testAssignment(String keyspace, ColumnSpecification receiver)
         {
-            if (!isAssignableTo(receiver))
+            return AssignmentTestable.TestResult.NOT_ASSIGNABLE;
+        }
+
+        public String getText()
+        {
+            return "";
+        }
+
+        public AbstractType<?> getExactTypeIfKnown(String keyspace)
+        {
+            return null;
+        }
+    }
+
+    // We don't have "unset" literal in the syntax, but it's used implicitely for JSON "DEFAULT UNSET" option
+    public static final UnsetLiteral UNSET_LITERAL = new UnsetLiteral();
+
+    public static final Value UNSET_VALUE = new Value(ByteBufferUtil.UNSET_BYTE_BUFFER);
+
+    private static class NullLiteral extends Term.Raw
+    {
+        public Term prepare(String keyspace, ColumnSpecification receiver) throws InvalidRequestException
+        {
+            if (!testAssignment(keyspace, receiver).isAssignable())
                 throw new InvalidRequestException("Invalid null value for counter increment/decrement");
 
             return NULL_VALUE;
         }
 
-        public boolean isAssignableTo(ColumnSpecification receiver)
+        public AssignmentTestable.TestResult testAssignment(String keyspace, ColumnSpecification receiver)
         {
-            return !(receiver.type instanceof CounterColumnType);
+            return receiver.type instanceof CounterColumnType
+                 ? AssignmentTestable.TestResult.NOT_ASSIGNABLE
+                 : AssignmentTestable.TestResult.WEAKLY_ASSIGNABLE;
+        }
+
+        public String getText()
+        {
+            return "NULL";
+        }
+
+        public AbstractType<?> getExactTypeIfKnown(String keyspace)
+        {
+            return null;
+        }
+    }
+
+    public static final NullLiteral NULL_LITERAL = new NullLiteral();
+
+    public static final Term.Terminal NULL_VALUE = new Value(null)
+    {
+        @Override
+        public Terminal bind(QueryOptions options)
+        {
+            // We return null because that makes life easier for collections
+            return null;
         }
 
         @Override
         public String toString()
         {
-            return null;
+            return "null";
         }
     };
 
-    public static class Literal implements Term.Raw
+    public static class Literal extends Term.Raw
     {
         private final Type type;
         private final String text;
+        private final AbstractType<?> preferedType;
 
         private Literal(Type type, String text)
         {
             assert type != null && text != null;
             this.type = type;
             this.text = text;
+            this.preferedType = type.getPreferedTypeFor(text);
         }
 
         public static Literal string(String text)
@@ -120,10 +208,15 @@ public abstract class Constants
             return new Literal(Type.HEX, text);
         }
 
-        public Value prepare(ColumnSpecification receiver) throws InvalidRequestException
+        public static Literal duration(String text)
         {
-            if (!isAssignableTo(receiver))
-                throw new InvalidRequestException(String.format("Invalid %s constant (%s) for %s of type %s", type, text, receiver, receiver.type.asCQL3Type()));
+            return new Literal(Type.DURATION, text);
+        }
+
+        public Value prepare(String keyspace, ColumnSpecification receiver) throws InvalidRequestException
+        {
+            if (!testAssignment(keyspace, receiver).isAssignable())
+                throw new InvalidRequestException(String.format("Invalid %s constant (%s) for \"%s\" of type %s", type, text, receiver.name, receiver.type.asCQL3Type()));
 
             return new Value(parsedValue(receiver.type));
         }
@@ -134,9 +227,12 @@ public abstract class Constants
                 validator = ((ReversedType<?>) validator).baseType;
             try
             {
-                // BytesType doesn't want it's input prefixed by '0x'.
-                if (type == Type.HEX && validator instanceof BytesType)
-                    return validator.fromString(text.substring(2));
+                if (type == Type.HEX)
+                    // Note that validator could be BytesType, but it could also be a custom type, so
+                    // we hardcode BytesType (rather than using 'validator') in the call below.
+                    // Further note that BytesType doesn't want it's input prefixed by '0x', hence the substring.
+                    return BytesType.instance.fromString(text.substring(2));
+
                 if (validator instanceof CounterColumnType)
                     return LongType.instance.fromString(text);
                 return validator.fromString(text);
@@ -147,22 +243,23 @@ public abstract class Constants
             }
         }
 
-        public String getRawText()
-        {
-            return text;
-        }
-
-        public boolean isAssignableTo(ColumnSpecification receiver)
+        @Override
+        public AssignmentTestable.TestResult testAssignment(String keyspace, ColumnSpecification receiver)
         {
             CQL3Type receiverType = receiver.type.asCQL3Type();
-            if (receiverType.isCollection())
-                return false;
+            if (receiverType.isCollection() || receiverType.isUDT())
+                return AssignmentTestable.TestResult.NOT_ASSIGNABLE;
 
             if (!(receiverType instanceof CQL3Type.Native))
                 // Skip type validation for custom types. May or may not be a good idea
-                return true;
+                return AssignmentTestable.TestResult.WEAKLY_ASSIGNABLE;
 
             CQL3Type.Native nt = (CQL3Type.Native)receiverType;
+
+            // If the receiver type match the prefered type we can straight away return an exact match
+            if (nt.getType().equals(preferedType))
+                return AssignmentTestable.TestResult.EXACT_MATCH;
+
             switch (type)
             {
                 case STRING:
@@ -172,61 +269,89 @@ public abstract class Constants
                         case TEXT:
                         case INET:
                         case VARCHAR:
+                        case DATE:
+                        case TIME:
                         case TIMESTAMP:
-                            return true;
+                            return AssignmentTestable.TestResult.WEAKLY_ASSIGNABLE;
                     }
-                    return false;
+                    break;
                 case INTEGER:
                     switch (nt)
                     {
                         case BIGINT:
                         case COUNTER:
+                        case DATE:
                         case DECIMAL:
                         case DOUBLE:
+                        case DURATION:
                         case FLOAT:
                         case INT:
+                        case SMALLINT:
+                        case TIME:
                         case TIMESTAMP:
+                        case TINYINT:
                         case VARINT:
-                            return true;
+                            return AssignmentTestable.TestResult.WEAKLY_ASSIGNABLE;
                     }
-                    return false;
+                    break;
                 case UUID:
                     switch (nt)
                     {
                         case UUID:
                         case TIMEUUID:
-                            return true;
+                            return AssignmentTestable.TestResult.WEAKLY_ASSIGNABLE;
                     }
-                    return false;
+                    break;
                 case FLOAT:
                     switch (nt)
                     {
                         case DECIMAL:
                         case DOUBLE:
                         case FLOAT:
-                            return true;
+                            return AssignmentTestable.TestResult.WEAKLY_ASSIGNABLE;
                     }
-                    return false;
+                    break;
                 case BOOLEAN:
                     switch (nt)
                     {
                         case BOOLEAN:
-                            return true;
+                            return AssignmentTestable.TestResult.WEAKLY_ASSIGNABLE;
                     }
-                    return false;
+                    break;
                 case HEX:
                     switch (nt)
                     {
                         case BLOB:
-                            return true;
+                            return AssignmentTestable.TestResult.WEAKLY_ASSIGNABLE;
                     }
-                    return false;
+                    break;
+                case DURATION:
+                    switch (nt)
+                    {
+                        case DURATION:
+                            return AssignmentTestable.TestResult.WEAKLY_ASSIGNABLE;
+                    }
+                    break;
             }
-            return false;
+            return AssignmentTestable.TestResult.NOT_ASSIGNABLE;
         }
 
-        @Override
-        public String toString()
+        public AbstractType<?> getExactTypeIfKnown(String keyspace)
+        {
+            // Most constant are valid for more than one type (the extreme example being integer constants, which can
+            // be use for any numerical type, including date, time, ...) so they don't have an exact type. And in fact,
+            // for good or bad, any literal is valid for custom types, so we can never claim an exact type.
+            // But really, the reason it's fine to return null here is that getExactTypeIfKnown is only used to
+            // implement testAssignment() in Selectable and that method is overriden above.
+            return null;
+        }
+
+        public String getRawText()
+        {
+            return text;
+        }
+
+        public String getText()
         {
             return type == Type.STRING ? String.format("'%s'", text) : text;
         }
@@ -244,15 +369,21 @@ public abstract class Constants
             this.bytes = bytes;
         }
 
-        public ByteBuffer get()
+        public ByteBuffer get(ProtocolVersion protocolVersion)
         {
             return bytes;
         }
 
         @Override
-        public ByteBuffer bindAndGet(List<ByteBuffer> values)
+        public ByteBuffer bindAndGet(QueryOptions options)
         {
             return bytes;
+        }
+
+        @Override
+        public String toString()
+        {
+            return ByteBufferUtil.bytesToHex(bytes);
         }
     }
 
@@ -261,16 +392,16 @@ public abstract class Constants
         protected Marker(int bindIndex, ColumnSpecification receiver)
         {
             super(bindIndex, receiver);
-            assert !(receiver.type instanceof CollectionType);
+            assert !receiver.type.isCollection();
         }
 
         @Override
-        public ByteBuffer bindAndGet(List<ByteBuffer> values) throws InvalidRequestException
+        public ByteBuffer bindAndGet(QueryOptions options) throws InvalidRequestException
         {
             try
             {
-                ByteBuffer value = values.get(bindIndex);
-                if (value != null)
+                ByteBuffer value = options.getValues().get(bindIndex);
+                if (value != null && value != ByteBufferUtil.UNSET_BYTE_BUFFER)
                     receiver.type.validate(value);
                 return value;
             }
@@ -280,65 +411,74 @@ public abstract class Constants
             }
         }
 
-        public Value bind(List<ByteBuffer> values) throws InvalidRequestException
+        public Value bind(QueryOptions options) throws InvalidRequestException
         {
-            ByteBuffer bytes = bindAndGet(values);
-            return bytes == null ? null : new Constants.Value(bytes);
+            ByteBuffer bytes = bindAndGet(options);
+            if (bytes == null)
+                return null;
+            if (bytes == ByteBufferUtil.UNSET_BYTE_BUFFER)
+                return Constants.UNSET_VALUE;
+            return new Constants.Value(bytes);
         }
     }
 
     public static class Setter extends Operation
     {
-        public Setter(ColumnIdentifier column, Term t)
+        public Setter(ColumnMetadata column, Term t)
         {
             super(column, t);
         }
 
-        public void execute(ByteBuffer rowKey, ColumnFamily cf, ColumnNameBuilder prefix, UpdateParameters params) throws InvalidRequestException
+        public void execute(DecoratedKey partitionKey, UpdateParameters params) throws InvalidRequestException
         {
-            ByteBuffer cname = columnName == null ? prefix.build() : prefix.add(columnName).build();
-            ByteBuffer value = t.bindAndGet(params.variables);
-            cf.addColumn(value == null ? params.makeTombstone(cname) : params.makeColumn(cname, value));
+            ByteBuffer value = t.bindAndGet(params.options);
+            if (value == null)
+                params.addTombstone(column);
+            else if (value != ByteBufferUtil.UNSET_BYTE_BUFFER) // use reference equality and not object equality
+                params.addCell(column, value);
         }
     }
 
     public static class Adder extends Operation
     {
-        public Adder(ColumnIdentifier column, Term t)
+        public Adder(ColumnMetadata column, Term t)
         {
             super(column, t);
         }
 
-        public void execute(ByteBuffer rowKey, ColumnFamily cf, ColumnNameBuilder prefix, UpdateParameters params) throws InvalidRequestException
+        public void execute(DecoratedKey partitionKey, UpdateParameters params) throws InvalidRequestException
         {
-            ByteBuffer bytes = t.bindAndGet(params.variables);
+            ByteBuffer bytes = t.bindAndGet(params.options);
             if (bytes == null)
                 throw new InvalidRequestException("Invalid null value for counter increment");
+            if (bytes == ByteBufferUtil.UNSET_BYTE_BUFFER)
+                return;
+
             long increment = ByteBufferUtil.toLong(bytes);
-            ByteBuffer cname = columnName == null ? prefix.build() : prefix.add(columnName).build();
-            cf.addCounter(cname, increment);
+            params.addCounter(column, increment);
         }
     }
 
     public static class Substracter extends Operation
     {
-        public Substracter(ColumnIdentifier column, Term t)
+        public Substracter(ColumnMetadata column, Term t)
         {
             super(column, t);
         }
 
-        public void execute(ByteBuffer rowKey, ColumnFamily cf, ColumnNameBuilder prefix, UpdateParameters params) throws InvalidRequestException
+        public void execute(DecoratedKey partitionKey, UpdateParameters params) throws InvalidRequestException
         {
-            ByteBuffer bytes = t.bindAndGet(params.variables);
+            ByteBuffer bytes = t.bindAndGet(params.options);
             if (bytes == null)
                 throw new InvalidRequestException("Invalid null value for counter increment");
+            if (bytes == ByteBufferUtil.UNSET_BYTE_BUFFER)
+                return;
 
             long increment = ByteBufferUtil.toLong(bytes);
             if (increment == Long.MIN_VALUE)
                 throw new InvalidRequestException("The negation of " + increment + " overflows supported counter precision (signed 8 bytes integer)");
 
-            ByteBuffer cname = columnName == null ? prefix.build() : prefix.add(columnName).build();
-            cf.addCounter(cname, -increment);
+            params.addCounter(column, -increment);
         }
     }
 
@@ -346,22 +486,17 @@ public abstract class Constants
     // duplicating this further
     public static class Deleter extends Operation
     {
-        private final boolean isCollection;
-
-        public Deleter(ColumnIdentifier column, boolean isCollection)
+        public Deleter(ColumnMetadata column)
         {
             super(column, null);
-            this.isCollection = isCollection;
         }
 
-        public void execute(ByteBuffer rowKey, ColumnFamily cf, ColumnNameBuilder prefix, UpdateParameters params) throws InvalidRequestException
+        public void execute(DecoratedKey partitionKey, UpdateParameters params) throws InvalidRequestException
         {
-            ColumnNameBuilder column = prefix.add(columnName);
-
-            if (isCollection)
-                cf.addAtom(params.makeRangeTombstone(column.build(), column.buildAsEndOfRange()));
+            if (column.type.isMultiCell())
+                params.setComplexDeletionTime(column);
             else
-                cf.addColumn(params.makeTombstone(column.build()));
+                params.addTombstone(column);
         }
-    };
+    }
 }

@@ -17,10 +17,9 @@
  */
 package org.apache.cassandra.metrics;
 
-import java.util.concurrent.TimeUnit;
+import com.codahale.metrics.Meter;
 
-import com.yammer.metrics.Metrics;
-import com.yammer.metrics.core.Meter;
+import static org.apache.cassandra.metrics.CassandraMetricsRegistry.Metrics;
 
 /**
  * Metrics related to Read Repair.
@@ -29,10 +28,18 @@ public class ReadRepairMetrics
 {
     private static final MetricNameFactory factory = new DefaultNameFactory("ReadRepair");
 
-    public static final Meter repairedBlocking =
-            Metrics.newMeter(factory.createMetricName("RepairedBlocking"), "RepairedBlocking", TimeUnit.SECONDS);
-    public static final Meter repairedBackground =
-            Metrics.newMeter(factory.createMetricName("RepairedBackground"), "RepairedBackground", TimeUnit.SECONDS);
-    public static final Meter attempted = 
-            Metrics.newMeter(factory.createMetricName("Attempted"), "Attempted", TimeUnit.SECONDS);
+    public static final Meter repairedBlocking = Metrics.meter(factory.createMetricName("RepairedBlocking"));
+    public static final Meter repairedAsync = Metrics.meter(factory.createMetricName("RepairedAsync"));
+    public static final Meter reconcileRead = Metrics.meter(factory.createMetricName("ReconcileRead"));
+
+    @Deprecated
+    public static final Meter repairedBackground = Metrics.meter(factory.createMetricName("RepairedBackground"));
+    @Deprecated
+    public static final Meter attempted = Metrics.meter(factory.createMetricName("Attempted"));
+
+    // Incremented when additional requests were sent during blocking read repair due to unavailable or slow nodes
+    public static final Meter speculatedRead = Metrics.meter(factory.createMetricName("SpeculatedRead"));
+    public static final Meter speculatedWrite = Metrics.meter(factory.createMetricName("SpeculatedWrite"));
+
+    public static void init() {}
 }

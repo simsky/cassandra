@@ -18,40 +18,137 @@
  */
 package org.apache.cassandra.utils;
 
-import org.apache.cassandra.AbstractSerializationsTester;
-import org.apache.cassandra.service.StorageService;
+import java.io.DataInputStream;
+import java.io.IOException;
 
+import org.junit.Assert;
+import org.junit.BeforeClass;
 import org.junit.Test;
 
-import java.io.DataInputStream;
-import java.io.DataOutputStream;
-import java.io.IOException;
+import org.apache.cassandra.AbstractSerializationsTester;
+import org.apache.cassandra.Util;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.marshal.Int32Type;
+import org.apache.cassandra.io.util.DataInputPlus.DataInputStreamPlus;
+import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.io.util.DataOutputStreamPlus;
+import org.apache.cassandra.dht.Murmur3Partitioner;
+import org.apache.cassandra.utils.obs.OffHeapBitSet;
+
+import java.io.File;
+import java.io.FileInputStream;
 
 public class SerializationsTest extends AbstractSerializationsTester
 {
-
-    private void testBloomFilterWrite(boolean offheap) throws IOException
+    // Helper function to serialize old Bloomfilter format, should be removed once the old format is not supported
+    public static void serializeOldBfFormat(BloomFilter bf, DataOutputPlus out) throws IOException
     {
-        IFilter bf = FilterFactory.getFilter(1000000, 0.0001, offheap);
-        for (int i = 0; i < 100; i++)
-            bf.add(StorageService.getPartitioner().getTokenFactory().toByteArray(StorageService.getPartitioner().getRandomToken()));
-        DataOutputStream out = getOutput("utils.BloomFilter.bin");
-        FilterFactory.serialize(bf, out);
-        out.close();
+        out.writeInt(bf.hashCount);
+        Assert.assertTrue(bf.bitset instanceof OffHeapBitSet);
+        ((OffHeapBitSet) bf.bitset).serializeOldBfFormat(out);
+    }
+
+    @BeforeClass
+    public static void initDD()
+    {
+        DatabaseDescriptor.daemonInitialization();
+    }
+
+    private static void testBloomFilterWrite1000(boolean oldBfFormat) throws IOException
+    {
+        try (IFilter bf = FilterFactory.getFilter(1000000, 0.0001))
+        {
+            for (int i = 0; i < 1000; i++)
+                bf.add(Util.dk(Int32Type.instance.decompose(i)));
+            try (DataOutputStreamPlus out = getOutput(oldBfFormat ? "3.0" : "4.0", "utils.BloomFilter1000.bin"))
+            {
+                if (oldBfFormat)
+                    serializeOldBfFormat((BloomFilter) bf, out);
+                else
+                    BloomFilterSerializer.serialize((BloomFilter) bf, out);
+            }
+        }
     }
 
     @Test
-    public void testBloomFilterReadMURMUR3() throws IOException
+    public void testBloomFilterRead1000() throws IOException
     {
         if (EXECUTE_WRITES)
-            testBloomFilterWrite(true);
+        {
+            testBloomFilterWrite1000(false);
+            testBloomFilterWrite1000(true);
+        }
 
-        DataInputStream in = getInput("utils.BloomFilter.bin");
-        assert FilterFactory.deserialize(in, true) != null;
-        in.close();
+        try (DataInputStream in = getInput("4.0", "utils.BloomFilter1000.bin");
+             IFilter filter = BloomFilterSerializer.deserialize(in, false))
+        {
+            boolean present;
+            for (int i = 0 ; i < 1000 ; i++)
+            {
+                present = filter.isPresent(Util.dk(Int32Type.instance.decompose(i)));
+                Assert.assertTrue(present);
+            }
+            for (int i = 1000 ; i < 2000 ; i++)
+            {
+                present = filter.isPresent(Util.dk(Int32Type.instance.decompose(i)));
+                Assert.assertFalse(present);
+            }
+        }
+
+        try (DataInputStream in = getInput("3.0", "utils.BloomFilter1000.bin");
+             IFilter filter = BloomFilterSerializer.deserialize(in, true))
+        {
+            boolean present;
+            for (int i = 0 ; i < 1000 ; i++)
+            {
+                present = filter.isPresent(Util.dk(Int32Type.instance.decompose(i)));
+                Assert.assertTrue(present);
+            }
+            for (int i = 1000 ; i < 2000 ; i++)
+            {
+                present = filter.isPresent(Util.dk(Int32Type.instance.decompose(i)));
+                Assert.assertFalse(present);
+            }
+        }
     }
 
-    private void testEstimatedHistogramWrite() throws IOException
+    @Test
+    public void testBloomFilterTable() throws Exception
+    {
+        testBloomFilterTable("test/data/bloom-filter/la/foo/la-1-big-Filter.db", true);
+    }
+
+    private static void testBloomFilterTable(String file, boolean oldBfFormat) throws Exception
+    {
+        Murmur3Partitioner partitioner = new Murmur3Partitioner();
+
+        try (DataInputStream in = new DataInputStream(new FileInputStream(new File(file)));
+             IFilter filter = BloomFilterSerializer.deserialize(in, oldBfFormat))
+        {
+            for (int i = 1; i <= 10; i++)
+            {
+                DecoratedKey decoratedKey = partitioner.decorateKey(Int32Type.instance.decompose(i));
+                boolean present = filter.isPresent(decoratedKey);
+                Assert.assertTrue(present);
+            }
+
+            int positives = 0;
+            for (int i = 11; i <= 1000010; i++)
+            {
+                DecoratedKey decoratedKey = partitioner.decorateKey(Int32Type.instance.decompose(i));
+                boolean present = filter.isPresent(decoratedKey);
+                if (present)
+                    positives++;
+            }
+            double fpr = positives;
+            fpr /= 1000000;
+            Assert.assertTrue(fpr <= 0.011d);
+        }
+    }
+
+
+    private static void testEstimatedHistogramWrite() throws IOException
     {
         EstimatedHistogram hist0 = new EstimatedHistogram();
         EstimatedHistogram hist1 = new EstimatedHistogram(5000);
@@ -62,14 +159,15 @@ public class SerializationsTest extends AbstractSerializationsTester
             offsets[i] = i;
             data[i] = 10 * i;
         }
-        data[offsets.length] = 100000;
+        data[offsets.length] = 100000; // write into the overflow bucket
         EstimatedHistogram hist2 = new EstimatedHistogram(offsets, data);
 
-        DataOutputStream out = getOutput("utils.EstimatedHistogram.bin");
-        EstimatedHistogram.serializer.serialize(hist0, out);
-        EstimatedHistogram.serializer.serialize(hist1, out);
-        EstimatedHistogram.serializer.serialize(hist2, out);
-        out.close();
+        try (DataOutputStreamPlus out = getOutput("utils.EstimatedHistogram.bin"))
+        {
+            EstimatedHistogram.serializer.serialize(hist0, out);
+            EstimatedHistogram.serializer.serialize(hist1, out);
+            EstimatedHistogram.serializer.serialize(hist2, out);
+        }
     }
 
     @Test
@@ -78,10 +176,11 @@ public class SerializationsTest extends AbstractSerializationsTester
         if (EXECUTE_WRITES)
             testEstimatedHistogramWrite();
 
-        DataInputStream in = getInput("utils.EstimatedHistogram.bin");
-        assert EstimatedHistogram.serializer.deserialize(in) != null;
-        assert EstimatedHistogram.serializer.deserialize(in) != null;
-        assert EstimatedHistogram.serializer.deserialize(in) != null;
-        in.close();
+        try (DataInputStreamPlus in = getInput("utils.EstimatedHistogram.bin"))
+        {
+            Assert.assertNotNull(EstimatedHistogram.serializer.deserialize(in));
+            Assert.assertNotNull(EstimatedHistogram.serializer.deserialize(in));
+            Assert.assertNotNull(EstimatedHistogram.serializer.deserialize(in));
+        }
     }
 }

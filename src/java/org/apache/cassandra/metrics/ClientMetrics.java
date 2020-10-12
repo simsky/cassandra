@@ -18,36 +18,148 @@
  */
 package org.apache.cassandra.metrics;
 
-import java.util.concurrent.Callable;
+import java.util.*;
+import java.util.concurrent.atomic.AtomicInteger;
 
-import com.yammer.metrics.Metrics;
-import com.yammer.metrics.core.Gauge;
+import com.codahale.metrics.Gauge;
+import com.codahale.metrics.Meter;
+import org.apache.cassandra.transport.ClientStat;
+import org.apache.cassandra.transport.ConnectedClient;
+import org.apache.cassandra.transport.Server;
 
-public class ClientMetrics
+import static org.apache.cassandra.metrics.CassandraMetricsRegistry.Metrics;
+
+public final class ClientMetrics
 {
-    private static final MetricNameFactory factory = new DefaultNameFactory("Client");
-    
     public static final ClientMetrics instance = new ClientMetrics();
+
+    private static final MetricNameFactory factory = new DefaultNameFactory("Client");
+
+    private volatile boolean initialized = false;
+    private Collection<Server> servers = Collections.emptyList();
+
+    private Meter authSuccess;
+    private Meter authFailure;
+
+    private AtomicInteger pausedConnections;
     
+    @SuppressWarnings({ "unused", "FieldCanBeLocal" })
+    private Gauge<Integer> pausedConnectionsGauge;
+    
+    private Meter requestDiscarded;
+
     private ClientMetrics()
     {
     }
 
-    public void addCounter(String name, final Callable<Integer> provider)
+    public void markAuthSuccess()
     {
-        Metrics.newGauge(factory.createMetricName(name), new Gauge<Integer>()
+        authSuccess.mark();
+    }
+
+    public void markAuthFailure()
+    {
+        authFailure.mark();
+    }
+
+    public void pauseConnection() { pausedConnections.incrementAndGet(); }
+    public void unpauseConnection() { pausedConnections.decrementAndGet(); }
+
+    public void markRequestDiscarded() { requestDiscarded.mark(); }
+
+    public List<ConnectedClient> allConnectedClients()
+    {
+        List<ConnectedClient> clients = new ArrayList<>();
+
+        for (Server server : servers)
+            clients.addAll(server.getConnectedClients());
+
+        return clients;
+    }
+
+    public synchronized void init(Collection<Server> servers)
+    {
+        if (initialized)
+            return;
+
+        this.servers = servers;
+
+        // deprecated the lower-cased initial letter metric names in 4.0
+        registerGauge("ConnectedNativeClients", "connectedNativeClients", this::countConnectedClients);
+        registerGauge("ConnectedNativeClientsByUser", "connectedNativeClientsByUser", this::countConnectedClientsByUser);
+        registerGauge("Connections", "connections", this::connectedClients);
+        registerGauge("ClientsByProtocolVersion", "clientsByProtocolVersion", this::recentClientStats);
+
+        authSuccess = registerMeter("AuthSuccess");
+        authFailure = registerMeter("AuthFailure");
+
+        pausedConnections = new AtomicInteger();
+        pausedConnectionsGauge = registerGauge("PausedConnections", pausedConnections::get);
+        requestDiscarded = registerMeter("RequestDiscarded");
+
+        initialized = true;
+    }
+
+    private int countConnectedClients()
+    {
+        int count = 0;
+
+        for (Server server : servers)
+            count += server.countConnectedClients();
+
+        return count;
+    }
+
+    private Map<String, Integer> countConnectedClientsByUser()
+    {
+        Map<String, Integer> counts = new HashMap<>();
+
+        for (Server server : servers)
         {
-            public Integer value()
-            {
-                try
-                {
-                    return provider.call();
-                }
-                catch (Exception e)
-                {
-                    throw new RuntimeException(e);
-                }
-            }
-        });
+            server.countConnectedClientsByUser()
+                  .forEach((username, count) -> counts.put(username, counts.getOrDefault(username, 0) + count));
+        }
+
+        return counts;
+    }
+
+    private List<Map<String, String>> connectedClients()
+    {
+        List<Map<String, String>> clients = new ArrayList<>();
+
+        for (Server server : servers)
+            for (ConnectedClient client : server.getConnectedClients())
+                clients.add(client.asMap());
+
+        return clients;
+    }
+
+    private List<Map<String, String>> recentClientStats()
+    {
+        List<Map<String, String>> stats = new ArrayList<>();
+
+        for (Server server : servers)
+            for (ClientStat stat : server.recentClientStats())
+                stats.add(new HashMap<>(stat.asMap())); // asMap returns guava, so need to convert to java for jmx
+
+        stats.sort(Comparator.comparing(map -> map.get(ClientStat.PROTOCOL_VERSION)));
+
+        return stats;
+    }
+
+    private <T> Gauge<T> registerGauge(String name, Gauge<T> gauge)
+    {
+        return Metrics.register(factory.createMetricName(name), gauge);
+    }
+    
+    private void registerGauge(String name, String deprecated, Gauge<?> gauge)
+    {
+        Gauge<?> registeredGauge = registerGauge(name, gauge);
+        Metrics.registerMBean(registeredGauge, factory.createMetricName(deprecated).getMBeanName());
+    }
+
+    private Meter registerMeter(String name)
+    {
+        return Metrics.meter(factory.createMetricName(name));
     }
 }

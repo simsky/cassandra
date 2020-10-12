@@ -20,41 +20,67 @@ package org.apache.cassandra.db.marshal;
 import java.nio.ByteBuffer;
 
 import org.apache.cassandra.cql3.CQL3Type;
-import org.apache.cassandra.db.*;
-import org.apache.cassandra.serializers.TypeSerializer;
+import org.apache.cassandra.cql3.Term;
+import org.apache.cassandra.db.context.CounterContext;
 import org.apache.cassandra.serializers.CounterSerializer;
+import org.apache.cassandra.serializers.MarshalException;
+import org.apache.cassandra.transport.ProtocolVersion;
+import org.apache.cassandra.serializers.TypeSerializer;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
-public class CounterColumnType extends AbstractCommutativeType
+public class CounterColumnType extends NumberType<Long>
 {
     public static final CounterColumnType instance = new CounterColumnType();
 
-    CounterColumnType() {} // singleton
+    CounterColumnType() {super(ComparisonType.NOT_COMPARABLE);} // singleton
 
-    public int compare(ByteBuffer o1, ByteBuffer o2)
+    public boolean isEmptyValueMeaningless()
     {
-        if (o1 == null)
-            return o2 == null ?  0 : -1;
-
-        return ByteBufferUtil.compareUnsigned(o1, o2);
+        return true;
     }
 
-    public String getString(ByteBuffer bytes)
+    public boolean isCounter()
     {
-        return ByteBufferUtil.bytesToHex(bytes);
+        return true;
     }
 
-    /**
-     * create commutative column
-     */
-    public Column createColumn(ByteBuffer name, ByteBuffer value, long timestamp)
+    public <V> Long compose(V value, ValueAccessor<V> accessor)
     {
-        return new CounterUpdateColumn(name, value, timestamp);
+        return CounterContext.instance().total(value, accessor);
+    }
+
+    @Override
+    public ByteBuffer decompose(Long value)
+    {
+        return ByteBufferUtil.bytes(value);
+    }
+
+    @Override
+    public <V> void validateCellValue(V cellValue, ValueAccessor<V> accessor) throws MarshalException
+    {
+        CounterContext.instance().validateContext(cellValue, accessor);
+    }
+
+    public <V> String getString(V value, ValueAccessor<V> accessor)
+    {
+        return accessor.toHex(value);
     }
 
     public ByteBuffer fromString(String source)
     {
         return ByteBufferUtil.hexToBytes(source);
+    }
+
+    @Override
+    public Term fromJSONObject(Object parsed)
+    {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public String toJSONString(ByteBuffer buffer, ProtocolVersion protocolVersion)
+    {
+        return CounterSerializer.instance.deserialize(buffer).toString();
     }
 
     public CQL3Type asCQL3Type()
@@ -65,5 +91,41 @@ public class CounterColumnType extends AbstractCommutativeType
     public TypeSerializer<Long> getSerializer()
     {
         return CounterSerializer.instance;
+    }
+
+    @Override
+    protected long toLong(ByteBuffer value)
+    {
+        return ByteBufferUtil.toLong(value);
+    }
+
+    public ByteBuffer add(NumberType<?> leftType, ByteBuffer left, NumberType<?> rightType, ByteBuffer right)
+    {
+        return ByteBufferUtil.bytes(leftType.toLong(left) + rightType.toLong(right));
+    }
+
+    public ByteBuffer substract(NumberType<?> leftType, ByteBuffer left, NumberType<?> rightType, ByteBuffer right)
+    {
+        return ByteBufferUtil.bytes(leftType.toLong(left) - rightType.toLong(right));
+    }
+
+    public ByteBuffer multiply(NumberType<?> leftType, ByteBuffer left, NumberType<?> rightType, ByteBuffer right)
+    {
+        return ByteBufferUtil.bytes(leftType.toLong(left) * rightType.toLong(right));
+    }
+
+    public ByteBuffer divide(NumberType<?> leftType, ByteBuffer left, NumberType<?> rightType, ByteBuffer right)
+    {
+        return ByteBufferUtil.bytes(leftType.toLong(left) / rightType.toLong(right));
+    }
+
+    public ByteBuffer mod(NumberType<?> leftType, ByteBuffer left, NumberType<?> rightType, ByteBuffer right)
+    {
+        return ByteBufferUtil.bytes(leftType.toLong(left) % rightType.toLong(right));
+    }
+
+    public ByteBuffer negate(ByteBuffer input)
+    {
+        return ByteBufferUtil.bytes(-toLong(input));
     }
 }

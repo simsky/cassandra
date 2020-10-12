@@ -17,29 +17,27 @@
  */
 package org.apache.cassandra.cql3.statements;
 
-
 import org.apache.cassandra.auth.DataResource;
+import org.apache.cassandra.auth.IResource;
 import org.apache.cassandra.cql3.CQLStatement;
 import org.apache.cassandra.cql3.QueryOptions;
-import org.apache.cassandra.exceptions.*;
+import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.exceptions.RequestExecutionException;
+import org.apache.cassandra.exceptions.RequestValidationException;
 import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.service.QueryState;
 import org.apache.cassandra.transport.messages.ResultMessage;
+import org.apache.commons.lang3.builder.ToStringBuilder;
+import org.apache.commons.lang3.builder.ToStringStyle;
 
-public abstract class AuthorizationStatement extends ParsedStatement implements CQLStatement
+public abstract class AuthorizationStatement extends CQLStatement.Raw implements CQLStatement
 {
-    @Override
-    public Prepared prepare()
+    public AuthorizationStatement prepare(ClientState state)
     {
-        return new Prepared(this);
+        return this;
     }
 
-    public int getBoundsTerms()
-    {
-        return 0;
-    }
-
-    public ResultMessage execute(QueryState state, QueryOptions options)
+    public ResultMessage execute(QueryState state, QueryOptions options, long queryStartNanoTime)
     throws RequestValidationException, RequestExecutionException
     {
         return execute(state.getClientState());
@@ -47,16 +45,26 @@ public abstract class AuthorizationStatement extends ParsedStatement implements 
 
     public abstract ResultMessage execute(ClientState state) throws RequestValidationException, RequestExecutionException;
 
-    public ResultMessage executeInternal(QueryState state)
+    public ResultMessage executeLocally(QueryState state, QueryOptions options)
     {
-        // executeInternal is for local query only, thus altering permission doesn't make sense and is not supported
+        // executeLocally is for local query only, thus altering permission doesn't make sense and is not supported
         throw new UnsupportedOperationException();
     }
 
-    public static DataResource maybeCorrectResource(DataResource resource, ClientState state) throws InvalidRequestException
+    public static IResource maybeCorrectResource(IResource resource, ClientState state) throws InvalidRequestException
     {
-        if (resource.isColumnFamilyLevel() && resource.getKeyspace() == null)
-            return DataResource.columnFamily(state.getKeyspace(), resource.getColumnFamily());
+        if (DataResource.class.isInstance(resource))
+        {
+            DataResource dataResource = (DataResource) resource;
+            if (dataResource.isTableLevel() && dataResource.getKeyspace() == null)
+                return DataResource.table(state.getKeyspace(), dataResource.getTable());
+        }
         return resource;
+    }
+    
+    @Override
+    public String toString()
+    {
+        return ToStringBuilder.reflectionToString(this, ToStringStyle.SHORT_PREFIX_STYLE);
     }
 }

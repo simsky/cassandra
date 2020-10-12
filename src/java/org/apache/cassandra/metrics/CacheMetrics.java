@@ -17,15 +17,14 @@
  */
 package org.apache.cassandra.metrics;
 
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.DoubleSupplier;
 
-import com.yammer.metrics.Metrics;
-import com.yammer.metrics.core.Gauge;
-import com.yammer.metrics.core.Meter;
-import com.yammer.metrics.util.RatioGauge;
+import com.google.common.annotations.VisibleForTesting;
 
-import org.apache.cassandra.cache.ICache;
+import com.codahale.metrics.*;
+import org.apache.cassandra.cache.CacheSize;
+
+import static org.apache.cassandra.metrics.CassandraMetricsRegistry.Metrics;
 
 /**
  * Metrics for {@code ICache}.
@@ -34,19 +33,28 @@ public class CacheMetrics
 {
     /** Cache capacity in bytes */
     public final Gauge<Long> capacity;
-    /** Total number of cache hits */
-    public final Meter hits;
-    /** Total number of cache requests */
-    public final Meter requests;
-    /** cache hit rate */
-    public final Gauge<Double> hitRate;
     /** Total size of cache, in bytes */
     public final Gauge<Long> size;
     /** Total number of cache entries */
     public final Gauge<Integer> entries;
 
-    private final AtomicLong lastRequests = new AtomicLong(0);
-    private final AtomicLong lastHits = new AtomicLong(0);
+    /** Total number of cache hits */
+    public final Meter hits;
+    /** Total number of cache misses */
+    public final Meter misses;
+    /** Total number of cache requests */
+    public final Metered requests;
+
+    /** all time cache hit rate */
+    public final Gauge<Double> hitRate;
+    /** 1m hit rate */
+    public final Gauge<Double> oneMinuteHitRate;
+    /** 5m hit rate */
+    public final Gauge<Double> fiveMinuteHitRate;
+    /** 15m hit rate */
+    public final Gauge<Double> fifteenMinuteHitRate;
+
+    protected final MetricNameFactory factory;
 
     /**
      * Create metrics for given cache.
@@ -54,61 +62,84 @@ public class CacheMetrics
      * @param type Type of Cache to identify metrics.
      * @param cache Cache to measure metrics
      */
-    public CacheMetrics(String type, final ICache cache)
+    public CacheMetrics(String type, CacheSize cache)
     {
-        MetricNameFactory factory = new DefaultNameFactory("Cache", type);
+        factory = new DefaultNameFactory("Cache", type);
 
-        capacity = Metrics.newGauge(factory.createMetricName("Capacity"), new Gauge<Long>()
-        {
-            public Long value()
-            {
-                return cache.capacity();
-            }
-        });
-        hits = Metrics.newMeter(factory.createMetricName("Hits"), "hits", TimeUnit.SECONDS);
-        requests = Metrics.newMeter(factory.createMetricName("Requests"), "requests", TimeUnit.SECONDS);
-        hitRate = Metrics.newGauge(factory.createMetricName("HitRate"), new RatioGauge()
-        {
-            protected double getNumerator()
-            {
-                return hits.count();
-            }
+        capacity = Metrics.register(factory.createMetricName("Capacity"), cache::capacity);
+        size = Metrics.register(factory.createMetricName("Size"), cache::weightedSize);
+        entries = Metrics.register(factory.createMetricName("Entries"), cache::size);
 
-            protected double getDenominator()
-            {
-                return requests.count();
-            }
-        });
-        size = Metrics.newGauge(factory.createMetricName("Size"), new Gauge<Long>()
-        {
-            public Long value()
-            {
-                return cache.weightedSize();
-            }
-        });
-        entries = Metrics.newGauge(factory.createMetricName("Entries"), new Gauge<Integer>()
-        {
-            public Integer value()
-            {
-                return cache.size();
-            }
-        });
+        hits = Metrics.meter(factory.createMetricName("Hits"));
+        misses = Metrics.meter(factory.createMetricName("Misses"));
+        requests = Metrics.register(factory.createMetricName("Requests"), sumMeters(hits, misses));
+
+        hitRate =
+            Metrics.register(factory.createMetricName("HitRate"),
+                             ratioGauge(hits::getCount, requests::getCount));
+        oneMinuteHitRate =
+            Metrics.register(factory.createMetricName("OneMinuteHitRate"),
+                             ratioGauge(hits::getOneMinuteRate, requests::getOneMinuteRate));
+        fiveMinuteHitRate =
+            Metrics.register(factory.createMetricName("FiveMinuteHitRate"),
+                             ratioGauge(hits::getFiveMinuteRate, requests::getFiveMinuteRate));
+        fifteenMinuteHitRate =
+            Metrics.register(factory.createMetricName("FifteenMinuteHitRate"),
+                             ratioGauge(hits::getFifteenMinuteRate, requests::getFifteenMinuteRate));
     }
 
-    // for backward compatibility
-    @Deprecated
-    public double getRecentHitRate()
+    @VisibleForTesting
+    public void reset()
     {
-        long r = requests.count();
-        long h = hits.count();
-        try
+        hits.mark(-hits.getCount());
+        misses.mark(-misses.getCount());
+    }
+
+    private static Metered sumMeters(Metered first, Metered second)
+    {
+        return new Metered()
         {
-            return ((double)(h - lastHits.get())) / (r - lastRequests.get());
-        }
-        finally
+            @Override
+            public long getCount()
+            {
+                return first.getCount() + second.getCount();
+            }
+
+            @Override
+            public double getMeanRate()
+            {
+                return first.getMeanRate() + second.getMeanRate();
+            }
+
+            @Override
+            public double getOneMinuteRate()
+            {
+                return first.getOneMinuteRate() + second.getOneMinuteRate();
+            }
+
+            @Override
+            public double getFiveMinuteRate()
+            {
+                return first.getFiveMinuteRate() + second.getFiveMinuteRate();
+            }
+
+            @Override
+            public double getFifteenMinuteRate()
+            {
+                return first.getFifteenMinuteRate() + second.getFifteenMinuteRate();
+            }
+        };
+    }
+
+    private static RatioGauge ratioGauge(DoubleSupplier numeratorSupplier, DoubleSupplier denominatorSupplier)
+    {
+        return new RatioGauge()
         {
-            lastRequests.set(r);
-            lastHits.set(h);
-        }
+            @Override
+            public Ratio getRatio()
+            {
+                return Ratio.of(numeratorSupplier.getAsDouble(), denominatorSupplier.getAsDouble());
+            }
+        };
     }
 }

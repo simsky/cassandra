@@ -17,53 +17,121 @@
  */
 package org.apache.cassandra.streaming;
 
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 
-import org.apache.cassandra.io.sstable.SSTableReader;
-import org.apache.cassandra.streaming.messages.FileMessage;
-import org.apache.cassandra.utils.Pair;
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Preconditions;
+import com.google.common.base.Throwables;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.concurrent.NamedThreadFactory;
+import org.apache.cassandra.schema.TableId;
+import org.apache.cassandra.streaming.messages.OutgoingStreamMessage;
+
+import static org.apache.cassandra.utils.ExecutorUtils.awaitTermination;
+import static org.apache.cassandra.utils.ExecutorUtils.shutdown;
 
 /**
- * StreamTransferTask sends sections of SSTable files in certain ColumnFamily.
+ * StreamTransferTask sends streams for a given table
  */
 public class StreamTransferTask extends StreamTask
 {
+    private static final Logger logger = LoggerFactory.getLogger(StreamTransferTask.class);
+    private static final ScheduledExecutorService timeoutExecutor = Executors.newSingleThreadScheduledExecutor(new NamedThreadFactory("StreamingTransferTaskTimeouts"));
+
     private final AtomicInteger sequenceNumber = new AtomicInteger(0);
+    private boolean aborted = false;
 
-    private final Map<Integer, FileMessage> files = new HashMap<>();
+    @VisibleForTesting
+    protected final Map<Integer, OutgoingStreamMessage> streams = new HashMap<>();
+    private final Map<Integer, ScheduledFuture> timeoutTasks = new HashMap<>();
 
-    private long totalSize;
+    private long totalSize = 0;
+    private int totalFiles = 0;
 
-    public StreamTransferTask(StreamSession session, UUID cfId)
+    public StreamTransferTask(StreamSession session, TableId tableId)
     {
-        super(session, cfId);
+        super(session, tableId);
     }
 
-    public void addTransferFile(SSTableReader sstable, long estimatedKeys, List<Pair<Long, Long>> sections)
+    public synchronized void addTransferStream(OutgoingStream stream)
     {
-        assert sstable != null && cfId.equals(sstable.metadata.cfId);
-        FileMessage message = new FileMessage(sstable, sequenceNumber.getAndIncrement(), estimatedKeys, sections);
-        files.put(message.header.sequenceNumber, message);
-        totalSize += message.header.size();
+        Preconditions.checkArgument(tableId.equals(stream.getTableId()));
+        OutgoingStreamMessage message = new OutgoingStreamMessage(tableId, session, stream, sequenceNumber.getAndIncrement());
+        message = StreamHook.instance.reportOutgoingStream(session, stream, message);
+        streams.put(message.header.sequenceNumber, message);
+        totalSize += message.stream.getEstimatedSize();
+        totalFiles += message.stream.getNumFiles();
     }
 
     /**
-     * Received ACK for file at {@code sequenceNumber}.
+     * Received ACK for stream at {@code sequenceNumber}.
      *
-     * @param sequenceNumber sequence number of file
+     * @param sequenceNumber sequence number of stream
      */
     public void complete(int sequenceNumber)
     {
-        files.remove(sequenceNumber);
+        boolean signalComplete;
+        synchronized (this)
+        {
+            ScheduledFuture timeout = timeoutTasks.remove(sequenceNumber);
+            if (timeout != null)
+                timeout.cancel(false);
+
+            OutgoingStreamMessage stream = streams.remove(sequenceNumber);
+            if (stream != null)
+                stream.complete();
+
+            logger.debug("recevied sequenceNumber {}, remaining files {}", sequenceNumber, streams.keySet());
+            signalComplete = streams.isEmpty();
+        }
+
         // all file sent, notify session this task is complete.
-        if (files.isEmpty())
+        if (signalComplete)
             session.taskCompleted(this);
     }
 
-    public int getTotalNumberOfFiles()
+    public synchronized void abort()
     {
-        return files.size();
+        if (aborted)
+            return;
+        aborted = true;
+
+        for (ScheduledFuture future : timeoutTasks.values())
+            future.cancel(false);
+        timeoutTasks.clear();
+
+        Throwable fail = null;
+        for (OutgoingStreamMessage stream : streams.values())
+        {
+            try
+            {
+                stream.complete();
+            }
+            catch (Throwable t)
+            {
+                if (fail == null) fail = t;
+                else fail.addSuppressed(t);
+            }
+        }
+        streams.clear();
+        if (fail != null)
+            Throwables.propagate(fail);
+    }
+
+    public synchronized int getTotalNumberOfFiles()
+    {
+        return totalFiles;
     }
 
     public long getTotalSize()
@@ -71,15 +139,59 @@ public class StreamTransferTask extends StreamTask
         return totalSize;
     }
 
-    public Collection<FileMessage> getFileMessages()
+    public synchronized Collection<OutgoingStreamMessage> getFileMessages()
     {
         // We may race between queuing all those messages and the completion of the completion of
         // the first ones. So copy the values to avoid a ConcurrentModificationException
-        return new ArrayList<>(files.values());
+        return new ArrayList<>(streams.values());
     }
 
-    public FileMessage createMessageForRetry(int sequenceNumber)
+    public synchronized OutgoingStreamMessage createMessageForRetry(int sequenceNumber)
     {
-        return files.get(sequenceNumber);
+        // remove previous time out task to be rescheduled later
+        ScheduledFuture future = timeoutTasks.remove(sequenceNumber);
+        if (future != null)
+            future.cancel(false);
+        return streams.get(sequenceNumber);
+    }
+
+    /**
+     * Schedule timeout task to release reference for stream sent.
+     * When not receiving ACK after sending to receiver in given time,
+     * the task will release reference.
+     *
+     * @param sequenceNumber sequence number of stream sent.
+     * @param time time to timeout
+     * @param unit unit of given time
+     * @return scheduled future for timeout task
+     */
+    public synchronized ScheduledFuture scheduleTimeout(final int sequenceNumber, long time, TimeUnit unit)
+    {
+        if (!streams.containsKey(sequenceNumber))
+            return null;
+
+        ScheduledFuture future = timeoutExecutor.schedule(new Runnable()
+        {
+            public void run()
+            {
+                synchronized (StreamTransferTask.this)
+                {
+                    // remove so we don't cancel ourselves
+                    timeoutTasks.remove(sequenceNumber);
+                    StreamTransferTask.this.complete(sequenceNumber);
+                }
+            }
+        }, time, unit);
+
+        ScheduledFuture prev = timeoutTasks.put(sequenceNumber, future);
+        assert prev == null;
+        return future;
+    }
+
+    @VisibleForTesting
+    public static void shutdownAndWait(long timeout, TimeUnit units) throws InterruptedException, TimeoutException
+    {
+        shutdown(timeoutExecutor);
+        awaitTermination(timeout, units, timeoutExecutor);
     }
 }

@@ -17,54 +17,89 @@
  */
 package org.apache.cassandra.streaming;
 
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.UUID;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
-import org.apache.cassandra.config.Schema;
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Preconditions;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.apache.cassandra.concurrent.NamedThreadFactory;
 import org.apache.cassandra.db.ColumnFamilyStore;
-import org.apache.cassandra.db.Keyspace;
-import org.apache.cassandra.io.sstable.SSTableReader;
-import org.apache.cassandra.utils.Pair;
+import org.apache.cassandra.schema.TableId;
+import org.apache.cassandra.utils.JVMStabilityInspector;
+
+import static org.apache.cassandra.utils.ExecutorUtils.awaitTermination;
+import static org.apache.cassandra.utils.ExecutorUtils.shutdown;
 
 /**
  * Task that manages receiving files for the session for certain ColumnFamily.
  */
 public class StreamReceiveTask extends StreamTask
 {
-    // number of files to receive
-    private final int totalFiles;
-    // total size of files to receive
+    private static final Logger logger = LoggerFactory.getLogger(StreamReceiveTask.class);
+
+    private static final ExecutorService executor = Executors.newCachedThreadPool(new NamedThreadFactory("StreamReceiveTask"));
+
+    private final StreamReceiver receiver;
+
+    // number of streams to receive
+    private final int totalStreams;
+
+    // total size of streams to receive
     private final long totalSize;
 
-    //  holds references to SSTables received
-    protected Collection<SSTableReader> sstables;
+    // true if task is done (either completed or aborted)
+    private volatile boolean done = false;
 
-    public StreamReceiveTask(StreamSession session, UUID cfId, int totalFiles, long totalSize)
+    private int remoteStreamsReceived = 0;
+    private long bytesReceived = 0;
+
+    public StreamReceiveTask(StreamSession session, TableId tableId, int totalStreams, long totalSize)
     {
-        super(session, cfId);
-        this.totalFiles = totalFiles;
+        super(session, tableId);
+        this.receiver = ColumnFamilyStore.getIfExists(tableId).getStreamManager().createStreamReceiver(session, totalStreams);
+        this.totalStreams = totalStreams;
         this.totalSize = totalSize;
-        this.sstables =  new ArrayList<>(totalFiles);
     }
 
     /**
-     * Process received file.
+     * Process received stream.
      *
-     * @param sstable SSTable file received.
+     * @param stream Stream received.
      */
-    public void received(SSTableReader sstable)
+    public synchronized void received(IncomingStream stream)
     {
-        assert cfId.equals(sstable.metadata.cfId);
+        Preconditions.checkState(!session.isPreview(), "we should never receive sstables when previewing");
 
-        sstables.add(sstable);
-        if (sstables.size() == totalFiles)
-            complete();
+        if (done)
+        {
+            logger.warn("[{}] Received stream {} on already finished stream received task. Aborting stream.", session.planId(),
+                        stream.getName());
+            receiver.discardStream(stream);
+            return;
+        }
+
+        remoteStreamsReceived += stream.getNumFiles();
+        bytesReceived += stream.getSize();
+        Preconditions.checkArgument(tableId.equals(stream.getTableId()));
+        logger.debug("received {} of {} total files, {} of total bytes {}", remoteStreamsReceived, totalStreams,
+                     bytesReceived, stream.getSize());
+
+        receiver.received(stream);
+
+        if (remoteStreamsReceived == totalStreams)
+        {
+            done = true;
+            executor.submit(new OnCompletionRunnable(this));
+        }
     }
 
     public int getTotalNumberOfFiles()
     {
-        return totalFiles;
+        return totalStreams;
     }
 
     public long getTotalSize()
@@ -72,24 +107,68 @@ public class StreamReceiveTask extends StreamTask
         return totalSize;
     }
 
-    // TODO should be run in background so that this does not block streaming
-    private void complete()
+    public synchronized StreamReceiver getReceiver()
     {
-        if (!SSTableReader.acquireReferences(sstables))
-            throw new AssertionError("We shouldn't fail acquiring a reference on a sstable that has just been transferred");
-        try
+        if (done)
+            throw new RuntimeException(String.format("Stream receive task %s of cf %s already finished.", session.planId(), tableId));
+        return receiver;
+    }
+
+    private static class OnCompletionRunnable implements Runnable
+    {
+        private final StreamReceiveTask task;
+
+        public OnCompletionRunnable(StreamReceiveTask task)
         {
-            Pair<String, String> kscf = Schema.instance.getCF(cfId);
-            ColumnFamilyStore cfs = Keyspace.open(kscf.left).getColumnFamilyStore(kscf.right);
-            // add sstables and build secondary indexes
-            cfs.addSSTables(sstables);
-            cfs.indexManager.maybeBuildSecondaryIndexes(sstables, cfs.indexManager.allIndexesNames());
-        }
-        finally
-        {
-            SSTableReader.releaseReferences(sstables);
+            this.task = task;
         }
 
-        session.taskCompleted(this);
+        public void run()
+        {
+            try
+            {
+                if (ColumnFamilyStore.getIfExists(task.tableId) == null)
+                {
+                    // schema was dropped during streaming
+                    task.receiver.abort();
+                    task.session.taskCompleted(task);
+                    return;
+                }
+
+                task.receiver.finished();
+                task.session.taskCompleted(task);
+            }
+            catch (Throwable t)
+            {
+                JVMStabilityInspector.inspectThrowable(t);
+                task.session.onError(t);
+            }
+            finally
+            {
+                task.receiver.cleanup();
+            }
+        }
+    }
+
+    /**
+     * Abort this task.
+     * If the task already received all files and
+     * {@link org.apache.cassandra.streaming.StreamReceiveTask.OnCompletionRunnable} task is submitted,
+     * then task cannot be aborted.
+     */
+    public synchronized void abort()
+    {
+        if (done)
+            return;
+
+        done = true;
+        receiver.abort();
+    }
+
+    @VisibleForTesting
+    public static void shutdownAndWait(long timeout, TimeUnit unit) throws InterruptedException, TimeoutException
+    {
+        shutdown(executor);
+        awaitTermination(timeout, unit, executor);
     }
 }

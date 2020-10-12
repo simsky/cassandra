@@ -17,8 +17,9 @@
  */
 package org.apache.cassandra.serializers;
 
-import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+
+import org.apache.cassandra.db.marshal.ValueAccessor;
 
 public class UTF8Serializer extends AbstractTextSerializer
 {
@@ -29,15 +30,16 @@ public class UTF8Serializer extends AbstractTextSerializer
         super(StandardCharsets.UTF_8);
     }
 
-    public void validate(ByteBuffer bytes) throws MarshalException
+    public <V> void validate(V value, ValueAccessor<V> accessor) throws MarshalException
     {
-        if (!UTF8Validator.validate(bytes))
+        if (!UTF8Validator.validate(value, accessor))
             throw new MarshalException("String didn't validate.");
     }
 
     static class UTF8Validator
     {
-        enum State {
+        enum State
+        {
             START,
             TWO,
             TWO_80,
@@ -50,14 +52,17 @@ public class UTF8Serializer extends AbstractTextSerializer
 
         // since we're not converting to java strings, we don't need to worry about converting to surrogates.
         // buf has already been sliced/duplicated.
-        static boolean validate(ByteBuffer buf)
+        static <V> boolean validate(V value, ValueAccessor<V> accessor)
         {
-            buf = buf.slice();
+            if (value == null)
+                return false;
+
             int b = 0;
+            int offset = 0;
             State state = State.START;
-            while (buf.remaining() > 0)
+            while (!accessor.isEmptyFromOffset(value, offset))
             {
-                b = buf.get();
+                b = accessor.getByte(value, offset++);
                 switch (state)
                 {
                     case START:
@@ -71,11 +76,12 @@ public class UTF8Serializer extends AbstractTextSerializer
                         {
                             // validate first byte of 2-byte char, 0xc2-0xdf
                             if (b == (byte) 0xc0)
-                                // speical case: modified utf8 null is 0xc080.
+                                // special case: modified utf8 null is 0xc080.
                                 state = State.TWO_80;
                             else if ((b & 0x1e) == 0)
                                 return false;
-                            state = State.TWO;
+                            else
+                                state = State.TWO;
                         }
                         else if ((b >> 4) == -2)
                         {
@@ -93,10 +99,8 @@ public class UTF8Serializer extends AbstractTextSerializer
                             if (b == (byte)0xf0)
                                 // 0xf0, 0x90-0xbf, 0x80-0xbf, 0x80-0xbf
                                 state = State.FOUR_90bf;
-                            else if (b == (byte)0xf4)
-                                // 0xf4, 0x80-0xbf, 0x80-0xbf, 0x80-0xbf
-                                state = State.FOUR_80bf_3;
                             else
+                                // 0xf4, 0x80-0xbf, 0x80-0xbf, 0x80-0xbf
                                 // 0xf1-0xf3, 0x80-0xbf, 0x80-0xbf, 0x80-0xbf
                                 state = State.FOUR_80bf_3;
                             break;

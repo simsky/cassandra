@@ -17,10 +17,13 @@
  */
 package org.apache.cassandra.cql3;
 
+import java.util.List;
+
+import org.apache.cassandra.cql3.functions.Function;
+import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.CollectionType;
 import org.apache.cassandra.db.marshal.ListType;
 import org.apache.cassandra.exceptions.InvalidRequestException;
-
 
 /**
  * A single bind marker.
@@ -46,10 +49,14 @@ public abstract class AbstractMarker extends Term.NonTerminal
         return true;
     }
 
+    public void addFunctionsTo(List<Function> functions)
+    {
+    }
+
     /**
      * A parsed, but non prepared, bind marker.
      */
-    public static class Raw implements Term.Raw
+    public static class Raw extends Term.Raw
     {
         protected final int bindIndex;
 
@@ -58,34 +65,82 @@ public abstract class AbstractMarker extends Term.NonTerminal
             this.bindIndex = bindIndex;
         }
 
-        public AbstractMarker prepare(ColumnSpecification receiver) throws InvalidRequestException
+        public NonTerminal prepare(String keyspace, ColumnSpecification receiver) throws InvalidRequestException
         {
-            if (!(receiver.type instanceof CollectionType))
-                return new Constants.Marker(bindIndex, receiver);
-
-            switch (((CollectionType)receiver.type).kind)
+            if (receiver.type.isCollection())
             {
-                case LIST: return new Lists.Marker(bindIndex, receiver);
-                case SET:  return new Sets.Marker(bindIndex, receiver);
-                case MAP:  return new Maps.Marker(bindIndex, receiver);
+                switch (((CollectionType) receiver.type).kind)
+                {
+                    case LIST:
+                        return new Lists.Marker(bindIndex, receiver);
+                    case SET:
+                        return new Sets.Marker(bindIndex, receiver);
+                    case MAP:
+                        return new Maps.Marker(bindIndex, receiver);
+                    default:
+                        throw new AssertionError();
+                }
             }
-            throw new AssertionError();
-        }
+            else if (receiver.type.isUDT())
+            {
+                return new UserTypes.Marker(bindIndex, receiver);
+            }
 
-        public boolean isAssignableTo(ColumnSpecification receiver)
-        {
-            return true;
+            return new Constants.Marker(bindIndex, receiver);
         }
 
         @Override
-        public String toString()
+        public AssignmentTestable.TestResult testAssignment(String keyspace, ColumnSpecification receiver)
+        {
+            return AssignmentTestable.TestResult.WEAKLY_ASSIGNABLE;
+        }
+
+        public AbstractType<?> getExactTypeIfKnown(String keyspace)
+        {
+            return null;
+        }
+
+        @Override
+        public String getText()
         {
             return "?";
         }
     }
 
-    // A raw that stands for multiple values, i.e. when we have 'IN ?'
-    public static class INRaw extends Raw
+    /** A MultiColumnRaw version of AbstractMarker.Raw */
+    public static abstract class MultiColumnRaw extends Term.MultiColumnRaw
+    {
+        protected final int bindIndex;
+
+        public MultiColumnRaw(int bindIndex)
+        {
+            this.bindIndex = bindIndex;
+        }
+
+        public NonTerminal prepare(String keyspace, ColumnSpecification receiver) throws InvalidRequestException
+        {
+            throw new AssertionError("MultiColumnRaw..prepare() requires a list of receivers");
+        }
+
+        public AssignmentTestable.TestResult testAssignment(String keyspace, ColumnSpecification receiver)
+        {
+            return AssignmentTestable.TestResult.WEAKLY_ASSIGNABLE;
+        }
+
+        @Override
+        public String getText()
+        {
+            return "?";
+        }
+    }
+
+    /**
+     * A raw placeholder for multiple values of the same type for a single column.
+     * For example, "SELECT ... WHERE user_id IN ?'.
+     *
+     * Because a single type is used, a List is used to represent the values.
+     */
+    public static final class INRaw extends Raw
     {
         public INRaw(int bindIndex)
         {
@@ -95,15 +150,12 @@ public abstract class AbstractMarker extends Term.NonTerminal
         private static ColumnSpecification makeInReceiver(ColumnSpecification receiver)
         {
             ColumnIdentifier inName = new ColumnIdentifier("in(" + receiver.name + ")", true);
-            return new ColumnSpecification(receiver.ksName, receiver.cfName, inName, ListType.getInstance(receiver.type));
+            return new ColumnSpecification(receiver.ksName, receiver.cfName, inName, ListType.getInstance(receiver.type, false));
         }
 
         @Override
-        public AbstractMarker prepare(ColumnSpecification receiver) throws InvalidRequestException
+        public Lists.Marker prepare(String keyspace, ColumnSpecification receiver) throws InvalidRequestException
         {
-            if (receiver.type instanceof CollectionType)
-                throw new InvalidRequestException("Invalid IN relation on collection column");
-
             return new Lists.Marker(bindIndex, makeInReceiver(receiver));
         }
     }

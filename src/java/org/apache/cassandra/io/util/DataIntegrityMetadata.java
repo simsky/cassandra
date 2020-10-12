@@ -19,19 +19,17 @@ package org.apache.cassandra.io.util;
 
 import java.io.Closeable;
 import java.io.File;
-import java.io.IOError;
 import java.io.IOException;
-import java.nio.channels.ClosedChannelException;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
-import java.util.regex.Pattern;
+import java.nio.ByteBuffer;
+import java.util.zip.CheckedInputStream;
 import java.util.zip.Checksum;
+
+import com.google.common.annotations.VisibleForTesting;
 
 import org.apache.cassandra.io.sstable.Component;
 import org.apache.cassandra.io.sstable.Descriptor;
-import org.apache.cassandra.io.sstable.SSTable;
-import org.apache.cassandra.utils.Hex;
-import org.apache.cassandra.utils.PureJavaCrc32;
+import org.apache.cassandra.utils.ChecksumType;
+import org.apache.cassandra.utils.Throwables;
 
 public class DataIntegrityMetadata
 {
@@ -42,24 +40,39 @@ public class DataIntegrityMetadata
 
     public static class ChecksumValidator implements Closeable
     {
-        private final Checksum checksum = new PureJavaCrc32();
+        private final ChecksumType checksumType;
         private final RandomAccessReader reader;
-        private final Descriptor descriptor;
         public final int chunkSize;
+        private final String dataFilename;
 
-        public ChecksumValidator(Descriptor desc) throws IOException
+        public ChecksumValidator(Descriptor descriptor) throws IOException
         {
-            this.descriptor = desc;
-            reader = RandomAccessReader.open(new File(desc.filenameFor(Component.CRC)));
+            this(ChecksumType.CRC32,
+                 RandomAccessReader.open(new File(descriptor.filenameFor(Component.CRC))),
+                 descriptor.filenameFor(Component.DATA));
+        }
+
+        public ChecksumValidator(ChecksumType checksumType, RandomAccessReader reader, String dataFilename) throws IOException
+        {
+            this.checksumType = checksumType;
+            this.reader = reader;
+            this.dataFilename = dataFilename;
             chunkSize = reader.readInt();
+        }
+
+        @VisibleForTesting
+        protected ChecksumValidator(ChecksumType checksumType, RandomAccessReader reader, int chunkSize)
+        {
+            this.checksumType = checksumType;
+            this.reader = reader;
+            this.dataFilename = null;
+            this.chunkSize = chunkSize;
         }
 
         public void seek(long offset)
         {
             long start = chunkStart(offset);
-            reader.seek(((start / chunkSize) * 4L) + 4); // 8 byte checksum per
-                                                         // chunk + 4 byte
-                                                         // header/chunkLength
+            reader.seek(((start / chunkSize) * 4L) + 4); // 8 byte checksum per chunk + 4 byte header/chunkLength
         }
 
         public long chunkStart(long offset)
@@ -70,12 +83,24 @@ public class DataIntegrityMetadata
 
         public void validate(byte[] bytes, int start, int end) throws IOException
         {
-            checksum.update(bytes, start, end);
-            int current = (int) checksum.getValue();
-            checksum.reset();
+            int current = (int) checksumType.of(bytes, start, end);
             int actual = reader.readInt();
             if (current != actual)
-                throw new IOException("Corrupted SSTable : " + descriptor.filenameFor(Component.DATA));
+                throw new IOException("Corrupted File : " + dataFilename);
+        }
+
+        /**
+         * validates the checksum with the bytes from the specified buffer.
+         *
+         * Upon return, the buffer's position will
+         * be updated to its limit; its limit will not have been changed.
+         */
+        public void validate(ByteBuffer buffer) throws IOException
+        {
+            int current = (int) checksumType.of(buffer);
+            int actual = reader.readInt();
+            if (current != actual)
+                throw new IOException("Corrupted File : " + dataFilename);
         }
 
         public void close()
@@ -84,84 +109,55 @@ public class DataIntegrityMetadata
         }
     }
 
-    public static ChecksumWriter checksumWriter(Descriptor desc)
+    public static FileDigestValidator fileDigestValidator(Descriptor desc) throws IOException
     {
-        return new ChecksumWriter(desc);
+        return new FileDigestValidator(desc);
     }
 
-    public static class ChecksumWriter implements Closeable
+    public static class FileDigestValidator implements Closeable
     {
-        private final Checksum checksum = new PureJavaCrc32();
-        private final MessageDigest digest;
-        private final SequentialWriter writer;
+        private final Checksum checksum;
+        private final RandomAccessReader digestReader;
+        private final RandomAccessReader dataReader;
         private final Descriptor descriptor;
+        private long storedDigestValue;
 
-        public ChecksumWriter(Descriptor desc)
+        public FileDigestValidator(Descriptor descriptor) throws IOException
         {
-            this.descriptor = desc;
-            writer = SequentialWriter.open(new File(desc.filenameFor(Component.CRC)), true);
+            this.descriptor = descriptor;
+            checksum = ChecksumType.CRC32.newInstance();
+            digestReader = RandomAccessReader.open(new File(descriptor.filenameFor(Component.DIGEST)));
+            dataReader = RandomAccessReader.open(new File(descriptor.filenameFor(Component.DATA)));
             try
             {
-                digest = MessageDigest.getInstance("SHA-1");
+                storedDigestValue = Long.parseLong(digestReader.readLine());
             }
-            catch (NoSuchAlgorithmException e)
+            catch (Exception e)
             {
-                // SHA-1 is standard in java 6
-                throw new RuntimeException(e);
+                close();
+                // Attempting to create a FileDigestValidator without a DIGEST file will fail
+                throw new IOException("Corrupted SSTable : " + descriptor.filenameFor(Component.DATA));
             }
         }
 
-        public void writeChunkSize(int length)
+        // Validate the entire file
+        public void validate() throws IOException
         {
-            try
-            {
-                writer.stream.writeInt(length);
-            }
-            catch (IOException e)
-            {
-                throw new IOError(e);
-            }
-        }
+            CheckedInputStream checkedInputStream = new CheckedInputStream(dataReader, checksum);
+            byte[] chunk = new byte[64 * 1024];
 
-        public void append(byte[] buffer, int start, int end)
-        {
-            try
+            while( checkedInputStream.read(chunk) > 0 ) { }
+            long calculatedDigestValue = checkedInputStream.getChecksum().getValue();
+            if (storedDigestValue != calculatedDigestValue)
             {
-                checksum.update(buffer, start, end);
-                writer.stream.writeInt((int) checksum.getValue());
-                checksum.reset();
-
-                digest.update(buffer, start, end);
-            }
-            catch (IOException e)
-            {
-                throw new IOError(e);
+                throw new IOException("Corrupted SSTable : " + descriptor.filenameFor(Component.DATA));
             }
         }
 
         public void close()
         {
-            FileUtils.closeQuietly(writer);
-            byte[] bytes = digest.digest();
-            if (bytes == null)
-                return;
-            SequentialWriter out = SequentialWriter.open(new File(descriptor.filenameFor(Component.DIGEST)), true);
-            // Writting output compatible with sha1sum
-            Descriptor newdesc = descriptor.asTemporary(false);
-            String[] tmp = newdesc.filenameFor(Component.DATA).split(Pattern.quote(File.separator));
-            String dataFileName = tmp[tmp.length - 1];
-            try
-            {
-                out.write(String.format("%s  %s", Hex.bytesToHex(bytes), dataFileName).getBytes());
-            }
-            catch (ClosedChannelException e)
-            {
-                throw new AssertionError(); // can't happen.
-            }
-            finally
-            {
-                FileUtils.closeQuietly(out);
-            }
+            Throwables.perform(digestReader::close,
+                               dataReader::close);
         }
     }
 }

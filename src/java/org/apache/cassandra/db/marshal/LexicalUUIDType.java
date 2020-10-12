@@ -20,11 +20,12 @@ package org.apache.cassandra.db.marshal;
 import java.nio.ByteBuffer;
 import java.util.UUID;
 
+import org.apache.cassandra.cql3.Constants;
+import org.apache.cassandra.cql3.Term;
 import org.apache.cassandra.serializers.TypeSerializer;
 import org.apache.cassandra.serializers.MarshalException;
 import org.apache.cassandra.serializers.UUIDSerializer;
 import org.apache.cassandra.utils.ByteBufferUtil;
-import org.apache.cassandra.utils.UUIDGen;
 
 public class LexicalUUIDType extends AbstractType<UUID>
 {
@@ -32,20 +33,19 @@ public class LexicalUUIDType extends AbstractType<UUID>
 
     LexicalUUIDType()
     {
+        super(ComparisonType.CUSTOM);
     } // singleton
 
-    public int compare(ByteBuffer o1, ByteBuffer o2)
+    public boolean isEmptyValueMeaningless()
     {
-        if (o1.remaining() == 0)
-        {
-            return o2.remaining() == 0 ? 0 : -1;
-        }
-        if (o2.remaining() == 0)
-        {
-            return 1;
-        }
+        return true;
+    }
 
-        return UUIDGen.getUUID(o1).compareTo(UUIDGen.getUUID(o2));
+    public <VL, VR> int compareCustom(VL left, ValueAccessor<VL> accessorL, VR right, ValueAccessor<VR> accessorR)
+    {
+        if (accessorL.isEmpty(left) || accessorR.isEmpty(right))
+            return Boolean.compare(accessorR.isEmpty(right), accessorL.isEmpty(left));
+        return accessorL.toUUID(left).compareTo(accessorR.toUUID(right));
     }
 
     public ByteBuffer fromString(String source) throws MarshalException
@@ -64,8 +64,28 @@ public class LexicalUUIDType extends AbstractType<UUID>
         }
     }
 
+    @Override
+    public Term fromJSONObject(Object parsed) throws MarshalException
+    {
+        try
+        {
+            return new Constants.Value(fromString((String) parsed));
+        }
+        catch (ClassCastException exc)
+        {
+            throw new MarshalException(String.format(
+                    "Expected a string representation of a uuid, but got a %s: %s", parsed.getClass().getSimpleName(), parsed));
+        }
+    }
+
     public TypeSerializer<UUID> getSerializer()
     {
         return UUIDSerializer.instance;
+    }
+
+    @Override
+    public int valueLengthIfFixed()
+    {
+        return 16;
     }
 }

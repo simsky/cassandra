@@ -17,61 +17,59 @@
  */
 package org.apache.cassandra.transport;
 
-import java.util.concurrent.ConcurrentMap;
+import javax.net.ssl.SSLPeerUnverifiedException;
+import javax.security.cert.X509Certificate;
 
-import org.jboss.netty.channel.Channel;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
+import io.netty.channel.Channel;
+import com.codahale.metrics.Counter;
+import io.netty.handler.ssl.SslHandler;
 import org.apache.cassandra.auth.IAuthenticator;
-import org.apache.cassandra.auth.ISaslAwareAuthenticator;
-import org.apache.cassandra.auth.ISaslAwareAuthenticator.SaslAuthenticator;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.service.QueryState;
 
-import org.cliffc.high_scale_lib.NonBlockingHashMap;
-
 public class ServerConnection extends Connection
 {
-    private enum State { UNINITIALIZED, AUTHENTICATION, READY }
+    private static final Logger logger = LoggerFactory.getLogger(ServerConnection.class);
 
-    private volatile SaslAuthenticator saslAuthenticator;
+    private volatile IAuthenticator.SaslNegotiator saslNegotiator;
     private final ClientState clientState;
-    private volatile State state;
+    private volatile ConnectionStage stage;
+    public final Counter requests = new Counter();
 
-    private final ConcurrentMap<Integer, QueryState> queryStates = new NonBlockingHashMap<Integer, QueryState>();
-
-    public ServerConnection(Channel channel, int version, Connection.Tracker tracker)
+    ServerConnection(Channel channel, ProtocolVersion version, Connection.Tracker tracker)
     {
         super(channel, version, tracker);
-        this.clientState = ClientState.forExternalCalls(channel.getRemoteAddress());
-        this.state = State.UNINITIALIZED;
+
+        clientState = ClientState.forExternalCalls(channel.remoteAddress());
+        stage = ConnectionStage.ESTABLISHED;
     }
 
-    private QueryState getQueryState(int streamId)
+    public ClientState getClientState()
     {
-        QueryState qState = queryStates.get(streamId);
-        if (qState == null)
-        {
-            // In theory we shouldn't get any race here, but it never hurts to be careful
-            QueryState newState = new QueryState(clientState);
-            if ((qState = queryStates.putIfAbsent(streamId, newState)) == null)
-                qState = newState;
-        }
-        return qState;
+        return clientState;
     }
 
-    public QueryState validateNewMessage(Message.Type type, int version, int streamId)
+    ConnectionStage stage()
     {
-        switch (state)
+        return stage;
+    }
+
+    QueryState validateNewMessage(Message.Type type, ProtocolVersion version)
+    {
+        switch (stage)
         {
-            case UNINITIALIZED:
+            case ESTABLISHED:
                 if (type != Message.Type.STARTUP && type != Message.Type.OPTIONS)
                     throw new ProtocolException(String.format("Unexpected message %s, expecting STARTUP or OPTIONS", type));
                 break;
-            case AUTHENTICATION:
+            case AUTHENTICATING:
                 // Support both SASL auth from protocol v2 and the older style Credentials auth from v1
                 if (type != Message.Type.AUTH_RESPONSE && type != Message.Type.CREDENTIALS)
-                    throw new ProtocolException(String.format("Unexpected message %s, expecting %s", type, version == 1 ? "CREDENTIALS" : "SASL_RESPONSE"));
+                    throw new ProtocolException(String.format("Unexpected message %s, expecting %s", type, version == ProtocolVersion.V1 ? "CREDENTIALS" : "SASL_RESPONSE"));
                 break;
             case READY:
                 if (type == Message.Type.STARTUP)
@@ -80,31 +78,32 @@ public class ServerConnection extends Connection
             default:
                 throw new AssertionError();
         }
-        return getQueryState(streamId);
+
+        return new QueryState(clientState);
     }
 
-    public void applyStateTransition(Message.Type requestType, Message.Type responseType)
+    void applyStateTransition(Message.Type requestType, Message.Type responseType)
     {
-        switch (state)
+        switch (stage)
         {
-            case UNINITIALIZED:
+            case ESTABLISHED:
                 if (requestType == Message.Type.STARTUP)
                 {
                     if (responseType == Message.Type.AUTHENTICATE)
-                        state = State.AUTHENTICATION;
+                        stage = ConnectionStage.AUTHENTICATING;
                     else if (responseType == Message.Type.READY)
-                        state = State.READY;
+                        stage = ConnectionStage.READY;
                 }
                 break;
-            case AUTHENTICATION:
+            case AUTHENTICATING:
                 // Support both SASL auth from protocol v2 and the older style Credentials auth from v1
                 assert requestType == Message.Type.AUTH_RESPONSE || requestType == Message.Type.CREDENTIALS;
 
                 if (responseType == Message.Type.READY || responseType == Message.Type.AUTH_SUCCESS)
                 {
-                    state = State.READY;
+                    stage = ConnectionStage.READY;
                     // we won't use the authenticator again, null it so that it can be GC'd
-                    saslAuthenticator = null;
+                    saslNegotiator = null;
                 }
                 break;
             case READY:
@@ -114,14 +113,33 @@ public class ServerConnection extends Connection
         }
     }
 
-    public SaslAuthenticator getAuthenticator()
+    public IAuthenticator.SaslNegotiator getSaslNegotiator(QueryState queryState)
     {
-        if (saslAuthenticator == null)
+        if (saslNegotiator == null)
+            saslNegotiator = DatabaseDescriptor.getAuthenticator()
+                                               .newSaslNegotiator(queryState.getClientAddress(), certificates());
+        return saslNegotiator;
+    }
+
+    private X509Certificate[] certificates()
+    {
+        SslHandler sslHandler = (SslHandler) channel().pipeline()
+                                                      .get("ssl");
+        X509Certificate[] certificates = null;
+
+        if (sslHandler != null)
         {
-            IAuthenticator authenticator = DatabaseDescriptor.getAuthenticator();
-            assert authenticator instanceof ISaslAwareAuthenticator : "Configured IAuthenticator does not support SASL authentication";
-            saslAuthenticator = ((ISaslAwareAuthenticator)authenticator).newAuthenticator();
+            try
+            {
+                certificates = sslHandler.engine()
+                                         .getSession()
+                                         .getPeerCertificateChain();
+            }
+            catch (SSLPeerUnverifiedException e)
+            {
+                logger.debug("Failed to get peer certificates for peer {}", channel().remoteAddress(), e);
+            }
         }
-        return saslAuthenticator;
+        return certificates;
     }
 }

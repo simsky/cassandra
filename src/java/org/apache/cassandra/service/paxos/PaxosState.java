@@ -1,6 +1,5 @@
-package org.apache.cassandra.service.paxos;
 /*
- * 
+ *
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -8,59 +7,46 @@ package org.apache.cassandra.service.paxos;
  * to you under the Apache License, Version 2.0 (the
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
- * 
+ *
  *   http://www.apache.org/licenses/LICENSE-2.0
- * 
+ *
  * Unless required by applicable law or agreed to in writing,
  * software distributed under the License is distributed on an
  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
  * KIND, either express or implied.  See the License for the
  * specific language governing permissions and limitations
  * under the License.
- * 
+ *
  */
+package org.apache.cassandra.service.paxos;
 
+import java.util.concurrent.locks.Lock;
 
-import java.nio.ByteBuffer;
+import com.google.common.util.concurrent.Striped;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.db.RowMutation;
-import org.apache.cassandra.db.Keyspace;
-import org.apache.cassandra.db.SystemKeyspace;
+import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.*;
 import org.apache.cassandra.tracing.Tracing;
+import org.apache.cassandra.utils.UUIDGen;
 
 public class PaxosState
 {
-    private static final Logger logger = LoggerFactory.getLogger(PaxosState.class);
-
-    private static final Object[] locks;
-    static
-    {
-        locks = new Object[1024];
-        for (int i = 0; i < locks.length; i++)
-            locks[i] = new Object();
-    }
-    private static Object lockFor(ByteBuffer key)
-    {
-        return locks[(0x7FFFFFFF & key.hashCode()) % locks.length];
-    }
+    private static final Striped<Lock> LOCKS = Striped.lazyWeakLock(DatabaseDescriptor.getConcurrentWriters() * 1024);
 
     private final Commit promised;
     private final Commit accepted;
     private final Commit mostRecentCommit;
 
-    public PaxosState(ByteBuffer key, CFMetaData metadata)
+    public PaxosState(DecoratedKey key, TableMetadata metadata)
     {
         this(Commit.emptyCommit(key, metadata), Commit.emptyCommit(key, metadata), Commit.emptyCommit(key, metadata));
     }
 
     public PaxosState(Commit promised, Commit accepted, Commit mostRecentCommit)
     {
-        assert promised.key == accepted.key && accepted.key == mostRecentCommit.key;
-        assert promised.update.metadata() == accepted.update.metadata() && accepted.update.metadata() == mostRecentCommit.update.metadata();
+        assert promised.update.partitionKey().equals(accepted.update.partitionKey()) && accepted.update.partitionKey().equals(mostRecentCommit.update.partitionKey());
+        assert promised.update.metadata().id.equals(accepted.update.metadata().id) && accepted.update.metadata().id.equals(mostRecentCommit.update.metadata().id);
 
         this.promised = promised;
         this.accepted = accepted;
@@ -69,55 +55,107 @@ public class PaxosState
 
     public static PrepareResponse prepare(Commit toPrepare)
     {
-        synchronized (lockFor(toPrepare.key))
+        long start = System.nanoTime();
+        try
         {
-            PaxosState state = SystemKeyspace.loadPaxosState(toPrepare.key, toPrepare.update.metadata());
-            if (toPrepare.isAfter(state.promised))
+            Lock lock = LOCKS.get(toPrepare.update.partitionKey());
+            lock.lock();
+            try
             {
-                Tracing.trace("Promising ballot {}", toPrepare.ballot);
-                SystemKeyspace.savePaxosPromise(toPrepare);
-                return new PrepareResponse(true, state.accepted, state.mostRecentCommit);
+                // When preparing, we need to use the same time as "now" (that's the time we use to decide if something
+                // is expired or not) accross nodes otherwise we may have a window where a Most Recent Commit shows up
+                // on some replica and not others during a new proposal (in StorageProxy.beginAndRepairPaxos()), and no
+                // amount of re-submit will fix this (because the node on which the commit has expired will have a
+                // tombstone that hides any re-submit). See CASSANDRA-12043 for details.
+                int nowInSec = UUIDGen.unixTimestampInSec(toPrepare.ballot);
+                PaxosState state = SystemKeyspace.loadPaxosState(toPrepare.update.partitionKey(), toPrepare.update.metadata(), nowInSec);
+                if (toPrepare.isAfter(state.promised))
+                {
+                    Tracing.trace("Promising ballot {}", toPrepare.ballot);
+                    SystemKeyspace.savePaxosPromise(toPrepare);
+                    return new PrepareResponse(true, state.accepted, state.mostRecentCommit);
+                }
+                else
+                {
+                    Tracing.trace("Promise rejected; {} is not sufficiently newer than {}", toPrepare, state.promised);
+                    // return the currently promised ballot (not the last accepted one) so the coordinator can make sure it uses newer ballot next time (#5667)
+                    return new PrepareResponse(false, state.promised, state.mostRecentCommit);
+                }
             }
-            else
+            finally
             {
-                Tracing.trace("Promise rejected; {} is not sufficiently newer than {}", toPrepare, state.promised);
-                // return the currently promised ballot (not the last accepted one) so the coordinator can make sure it uses newer ballot next time (#5667)
-                return new PrepareResponse(false, state.promised, state.mostRecentCommit);
+                lock.unlock();
             }
         }
+        finally
+        {
+            Keyspace.open(toPrepare.update.metadata().keyspace).getColumnFamilyStore(toPrepare.update.metadata().id).metric.casPrepare.addNano(System.nanoTime() - start);
+        }
+
     }
 
     public static Boolean propose(Commit proposal)
     {
-        synchronized (lockFor(proposal.key))
+        long start = System.nanoTime();
+        try
         {
-            PaxosState state = SystemKeyspace.loadPaxosState(proposal.key, proposal.update.metadata());
-            if (proposal.hasBallot(state.promised.ballot) || proposal.isAfter(state.promised))
+            Lock lock = LOCKS.get(proposal.update.partitionKey());
+            lock.lock();
+            try
             {
-                Tracing.trace("Accepting proposal {}", proposal);
-                SystemKeyspace.savePaxosProposal(proposal);
-                return true;
+                int nowInSec = UUIDGen.unixTimestampInSec(proposal.ballot);
+                PaxosState state = SystemKeyspace.loadPaxosState(proposal.update.partitionKey(), proposal.update.metadata(), nowInSec);
+                if (proposal.hasBallot(state.promised.ballot) || proposal.isAfter(state.promised))
+                {
+                    Tracing.trace("Accepting proposal {}", proposal);
+                    SystemKeyspace.savePaxosProposal(proposal);
+                    return true;
+                }
+                else
+                {
+                    Tracing.trace("Rejecting proposal for {} because inProgress is now {}", proposal, state.promised);
+                    return false;
+                }
             }
-            else
+            finally
             {
-                Tracing.trace("Rejecting proposal for {} because inProgress is now {}", proposal, state.promised);
-                return false;
+                lock.unlock();
             }
+        }
+        finally
+        {
+            Keyspace.open(proposal.update.metadata().keyspace).getColumnFamilyStore(proposal.update.metadata().id).metric.casPropose.addNano(System.nanoTime() - start);
         }
     }
 
     public static void commit(Commit proposal)
     {
-        // There is no guarantee we will see commits in the right order, because messages
-        // can get delayed, so a proposal can be older than our current most recent ballot/commit.
-        // Committing it is however always safe due to column timestamps, so always do it. However,
-        // if our current in-progress ballot is strictly greater than the proposal one, we shouldn't
-        // erase the in-progress update.
-        Tracing.trace("Committing proposal {}", proposal);
-        RowMutation rm = proposal.makeMutation();
-        Keyspace.open(rm.getKeyspaceName()).apply(rm, true);
-
-        // We don't need to lock, we're just blindly updating
-        SystemKeyspace.savePaxosCommit(proposal);
+        long start = System.nanoTime();
+        try
+        {
+            // There is no guarantee we will see commits in the right order, because messages
+            // can get delayed, so a proposal can be older than our current most recent ballot/commit.
+            // Committing it is however always safe due to column timestamps, so always do it. However,
+            // if our current in-progress ballot is strictly greater than the proposal one, we shouldn't
+            // erase the in-progress update.
+            // The table may have been truncated since the proposal was initiated. In that case, we
+            // don't want to perform the mutation and potentially resurrect truncated data
+            if (UUIDGen.unixTimestamp(proposal.ballot) >= SystemKeyspace.getTruncatedAt(proposal.update.metadata().id))
+            {
+                Tracing.trace("Committing proposal {}", proposal);
+                Mutation mutation = proposal.makeMutation();
+                Keyspace.open(mutation.getKeyspaceName()).apply(mutation, true);
+            }
+            else
+            {
+                Tracing.trace("Not committing proposal {} as ballot timestamp predates last truncation time", proposal);
+            }
+            // We don't need to lock, we're just blindly updating
+            SystemKeyspace.savePaxosCommit(proposal);
+        }
+        finally
+        {
+            Keyspace.open(proposal.update.metadata().keyspace).getColumnFamilyStore(proposal.update.metadata().id).metric.casCommit.addNano(System.nanoTime() - start);
+        }
     }
 }
