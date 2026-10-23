@@ -17,20 +17,24 @@
  */
 package org.apache.cassandra.db.marshal;
 
-
 import java.nio.ByteBuffer;
-import java.text.ParseException;
 import java.util.UUID;
+import java.util.regex.Pattern;
+
+import com.google.common.primitives.UnsignedLongs;
 
 import org.apache.cassandra.cql3.CQL3Type;
-import org.apache.cassandra.serializers.TypeSerializer;
+import org.apache.cassandra.cql3.functions.ArgumentDeserializer;
+import org.apache.cassandra.cql3.terms.Constants;
+import org.apache.cassandra.cql3.terms.Term;
 import org.apache.cassandra.serializers.MarshalException;
+import org.apache.cassandra.serializers.TypeSerializer;
 import org.apache.cassandra.serializers.UUIDSerializer;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.UUIDGen;
-import org.apache.commons.lang3.time.DateUtils;
-
-import static org.apache.cassandra.serializers.TimestampSerializer.iso8601Patterns;
+import org.apache.cassandra.utils.bytecomparable.ByteComparable;
+import org.apache.cassandra.utils.bytecomparable.ByteSource;
+import org.apache.cassandra.utils.bytecomparable.ByteSourceInverse;
 
 /**
  * Compares UUIDs using the following criteria:<br>
@@ -46,180 +50,211 @@ public class UUIDType extends AbstractType<UUID>
 {
     public static final UUIDType instance = new UUIDType();
 
+    private static final ArgumentDeserializer ARGUMENT_DESERIALIZER = new DefaultArgumentDeserializer(instance);
+
+    private static final ByteBuffer MASKED_VALUE = instance.decompose(UUID.fromString("00000000-0000-0000-0000-000000000000"));
+
     UUIDType()
     {
+        super(ComparisonType.CUSTOM, 16);
     }
 
-    public int compare(ByteBuffer b1, ByteBuffer b2)
+    @Override
+    public boolean allowsEmpty()
+    {
+        return true;
+    }
+
+    @Override
+    public boolean isEmptyValueMeaningless()
+    {
+        return true;
+    }
+
+    public <VL, VR> int compareCustom(VL left, ValueAccessor<VL> accessorL, VR right, ValueAccessor<VR> accessorR)
     {
 
         // Compare for length
-
-        if ((b1 == null) || (b1.remaining() < 16))
+        boolean p1 = accessorL.size(left) == 16, p2 = accessorR.size(right) == 16;
+        if (!(p1 & p2))
         {
-            return ((b2 == null) || (b2.remaining() < 16)) ? 0 : -1;
+            // should we assert exactly 16 bytes (or 0)? seems prudent
+            assert p1 || accessorL.isEmpty(left);
+            assert p2 || accessorR.isEmpty(right);
+            return p1 ? 1 : p2 ? -1 : 0;
         }
-        if ((b2 == null) || (b2.remaining() < 16))
-        {
-            return 1;
-        }
-
-        int s1 = b1.position();
-        int s2 = b2.position();
 
         // Compare versions
+        long msb1 = accessorL.getLong(left, 0);
+        long msb2 = accessorR.getLong(right, 0);
 
-        int v1 = (b1.get(s1 + 6) >> 4) & 0x0f;
-        int v2 = (b2.get(s2 + 6) >> 4) & 0x0f;
+        int version1 = (int) ((msb1 >>> 12) & 0xf);
+        int version2 = (int) ((msb2 >>> 12) & 0xf);
+        if (version1 != version2)
+            return version1 - version2;
 
-        if (v1 != v2)
+        // bytes: version is top 4 bits of byte 6
+        // then: [6.5-8), [4-6), [0-4)
+        if (version1 == 1)
         {
-            return v1 - v2;
-        }
-
-        // Compare timestamps for version 1
-
-        if (v1 == 1)
-        {
-            // if both time-based, compare as timestamps
-            int c = compareTimestampBytes(b1, b2);
+            long reorder1 = TimeUUIDType.reorderTimestampBytes(msb1);
+            long reorder2 = TimeUUIDType.reorderTimestampBytes(msb2);
+            // we know this is >= 0, since the top 3 bits will be 0
+            int c = Long.compare(reorder1, reorder2);
             if (c != 0)
-            {
                 return c;
-            }
         }
-
-        // Compare the two byte arrays starting from the first
-        // byte in the sequence until an inequality is
-        // found. This should provide equivalent results
-        // to the comparison performed by the RFC 4122
-        // Appendix A - Sample Implementation.
-        // Note: java.util.UUID.compareTo is not a lexical
-        // comparison
-        for (int i = 0; i < 16; i++)
+        else
         {
-            int c = ((b1.get(s1 + i)) & 0xFF) - ((b2.get(s2 + i)) & 0xFF);
+            int c = UnsignedLongs.compare(msb1, msb2);
             if (c != 0)
-            {
                 return c;
-            }
         }
 
-        return 0;
+        // Amusingly (or not so much), although UUIDType freely takes time UUIDs (UUIDs with version 1), it compares
+        // them differently than TimeUUIDType. This is evident in the least significant bytes comparison (the code
+        // below for UUIDType), where UUIDType treats them as unsigned bytes, while TimeUUIDType compares the bytes
+        // signed. See CASSANDRA-8730 for details around this discrepancy.
+        return UnsignedLongs.compare(accessorL.getLong(left, 8), accessorR.getLong(right, 8));
     }
 
-    private static int compareTimestampBytes(ByteBuffer o1, ByteBuffer o2)
+    @Override
+    public <V> ByteSource asComparableBytes(ValueAccessor<V> accessor, V data, ByteComparable.Version v)
     {
-        int o1Pos = o1.position();
-        int o2Pos = o2.position();
+        if (accessor.isEmpty(data))
+            return null;
 
-        int d = (o1.get(o1Pos + 6) & 0xF) - (o2.get(o2Pos + 6) & 0xF);
-        if (d != 0)
+        long msb = accessor.getLong(data, 0);
+        long version = ((msb >>> 12) & 0xf);
+        ByteBuffer swizzled = ByteBuffer.allocate(16);
+
+        if (version == 1)
+            swizzled.putLong(0, TimeUUIDType.reorderTimestampBytes(msb));
+        else
+            swizzled.putLong(0, (version << 60) | ((msb >>> 4) & 0x0FFFFFFFFFFFF000L) | (msb & 0xFFFL));
+
+        swizzled.putLong(8, accessor.getLong(data, 8));
+
+        // fixed-length thus prefix-free
+        return ByteSource.fixedLength(swizzled);
+    }
+
+    @Override
+    public <V> V fromComparableBytes(ValueAccessor<V> accessor, ByteSource.Peekable comparableBytes, ByteComparable.Version version)
+    {
+        // Optional-style encoding of empty values as null sources
+        if (comparableBytes == null)
+            return accessor.empty();
+
+        // The UUID bits are stored as an unsigned fixed-length 128-bit integer.
+        long hiBits = ByteSourceInverse.getUnsignedFixedLengthAsLong(comparableBytes, 8);
+        long loBits = ByteSourceInverse.getUnsignedFixedLengthAsLong(comparableBytes, 8);
+
+        long uuidVersion = hiBits >>> 60 & 0xF;
+        if (uuidVersion == 1)
         {
-            return d;
+            // If the version bits are set to 1, this is a time-based UUID, and its high bits are significantly more
+            // shuffled than in other UUIDs. Revert the shuffle.
+            hiBits = TimeUUIDType.reorderBackTimestampBytes(hiBits);
+        }
+        else
+        {
+            // For non-time UUIDs, the only thing that's needed is to put the version bits back where they were originally.
+            hiBits = hiBits << 4 & 0xFFFFFFFFFFFF0000L
+                     | uuidVersion << 12
+                     | hiBits & 0x0000000000000FFFL;
         }
 
-        d = (o1.get(o1Pos + 7) & 0xFF) - (o2.get(o2Pos + 7) & 0xFF);
-        if (d != 0)
-        {
-            return d;
-        }
+        return makeUuidBytes(accessor, hiBits, loBits);
+    }
 
-        d = (o1.get(o1Pos + 4) & 0xFF) - (o2.get(o2Pos + 4) & 0xFF);
-        if (d != 0)
-        {
-            return d;
-        }
+    static <V> V makeUuidBytes(ValueAccessor<V> accessor, long high, long low)
+    {
+        V buffer = accessor.allocate(16);
+        accessor.putLong(buffer, 0, high);
+        accessor.putLong(buffer, 8, low);
+        return buffer;
+    }
 
-        d = (o1.get(o1Pos + 5) & 0xFF) - (o2.get(o2Pos + 5) & 0xFF);
-        if (d != 0)
-        {
-            return d;
-        }
-
-        d = (o1.get(o1Pos) & 0xFF) - (o2.get(o2Pos) & 0xFF);
-        if (d != 0)
-        {
-            return d;
-        }
-
-        d = (o1.get(o1Pos + 1) & 0xFF) - (o2.get(o2Pos + 1) & 0xFF);
-        if (d != 0)
-        {
-            return d;
-        }
-
-        d = (o1.get(o1Pos + 2) & 0xFF) - (o2.get(o2Pos + 2) & 0xFF);
-        if (d != 0)
-        {
-            return d;
-        }
-
-        return (o1.get(o1Pos + 3) & 0xFF) - (o2.get(o2Pos + 3) & 0xFF);
+    @Override
+    public boolean isValueCompatibleWithInternal(AbstractType<?> otherType)
+    {
+        return otherType instanceof UUIDType || otherType instanceof TimeUUIDType;
     }
 
     @Override
     public ByteBuffer fromString(String source) throws MarshalException
     {
         // Return an empty ByteBuffer for an empty string.
-        if (source.isEmpty())
-            return ByteBufferUtil.EMPTY_BYTE_BUFFER;
+        ByteBuffer parsed = parse(source);
+        if (parsed != null)
+            return parsed;
 
-        ByteBuffer idBytes = null;
-
-        // ffffffff-ffff-ffff-ffff-ffffffffff
-        if (TimeUUIDType.regexPattern.matcher(source).matches())
-        {
-            UUID uuid;
-            try
-            {
-                uuid = UUID.fromString(source);
-                idBytes = ByteBuffer.wrap(UUIDGen.decompose(uuid));
-            }
-            catch (IllegalArgumentException e)
-            {
-                throw new MarshalException(String.format("unable to make UUID from '%s'", source), e);
-            }
-        } else if (source.toLowerCase().equals("now"))
-        {
-            idBytes = ByteBuffer.wrap(UUIDGen.getTimeUUIDBytes());
-        }
-        // Milliseconds since epoch?
-        else if (source.matches("^\\d+$"))
-        {
-            try
-            {
-                idBytes = ByteBuffer.wrap(UUIDGen.getTimeUUIDBytes(Long.parseLong(source)));
-            }
-            catch (NumberFormatException e)
-            {
-                throw new MarshalException(String.format("unable to make version 1 UUID from '%s'", source), e);
-            }
-        }
-        // Last chance, attempt to parse as date-time string
-        else
-        {
-            try
-            {
-                long timestamp = DateUtils.parseDate(source, iso8601Patterns).getTime();
-                idBytes = ByteBuffer.wrap(UUIDGen.getTimeUUIDBytes(timestamp));
-            }
-            catch (ParseException e1)
-            {
-                throw new MarshalException(String.format("unable to coerce '%s' to version 1 UUID", source), e1);
-            }
-        }
-
-        return idBytes;
+        throw new MarshalException(String.format("Unable to make UUID from '%s'", source));
     }
 
+    @Override
     public CQL3Type asCQL3Type()
     {
         return CQL3Type.Native.UUID;
     }
 
+    @Override
     public TypeSerializer<UUID> getSerializer()
     {
         return UUIDSerializer.instance;
+    }
+
+    @Override
+    public ArgumentDeserializer getArgumentDeserializer()
+    {
+        return ARGUMENT_DESERIALIZER;
+    }
+
+    static final Pattern regexPattern = Pattern.compile("[A-Fa-f0-9]{8}\\-[A-Fa-f0-9]{4}\\-[A-Fa-f0-9]{4}\\-[A-Fa-f0-9]{4}\\-[A-Fa-f0-9]{12}");
+
+    static ByteBuffer parse(String source)
+    {
+        if (source.isEmpty())
+            return ByteBufferUtil.EMPTY_BYTE_BUFFER;
+
+        if (regexPattern.matcher(source).matches())
+        {
+            try
+            {
+                return UUIDGen.toByteBuffer(UUID.fromString(source));
+            }
+            catch (IllegalArgumentException e)
+            {
+                throw new MarshalException(String.format("Unable to make UUID from '%s'", source), e);
+            }
+        }
+
+        return null;
+    }
+
+    @Override
+    public Term fromJSONObject(Object parsed) throws MarshalException
+    {
+        try
+        {
+            return new Constants.Value(fromString((String) parsed));
+        }
+        catch (ClassCastException exc)
+        {
+            throw new MarshalException(String.format(
+                    "Expected a string representation of a uuid, but got a %s: %s", parsed.getClass().getSimpleName(), parsed));
+        }
+    }
+
+    static int version(ByteBuffer uuid)
+    {
+        return (uuid.get(6) & 0xf0) >> 4;
+    }
+
+    @Override
+    public ByteBuffer getMaskedValue()
+    {
+        return MASKED_VALUE;
     }
 }

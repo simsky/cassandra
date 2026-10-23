@@ -17,7 +17,12 @@
  */
 package org.apache.cassandra.exceptions;
 
-public abstract class CassandraException extends Exception implements TransportException
+import org.apache.cassandra.utils.Shared;
+
+import static org.apache.cassandra.utils.Shared.Scope.SIMULATION;
+
+@Shared(scope = SIMULATION)
+public abstract class CassandraException extends RuntimeException implements TransportException
 {
     private final ExceptionCode code;
 

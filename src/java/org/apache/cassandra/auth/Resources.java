@@ -19,47 +19,62 @@ package org.apache.cassandra.auth;
 
 import java.util.ArrayList;
 import java.util.List;
-
-import org.apache.cassandra.utils.Hex;
+import java.util.function.Predicate;
 
 public final class Resources
 {
     /**
      * Construct a chain of resource parents starting with the resource and ending with the root.
      *
-     * @param resource The staring point.
+     * @param resource The starting point.
      * @return list of resource in the chain form start to the root.
      */
     public static List<? extends IResource> chain(IResource resource)
     {
-        List<IResource> chain = new ArrayList<IResource>();
+        return chain(resource, (r) -> true);
+    }
+
+    /**
+     * Construct a chain of resource parents starting with the resource and ending with the root. Only resources which
+     * satisfy the supplied predicate will be included.
+     *
+     * @param resource The starting point.
+     * @param filter can be used to omit specific resources from the chain
+     * @return list of resource in the chain form start to the root.
+     */
+    public static List<? extends IResource> chain(IResource resource, Predicate<IResource> filter)
+    {
+
+        List<IResource> chain = new ArrayList<>(4);
         while (true)
         {
-           chain.add(resource);
-           if (!resource.hasParent())
-               break;
-           resource = resource.getParent();
+            if (filter.test(resource))
+                chain.add(resource);
+            if (!resource.hasParent())
+                break;
+            resource = resource.getParent();
         }
         return chain;
     }
 
-    @Deprecated
-    public final static String ROOT = "cassandra";
-    @Deprecated
-    public final static String KEYSPACES = "keyspaces";
-
-    @Deprecated
-    public static String toString(List<Object> resource)
+    /**
+     * Creates an IResource instance from its external name.
+     * Resource implementation class is inferred by matching against the known IResource
+     * impls' root level resources.
+     * @param name external name to create IResource from
+     * @return an IResource instance created from the name
+     */
+    public static IResource fromName(String name)
     {
-        StringBuilder buff = new StringBuilder();
-        for (Object component : resource)
-        {
-            buff.append("/");
-            if (component instanceof byte[])
-                buff.append(Hex.bytesToHex((byte[])component));
-            else
-                buff.append(component.toString());
-        }
-        return buff.toString();
+        if (name.startsWith(RoleResource.root().getName()))
+            return RoleResource.fromName(name);
+        else if (name.startsWith(DataResource.root().getName()))
+            return DataResource.fromName(name);
+        else if (name.startsWith(FunctionResource.root().getName()))
+            return FunctionResource.fromName(name);
+        else if (name.startsWith(JMXResource.root().getName()))
+            return JMXResource.fromName(name);
+        else
+            throw new IllegalArgumentException(String.format("Name %s is not valid for any resource type", name));
     }
 }

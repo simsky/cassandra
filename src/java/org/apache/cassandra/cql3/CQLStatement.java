@@ -17,45 +17,142 @@
  */
 package org.apache.cassandra.cql3;
 
-import org.apache.cassandra.transport.messages.ResultMessage;
+import java.util.Collections;
+import java.util.List;
+
+import com.google.common.collect.ImmutableList;
+
+import org.apache.cassandra.audit.AuditLogContext;
+import org.apache.cassandra.cql3.functions.Function;
 import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.service.QueryState;
-import org.apache.cassandra.exceptions.*;
+import org.apache.cassandra.transport.Dispatcher;
+import org.apache.cassandra.transport.messages.ResultMessage;
 
 public interface CQLStatement
 {
     /**
-     * Returns the number of bound terms in this statement.
+     * Returns all bind variables for the statement
      */
-    public int getBoundsTerms();
+    default ImmutableList<ColumnSpecification> getBindVariables()
+    {
+        return ImmutableList.of();
+    }
+
+    /**
+     * Returns an array with the same length as the number of partition key columns for the table corresponding
+     * to table.  Each short in the array represents the bind index of the marker that holds the value for that
+     * partition key column. If there are no bind markers for any of the partition key columns, null is returned.
+     */
+    default short[] getPartitionKeyBindVariableIndexes()
+    {
+        return null;
+    }
+
+    /**
+     * Return an Iterable over all the functions (both native and user-defined) used by any component of the statement
+     *
+     * @return functions all functions found (may contain duplicates)
+     */
+    default Iterable<Function> getFunctions()
+    {
+        return Collections.emptyList();
+    }
 
     /**
      * Perform any access verification necessary for the statement.
      *
      * @param state the current client state
      */
-    public void checkAccess(ClientState state) throws UnauthorizedException, InvalidRequestException;
+    void authorize(ClientState state);
 
     /**
-     * Perform additional validation required by the statment.
-     * To be overriden by subclasses if needed.
+     * Perform additional validation required by the statment. To be overriden by subclasses if needed.
      *
      * @param state the current client state
      */
-    public void validate(ClientState state) throws RequestValidationException;
+    void validate(ClientState state);
+
+    /**
+     * Performs validation specific to the preparation phase of a CQL statement.
+     * <p>
+     * Unlike {@link #validate(ClientState)}, which is invoked during normal execution,
+     * this method is explicitly triggered only when a statement is being prepared by a client.
+     * By default, this is a no-op. Subclasses can override this to enforce preparation-specific
+     * rules or guardrails (e.g., ensuring prepared statements contain bind markers).
+     *
+     * @param state the current client state
+     */
+    default void validatePrepare(ClientState state) {}
 
     /**
      * Execute the statement and return the resulting result or null if there is no result.
      *
      * @param state the current query state
      * @param options options for this query (consistency, variables, pageSize, ...)
+     * @param requestTime request enqueue / and start times;
      */
-    public ResultMessage execute(QueryState state, QueryOptions options) throws RequestValidationException, RequestExecutionException;
+    ResultMessage execute(QueryState state, QueryOptions options, Dispatcher.RequestTime requestTime);
 
     /**
-     * Variante of execute used for internal query against the system tables, and thus only query the local node.
+     * Variant of execute used for internal query against the system tables, and thus only query the local node.
      *
      * @param state the current query state
      */
-    public ResultMessage executeInternal(QueryState state) throws RequestValidationException, RequestExecutionException;
+    ResultMessage executeLocally(QueryState state, QueryOptions options);
+
+    /**
+     * Provides the context needed for audit logging statements.
+     */
+    AuditLogContext getAuditLogContext();
+
+    /**
+     * Whether this CQL Statement has LWT conditions
+     */
+    default boolean hasConditions()
+    {
+        return false;
+    }
+
+    /**
+     * If this CQL statement is not fully qualified and this method returns true,
+     * then the warning will be emitted to the client if the statement is executed on
+     * a keyspace it was not prepared on.
+     * <p>
+     * A warning is also emitted if a prepare statement is used for other than
+     * modifications statements.
+     *
+     * @return true if this statement is eligible to be a prepared statement, false otherwise.
+     */
+    default boolean eligibleAsPreparedStatement()
+    {
+        return false;
+    }
+
+    abstract class Raw
+    {
+        protected VariableSpecifications bindVariables;
+
+        public void setBindVariables(List<ColumnIdentifier> variables)
+        {
+            bindVariables = new VariableSpecifications(variables);
+        }
+
+        public abstract CQLStatement prepare(ClientState state);
+    }
+
+    interface SingleKeyspaceCqlStatement extends CQLStatement
+    {
+        String keyspace();
+    }
+
+    interface CompositeCQLStatement extends CQLStatement
+    {
+        Iterable<? extends CQLStatement> getStatements();
+    }
+
+    interface ReturningCQLStatement extends CQLStatement
+    {
+        ResultSet.ResultMetadata getResultMetadata();
+    }
 }

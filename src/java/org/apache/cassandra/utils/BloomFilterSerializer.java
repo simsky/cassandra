@@ -17,50 +17,64 @@
  */
 package org.apache.cassandra.utils;
 
-import java.io.DataInput;
-import java.io.DataOutput;
 import java.io.IOException;
 
 import org.apache.cassandra.db.TypeSizes;
-import org.apache.cassandra.io.ISerializer;
+import org.apache.cassandra.io.IGenericSerializer;
+import org.apache.cassandra.io.util.DataInputPlus.DataInputStreamPlus;
+import org.apache.cassandra.io.util.DataOutputStreamPlus;
 import org.apache.cassandra.utils.obs.IBitSet;
 import org.apache.cassandra.utils.obs.OffHeapBitSet;
-import org.apache.cassandra.utils.obs.OpenBitSet;
 
-abstract class BloomFilterSerializer implements ISerializer<BloomFilter>
+public final class BloomFilterSerializer implements IGenericSerializer<BloomFilter, DataInputStreamPlus, DataOutputStreamPlus>
 {
-    public void serialize(BloomFilter bf, DataOutput out) throws IOException
+    public final static BloomFilterSerializer newFormatInstance = new BloomFilterSerializer(false);
+    public final static BloomFilterSerializer oldFormatInstance = new BloomFilterSerializer(true);
+
+    private final boolean oldFormat;
+
+    private <T> BloomFilterSerializer(boolean oldFormat)
     {
+        this.oldFormat = oldFormat;
+    }
+
+    public static BloomFilterSerializer forVersion(boolean oldSerializationFormat)
+    {
+        if (oldSerializationFormat)
+            return oldFormatInstance;
+
+        return newFormatInstance;
+    }
+
+    @Override
+    public void serialize(BloomFilter bf, DataOutputStreamPlus out) throws IOException
+    {
+        assert !oldFormat : "Filter should not be serialized in old format";
         out.writeInt(bf.hashCount);
         bf.bitset.serialize(out);
     }
 
-    public BloomFilter deserialize(DataInput in) throws IOException
-    {
-        return deserialize(in, false);
-    }
-
-    public BloomFilter deserialize(DataInput in, boolean offheap) throws IOException
-    {
-        int hashes = in.readInt();
-        IBitSet bs = offheap ? OffHeapBitSet.deserialize(in) : OpenBitSet.deserialize(in);
-        return createFilter(hashes, bs);
-    }
-
-    protected abstract BloomFilter createFilter(int hashes, IBitSet bs);
-
     /**
      * Calculates a serialized size of the given Bloom Filter
-     * @see BloomFilterSerializer#serialize(BloomFilter, DataOutput)
      *
      * @param bf Bloom filter to calculate serialized size
-     *
      * @return serialized size of the given bloom filter
+     * @see org.apache.cassandra.io.ISerializer#serialize(Object, org.apache.cassandra.io.util.DataOutputPlus)
      */
-    public long serializedSize(BloomFilter bf, TypeSizes typeSizes)
+    @Override
+    public long serializedSize(BloomFilter bf)
     {
-        int size = typeSizes.sizeof(bf.hashCount); // hash count
-        size += bf.bitset.serializedSize(typeSizes);
+        long size = TypeSizes.sizeof(bf.hashCount); // hash count
+        size += bf.bitset.serializedSize();
         return size;
+    }
+
+    @Override
+    public BloomFilter deserialize(DataInputStreamPlus in) throws IOException
+    {
+        int hashes = in.readInt();
+        IBitSet bs = OffHeapBitSet.deserialize(in, oldFormat);
+
+        return new BloomFilter(hashes, bs);
     }
 }

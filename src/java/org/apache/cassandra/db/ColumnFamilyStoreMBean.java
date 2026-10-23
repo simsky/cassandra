@@ -17,9 +17,19 @@
  */
 package org.apache.cassandra.db;
 
+import java.io.IOException;
+import java.util.Collection;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ExecutionException;
+
+import javax.management.openmbean.CompositeData;
+import javax.management.openmbean.OpenDataException;
+
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.utils.BreaksJMX;
 
 /**
  * The MBean interface for ColumnFamilyStore
@@ -29,205 +39,49 @@ public interface ColumnFamilyStoreMBean
     /**
      * @return the name of the column family
      */
+    /** @deprecated See CASSANDRA-9448 */
+    @Deprecated(since = "3.0")
     public String getColumnFamilyName();
 
-    /**
-     * Returns the total amount of data stored in the memtable, including
-     * column related overhead.
-     *
-     * @see org.apache.cassandra.metrics.ColumnFamilyMetrics#memtableDataSize
-     * @return The size in bytes.
-     * @deprecated
-     */
-    @Deprecated
-    public long getMemtableDataSize();
-
-    /**
-     * Returns the total number of columns present in the memtable.
-     *
-     * @see org.apache.cassandra.metrics.ColumnFamilyMetrics#memtableColumnsCount
-     * @return The number of columns.
-     */
-    @Deprecated
-    public long getMemtableColumnsCount();
-
-    /**
-     * Returns the number of times that a flush has resulted in the
-     * memtable being switched out.
-     *
-     * @see org.apache.cassandra.metrics.ColumnFamilyMetrics#memtableSwitchCount
-     * @return the number of memtable switches
-     */
-    @Deprecated
-    public int getMemtableSwitchCount();
-
-    /**
-     * @see org.apache.cassandra.metrics.ColumnFamilyMetrics#recentSSTablesPerRead
-     * @return a histogram of the number of sstable data files accessed per read: reading this property resets it
-     */
-    @Deprecated
-    public long[] getRecentSSTablesPerReadHistogram();
-
-    /**
-     * @see org.apache.cassandra.metrics.ColumnFamilyMetrics#sstablesPerReadHistogram
-     * @return a histogram of the number of sstable data files accessed per read
-     */
-    @Deprecated
-    public long[] getSSTablesPerReadHistogram();
-
-    /**
-     * @see org.apache.cassandra.metrics.ColumnFamilyMetrics#readLatency
-     * @return the number of read operations on this column family
-     */
-    @Deprecated
-    public long getReadCount();
-
-    /**
-     * @see org.apache.cassandra.metrics.ColumnFamilyMetrics#readLatency
-     * @return total read latency (divide by getReadCount() for average)
-     */
-    @Deprecated
-    public long getTotalReadLatencyMicros();
-
-    /**
-     * @see org.apache.cassandra.metrics.ColumnFamilyMetrics#readLatency
-     * @return an array representing the latency histogram
-     */
-    @Deprecated
-    public long[] getLifetimeReadLatencyHistogramMicros();
-
-    /**
-     * @see org.apache.cassandra.metrics.ColumnFamilyMetrics#readLatency
-     * @return an array representing the latency histogram
-     */
-    @Deprecated
-    public long[] getRecentReadLatencyHistogramMicros();
-
-    /**
-     * @see org.apache.cassandra.metrics.ColumnFamilyMetrics#readLatency
-     * @return average latency per read operation since the last call
-     */
-    @Deprecated
-    public double getRecentReadLatencyMicros();
-
-    /**
-     * @see org.apache.cassandra.metrics.ColumnFamilyMetrics#writeLatency
-     * @return the number of write operations on this column family
-     */
-    @Deprecated
-    public long getWriteCount();
-
-    /**
-     * @see org.apache.cassandra.metrics.ColumnFamilyMetrics#writeLatency
-     * @return total write latency (divide by getReadCount() for average)
-     */
-    @Deprecated
-    public long getTotalWriteLatencyMicros();
-
-    /**
-     * @see org.apache.cassandra.metrics.ColumnFamilyMetrics#writeLatency
-     * @return an array representing the latency histogram
-     */
-    @Deprecated
-    public long[] getLifetimeWriteLatencyHistogramMicros();
-
-    /**
-     * @see org.apache.cassandra.metrics.ColumnFamilyMetrics#writeLatency
-     * @return an array representing the latency histogram
-     */
-    @Deprecated
-    public long[] getRecentWriteLatencyHistogramMicros();
-
-    /**
-     * @see org.apache.cassandra.metrics.ColumnFamilyMetrics#writeLatency
-     * @return average latency per write operation since the last call
-     */
-    @Deprecated
-    public double getRecentWriteLatencyMicros();
-
-    /**
-     * @see org.apache.cassandra.metrics.ColumnFamilyMetrics#pendingTasks
-     * @return the estimated number of tasks pending for this column family
-     */
-    @Deprecated
-    public int getPendingTasks();
-
-    /**
-     * @see org.apache.cassandra.metrics.ColumnFamilyMetrics#liveSSTableCount
-     * @return the number of SSTables on disk for this CF
-     */
-    @Deprecated
-    public int getLiveSSTableCount();
-
-    /**
-     * @see org.apache.cassandra.metrics.ColumnFamilyMetrics#liveDiskSpaceUsed
-     * @return disk space used by SSTables belonging to this CF
-     */
-    @Deprecated
-    public long getLiveDiskSpaceUsed();
-
-    /**
-     * @see org.apache.cassandra.metrics.ColumnFamilyMetrics#totalDiskSpaceUsed
-     * @return total disk space used by SSTables belonging to this CF, including obsolete ones waiting to be GC'd
-     */
-    @Deprecated
-    public long getTotalDiskSpaceUsed();
+    public String getTableName();
 
     /**
      * force a major compaction of this column family
+     *
+     * @param splitOutput true if the output of the major compaction should be split in several sstables
      */
-    public void forceMajorCompaction() throws ExecutionException, InterruptedException;
+    public void forceMajorCompaction(boolean splitOutput) throws ExecutionException, InterruptedException;
 
     /**
-     * @see org.apache.cassandra.metrics.ColumnFamilyMetrics#minRowSize
-     * @return the size of the smallest compacted row
+     * force a major compaction of this column family
+     *
+     * @param permittedParallelism The maximum number of compaction threads that can be used by the operation.
+     *                             If 0, the operation can use all available threads.
+     *                             If <0, the default parallelism will be used.
      */
-    @Deprecated
-    public long getMinRowSize();
+    public void forceMajorCompaction(int permittedParallelism) throws ExecutionException, InterruptedException;
 
     /**
-     * @see org.apache.cassandra.metrics.ColumnFamilyMetrics#maxRowSize
-     * @return the size of the largest compacted row
+     * Forces a major compaction of specified token ranges in this column family.
+     * <p>
+     * The token ranges will be interpreted as closed intervals to match the closed interval defined by the first and
+     * last keys of a sstable, even though the {@link Range} class is suppossed to be half-open by definition.
+     *
+     * @param tokenRanges The token ranges to be compacted, interpreted as closed intervals.
+     *
+     * @deprecated See CASSANDRA-17527
      */
-    @Deprecated
-    public long getMaxRowSize();
+    @BreaksJMX("This API was released in 3.10 using a parameter that takes Range of Token, which can only be done IFF client has Cassandra binaries in the classpath")
+    @Deprecated(since = "4.1")
+    public void forceCompactionForTokenRange(Collection<Range<Token>> tokenRanges) throws ExecutionException, InterruptedException;
 
     /**
-     * @see org.apache.cassandra.metrics.ColumnFamilyMetrics#meanRowSize
-     * @return the size of the smallest compacted row
+     * Forces a major compaction of specified token ranges in this column family.
+     * <p>
+     * The token ranges will be interpreted as closed intervals to match the closed interval defined by the first and
+     * last keys of a sstable, even though the {@link Range} class is suppossed to be half-open by definition.
      */
-    @Deprecated
-    public long getMeanRowSize();
-
-    /**
-     * @see org.apache.cassandra.metrics.ColumnFamilyMetrics#bloomFilterFalsePositives
-     */
-    @Deprecated
-    public long getBloomFilterFalsePositives();
-
-    /**
-     * @see org.apache.cassandra.metrics.ColumnFamilyMetrics#recentBloomFilterFalsePositives
-     */
-    @Deprecated
-    public long getRecentBloomFilterFalsePositives();
-
-    /**
-     * @see org.apache.cassandra.metrics.ColumnFamilyMetrics#bloomFilterFalseRatio
-     */
-    @Deprecated
-    public double getBloomFilterFalseRatio();
-
-    /**
-     * @see org.apache.cassandra.metrics.ColumnFamilyMetrics#recentBloomFilterFalseRatio
-     */
-    @Deprecated
-    public double getRecentBloomFilterFalseRatio();
-
-    /**
-     * @see org.apache.cassandra.metrics.ColumnFamilyMetrics#bloomFilterDiskSpaceUsed
-     */
-    @Deprecated
-    public long getBloomFilterDiskSpaceUsed();
+    public void forceCompactionForTokenRanges(String... tokenRanges);
 
     /**
      * Gets the minimum number of sstables in queue before compaction kicks off
@@ -255,26 +109,38 @@ public interface ColumnFamilyStoreMBean
     public void setMaximumCompactionThreshold(int threshold);
 
     /**
-     * Sets the compaction strategy by class name
-     * @param className the name of the compaction strategy class
+     * Sets the compaction parameters locally for this node
+     *
+     * Note that this will be set until an ALTER with compaction = {..} is executed or the node is restarted
+     *
+     * @param options compaction options with the same syntax as when doing ALTER ... WITH compaction = {..}
      */
-    public void setCompactionStrategyClass(String className);
+    public void setCompactionParametersJson(String options);
+    public String getCompactionParametersJson();
 
     /**
-     * Gets the compaction strategy class name
+     * Sets the compaction parameters locally for this node
+     *
+     * Note that this will be set until an ALTER with compaction = {..} is executed or the node is restarted
+     *
+     * @param options compaction options map
      */
-    public String getCompactionStrategyClass();
+    public void setCompactionParameters(Map<String, String> options);
+    public Map<String, String> getCompactionParameters();
 
     /**
      * Get the compression parameters
      */
     public Map<String,String> getCompressionParameters();
 
+    public String getCompressionParametersJson();
+
     /**
-     * Set the compression parameters
+     * Set the compression parameters locally for this node
      * @param opts map of string names to values
      */
     public void setCompressionParameters(Map<String,String> opts);
+    public void setCompressionParametersJson(String options);
 
     /**
      * Set new crc check chance
@@ -283,31 +149,8 @@ public interface ColumnFamilyStoreMBean
 
     public boolean isAutoCompactionDisabled();
 
-    /** Number of tombstoned cells retreived during the last slicequery */
-    @Deprecated
-    public double getTombstonesPerSlice();
-
-    /** Number of live cells retreived during the last slicequery */
-    @Deprecated
-    public double getLiveCellsPerSlice();
-
     public long estimateKeys();
 
-    /**
-     * @see org.apache.cassandra.metrics.ColumnFamilyMetrics#estimatedRowSizeHistogram
-     */
-    @Deprecated
-    public long[] getEstimatedRowSizeHistogram();
-    /**
-     * @see org.apache.cassandra.metrics.ColumnFamilyMetrics#estimatedColumnCountHistogram
-     */
-    @Deprecated
-    public long[] getEstimatedColumnCountHistogram();
-    /**
-     * @see org.apache.cassandra.metrics.ColumnFamilyMetrics#compressionRatio
-     */
-    @Deprecated
-    public double getCompressionRatio();
 
     /**
      * Returns a list of the names of the built column indexes for current store
@@ -323,11 +166,100 @@ public interface ColumnFamilyStoreMBean
     public List<String> getSSTablesForKey(String key);
 
     /**
-     * Scan through Keyspace/ColumnFamily's data directory
-     * determine which SSTables should be loaded and load them
+     * Returns a list of filenames that contain the given key on this node
+     * @param key
+     * @param hexFormat if key is in hex string format
+     * @return list of filenames containing the key
      */
-    public void loadNewSSTables();
+    public List<String> getSSTablesForKey(String key, boolean hexFormat);
 
+    /**
+     * Returns a list of filenames that contain the given key and which level they belong to.
+     * Requires table to be compacted with {@link org.apache.cassandra.db.compaction.LeveledCompactionStrategy}
+     * @param key
+     * @param hexFormat
+     * @return list of filenames and levels containing the key
+     */
+    public Map<Integer, Set<String>> getSSTablesForKeyWithLevel(String key, boolean hexFormat);
+
+    /**
+     * Load new sstables from the given directory
+     *
+     * @param srcPaths the path to the new sstables - if it is an empty set, the data directories will be scanned
+     * @param resetLevel if the level should be reset to 0 on the new sstables
+     * @param clearRepaired if repaired info should be wiped from the new sstables
+     * @param verifySSTables if the new sstables should be verified that they are not corrupt
+     * @param verifyTokens if the tokens in the new sstables should be verified that they are owned by the current node
+     * @param invalidateCaches if row cache should be invalidated for the keys in the new sstables
+     * @param extendedVerify if we should run an extended verify checking all values in the new sstables
+     *
+     * @return list of failed import directories
+     */
+    /** @deprecated See CASSANDRA-16407 */
+    @Deprecated(since = "4.0")
+    public List<String> importNewSSTables(Set<String> srcPaths,
+                                          boolean resetLevel,
+                                          boolean clearRepaired,
+                                          boolean verifySSTables,
+                                          boolean verifyTokens,
+                                          boolean invalidateCaches,
+                                          boolean extendedVerify);
+
+    /**
+     * Load new sstables from the given directory
+     *
+     * @param srcPaths the path to the new sstables - if it is an empty set, the data directories will be scanned
+     * @param resetLevel if the level should be reset to 0 on the new sstables
+     * @param clearRepaired if repaired info should be wiped from the new sstables
+     * @param verifySSTables if the new sstables should be verified that they are not corrupt
+     * @param verifyTokens if the tokens in the new sstables should be verified that they are owned by the current node
+     * @param invalidateCaches if row cache should be invalidated for the keys in the new sstables
+     * @param extendedVerify if we should run an extended verify checking all values in the new sstables
+     * @param copyData if we should copy data from source paths instead of moving them
+     *
+     * @return list of failed import directories
+     */
+    /** @deprecated See CASSANDRA-18714 */
+    @Deprecated(since = "5.0")
+    public List<String> importNewSSTables(Set<String> srcPaths,
+                                          boolean resetLevel,
+                                          boolean clearRepaired,
+                                          boolean verifySSTables,
+                                          boolean verifyTokens,
+                                          boolean invalidateCaches,
+                                          boolean extendedVerify,
+                                          boolean copyData);
+
+    /**
+     * Load new sstables from the given directory
+     *
+     * @param srcPaths the path to the new sstables - if it is an empty set, the data directories will be scanned
+     * @param resetLevel if the level should be reset to 0 on the new sstables
+     * @param clearRepaired if repaired info should be wiped from the new sstables
+     * @param verifySSTables if the new sstables should be verified that they are not corrupt
+     * @param verifyTokens if the tokens in the new sstables should be verified that they are owned by the current node
+     * @param invalidateCaches if row cache should be invalidated for the keys in the new sstables
+     * @param extendedVerify if we should run an extended verify checking all values in the new sstables
+     * @param copyData if we should copy data from source paths instead of moving them
+     * @param validateIndexChecksum if we should also validate checksum for SAI indexes
+     * @param failOnMissingIndex if loading should fail when SSTables do not contain built SAI indexes too
+     *
+     * @return list of failed import directories
+     */
+    public List<String> importNewSSTables(Set<String> srcPaths,
+                                          boolean resetLevel,
+                                          boolean clearRepaired,
+                                          boolean verifySSTables,
+                                          boolean verifyTokens,
+                                          boolean invalidateCaches,
+                                          boolean extendedVerify,
+                                          boolean copyData,
+                                          boolean failOnMissingIndex,
+                                          boolean validateIndexChecksum);
+
+    /** @deprecated See CASSANDRA-6719 */
+    @Deprecated(since = "4.0")
+    public void loadNewSSTables();
     /**
      * @return the number of SSTables in L0.  Always return 0 if Leveled compaction is not enabled.
      */
@@ -340,6 +272,70 @@ public interface ColumnFamilyStoreMBean
     public int[] getSSTableCountPerLevel();
 
     /**
+     * @return total size on disk for each level. null unless leveled compaction is used.
+     *         array index corresponds to level(int[0] is for level 0, ...).
+     */
+    public long[] getPerLevelSizeBytes();
+
+    /**
+     * @return average of sstable covered token spaces in each level.
+     *         null unless unified compaction strategy is used.
+     *         array index corresponds to level(int[0] is for level 0, ...).
+     */
+    public double[] getPerLevelAvgTokenSpace();
+
+    /**
+     * @return the maximum density each level is allowed to hold.
+     *         null unless unified compaction strategy is used.
+     *         array index corresponds to level(int[0] is for level 0, ...).
+     */
+    public double[] getPerLevelMaxDensityThreshold();
+
+    /**
+     * @return the average size of sstables in each level.
+     *         null unless unified compaction strategy is used.
+     *         array index corresponds to level(int[0] is for level 0, ...).
+     */
+    public double[] getPerLevelAvgSize();
+
+    /**
+     * @return the average density of sstables in each level.
+     *         null unless unified compaction strategy is used.
+     *         array index corresponds to level(int[0] is for level 0, ...).
+     */
+    public double[] getPerLevelAvgDensity();
+
+    /**
+     * @return the ratio of avg density to the maximum density threshold of that level
+     *         in each level. null unless unified compaction strategy is used.
+     *         array index corresponds to level(int[0] is for level 0, ...).
+     */
+    public double[] getPerLevelAvgDensityMaxDensityThresholdRatio();
+
+    /**
+     * @return the ratio of maximum density to the maximum density threshold of that level
+     *         in each level. null unless unified compaction strategy is used.
+     *         array index corresponds to level(int[0] is for level 0, ...).
+     */
+    public double[] getPerLevelMaxDensityMaxDensityThresholdRatio();
+
+    /**
+     * @return true if the table is using LeveledCompactionStrategy. false otherwise.
+     */
+    public boolean isLeveledCompaction();
+
+    /**
+     * @return sstable count for each bucket in TWCS. null unless time window compaction is used.
+     *         array index corresponds to bucket(int[0] is for most recent, ...).
+     */
+    public int[] getSSTableCountPerTWCSBucket();
+
+    /**
+     * @return sstable fanout size for level compaction strategy.
+     */
+    public int getLevelFanoutSize();
+
+    /**
      * Get the ratio of droppable tombstones to real columns (and non-droppable tombstones)
      * @return ratio
      */
@@ -349,4 +345,62 @@ public interface ColumnFamilyStoreMBean
      * @return the size of SSTables in "snapshots" subdirectory which aren't live anymore
      */
     public long trueSnapshotsSize();
+
+    /**
+     * begin sampling for a specific sampler with a given capacity.  The cardinality may
+     * be larger than the capacity, but depending on the use case it may affect its accuracy
+     */
+    public void beginLocalSampling(String sampler, int capacity, int durationMillis);
+
+    /**
+     * @return top <i>count</i> items for the sampler since beginLocalSampling was called
+     */
+    public List<CompositeData> finishLocalSampling(String sampler, int count) throws OpenDataException;
+
+    /*
+        Is Compaction space check enabled
+     */
+    public boolean isCompactionDiskSpaceCheckEnabled();
+
+    /*
+       Enable/Disable compaction space check
+     */
+    public void compactionDiskSpaceCheck(boolean enable);
+
+    public void setNeverPurgeTombstones(boolean value);
+
+    public boolean getNeverPurgeTombstones();
+
+    /**
+     * Check SSTables whether or not they are misplaced.
+     * @return true if any of the SSTables is misplaced.
+     *         If all SSTables are correctly placed or the partitioner does not support splitting, it returns false.
+     */
+    public boolean hasMisplacedSSTables();
+
+    public List<String> getDataPaths() throws IOException;
+
+    public Map<String, Long> getTopSizePartitions();
+    public Long getTopSizePartitionsLastUpdate();
+    public Map<String, Long> getTopTombstonePartitions();
+    public Long getTopTombstonePartitionsLastUpdate();
+
+    /**
+     * Returns the size of the biggest SSTable of this table.
+     *
+     * @return (physical) size of the biggest SSTable of this table on disk or 0 if no SSTable is present
+     */
+    public long getMaxSSTableSize();
+
+    /**
+     * Returns the longest duration of an SSTable, in milliseconds, of this table,
+     * computed as {@code maxTimestamp - minTimestamp}.
+     *
+     * It returns 0 if there are no SSTables or if {@code maxTimestamp} or {@code minTimestamp} is
+     * equal to {@code Long.MAX_VALUE}. Effectively non-zero for tables on {@code TimeWindowCompactionStrategy}.
+     *
+     * @return the biggest {@code maxTimestamp - minTimestamp} among all SSTables of this table
+     * or 0 if no SSTable is present
+     */
+    public long getMaxSSTableDuration();
 }

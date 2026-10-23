@@ -20,8 +20,8 @@ package org.apache.cassandra.db.marshal;
 
 import org.junit.Test;
 
-import static org.apache.cassandra.utils.ByteBufferUtil.bytes;
 import static org.apache.cassandra.utils.ByteBufferUtil.EMPTY_BYTE_BUFFER;
+import static org.apache.cassandra.utils.ByteBufferUtil.bytes;
 
 public class ReversedTypeTest
 {
@@ -34,7 +34,7 @@ public class ReversedTypeTest
         assert t.compare(bytes(4L), bytes(2L)) < 0;
 
         // the empty byte buffer is always the smaller
-        assert t.compare(EMPTY_BYTE_BUFFER, bytes(2L)) < 0;
-        assert t.compare(bytes(2L), EMPTY_BYTE_BUFFER) > 0;
+        assert t.compare(EMPTY_BYTE_BUFFER, bytes(2L)) > 0;
+        assert t.compare(bytes(2L), EMPTY_BYTE_BUFFER) < 0;
     }
 }

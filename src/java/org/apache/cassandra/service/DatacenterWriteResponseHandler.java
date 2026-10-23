@@ -17,41 +17,52 @@
  */
 package org.apache.cassandra.service;
 
-import java.net.InetAddress;
-import java.util.Collection;
+import java.util.function.Predicate;
+import java.util.function.Supplier;
 
-import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.db.Keyspace;
-import org.apache.cassandra.locator.IEndpointSnitch;
-import org.apache.cassandra.net.MessageIn;
-import org.apache.cassandra.db.ConsistencyLevel;
+import org.apache.cassandra.db.Mutation;
 import org.apache.cassandra.db.WriteType;
+import org.apache.cassandra.locator.InOurDc;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.locator.ReplicaPlan;
+import org.apache.cassandra.net.Message;
+import org.apache.cassandra.transport.Dispatcher;
 
 /**
  * This class blocks for a quorum of responses _in the local datacenter only_ (CL.LOCAL_QUORUM).
  */
-public class DatacenterWriteResponseHandler extends WriteResponseHandler
+public class DatacenterWriteResponseHandler<T> extends WriteResponseHandler<T>
 {
-    private static final IEndpointSnitch snitch = DatabaseDescriptor.getEndpointSnitch();
+    private final Predicate<InetAddressAndPort> waitingFor = InOurDc.endpoints();
 
-    public DatacenterWriteResponseHandler(Collection<InetAddress> naturalEndpoints,
-                                          Collection<InetAddress> pendingEndpoints,
-                                          ConsistencyLevel consistencyLevel,
-                                          Keyspace keyspace,
+    public DatacenterWriteResponseHandler(ReplicaPlan.ForWrite replicaPlan,
                                           Runnable callback,
-                                          WriteType writeType)
+                                          WriteType writeType,
+                                          Supplier<Mutation> hintOnFailure,
+                                          Dispatcher.RequestTime requestTime)
     {
-        super(naturalEndpoints, pendingEndpoints, consistencyLevel, keyspace, callback, writeType);
-        assert consistencyLevel.isDatacenterLocal();
+        super(replicaPlan, callback, writeType, hintOnFailure, requestTime);
+        assert replicaPlan.consistencyLevel().isDatacenterLocal();
     }
 
     @Override
-    public void response(MessageIn message)
+    public void onResponse(Message<T> message)
     {
-        if (message == null || DatabaseDescriptor.getLocalDataCenter().equals(snitch.getDatacenter(message.from)))
+        if (message == null || waitingFor(message.from()))
         {
-            if (responses.decrementAndGet() == 0)
-                signal();
+            super.onResponse(message);
         }
+        else
+        {
+            //WriteResponseHandler.response will call logResonseToIdealCLDelegate so only do it if not calling WriteResponseHandler.response.
+            //Must be last after all subclass processing
+            logResponseToIdealCLDelegate(message);
+        }
+    }
+
+    @Override
+    protected boolean waitingFor(InetAddressAndPort from)
+    {
+        return waitingFor.test(from);
     }
 }

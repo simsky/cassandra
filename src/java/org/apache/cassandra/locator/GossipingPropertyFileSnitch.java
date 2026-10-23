@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -18,115 +18,40 @@
 
 package org.apache.cassandra.locator;
 
-import java.net.InetAddress;
-import java.util.Map;
-
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-import org.apache.cassandra.db.SystemKeyspace;
 import org.apache.cassandra.exceptions.ConfigurationException;
-import org.apache.cassandra.gms.ApplicationState;
-import org.apache.cassandra.gms.EndpointState;
-import org.apache.cassandra.gms.Gossiper;
-import org.apache.cassandra.utils.FBUtilities;
-import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.tcm.membership.Location;
 
-
-public class GossipingPropertyFileSnitch extends AbstractNetworkTopologySnitch// implements IEndpointStateChangeSubscriber
+/**
+ * @deprecated See CASSANDRA-19488
+ */
+@Deprecated(since = "CEP-21")
+public class GossipingPropertyFileSnitch extends AbstractNetworkTopologySnitch
 {
-    private static final Logger logger = LoggerFactory.getLogger(GossipingPropertyFileSnitch.class);
-
-    private PropertyFileSnitch psnitch;
-    private String myDC;
-    private String myRack;
-    private Map<InetAddress, Map<String, String>> savedEndpoints;
-    private String DEFAULT_DC = "UNKNOWN_DC";
-    private String DEFAULT_RACK = "UNKNOWN_RACK";
-    private final boolean preferLocal;
+    private final Location fromConfig;
+    public final boolean preferLocal;
 
     public GossipingPropertyFileSnitch() throws ConfigurationException
     {
-        myDC = SnitchProperties.get("dc", null);
-        myRack = SnitchProperties.get("rack", null);
-        if (myDC == null || myRack == null)
-            throw new ConfigurationException("DC or rack not found in snitch properties, check your configuration in: " + SnitchProperties.RACKDC_PROPERTY_FILENAME);
-
-        myDC = myDC.trim();
-        myRack = myRack.trim();
-        preferLocal = Boolean.parseBoolean(SnitchProperties.get("prefer_local", "false"));
-        try
-        {
-            psnitch = new PropertyFileSnitch();
-            logger.info("Loaded {} for compatibility", PropertyFileSnitch.SNITCH_PROPERTIES_FILENAME);
-        }
-        catch (ConfigurationException e)
-        {
-            logger.info("Unable to load {}; compatibility mode disabled", PropertyFileSnitch.SNITCH_PROPERTIES_FILENAME);
-        }
+        SnitchProperties properties = RackDCFileLocationProvider.loadConfiguration();
+        fromConfig = new RackDCFileLocationProvider(properties).initialLocation();
+        preferLocal = Boolean.parseBoolean(properties.get("prefer_local", "false"));
     }
 
-    /**
-     * Return the data center for which an endpoint resides in
-     *
-     * @param endpoint the endpoint to process
-     * @return string of data center
-     */
-    public String getDatacenter(InetAddress endpoint)
+    @Override
+    public String getLocalRack()
     {
-        if (endpoint.equals(FBUtilities.getBroadcastAddress()))
-            return myDC;
-
-        EndpointState epState = Gossiper.instance.getEndpointStateForEndpoint(endpoint);
-        if (epState == null || epState.getApplicationState(ApplicationState.DC) == null)
-        {
-            if (psnitch == null)
-            {
-                if (savedEndpoints == null)
-                    savedEndpoints = SystemKeyspace.loadDcRackInfo();
-                if (savedEndpoints.containsKey(endpoint))
-                    return savedEndpoints.get(endpoint).get("data_center");
-                return DEFAULT_DC;
-            }
-            else
-                return psnitch.getDatacenter(endpoint);
-        }
-        return epState.getApplicationState(ApplicationState.DC).value;
+        return fromConfig.rack;
     }
 
-    /**
-     * Return the rack for which an endpoint resides in
-     *
-     * @param endpoint the endpoint to process
-     * @return string of rack
-     */
-    public String getRack(InetAddress endpoint)
+    @Override
+    public String getLocalDatacenter()
     {
-        if (endpoint.equals(FBUtilities.getBroadcastAddress()))
-            return myRack;
-
-        EndpointState epState = Gossiper.instance.getEndpointStateForEndpoint(endpoint);
-        if (epState == null || epState.getApplicationState(ApplicationState.RACK) == null)
-        {
-            if (psnitch == null)
-            {
-                if (savedEndpoints == null)
-                    savedEndpoints = SystemKeyspace.loadDcRackInfo();
-                if (savedEndpoints.containsKey(endpoint))
-                    return savedEndpoints.get(endpoint).get("rack");
-                return DEFAULT_RACK;
-            }
-            else
-                return psnitch.getRack(endpoint);
-        }
-        return epState.getApplicationState(ApplicationState.RACK).value;
+        return fromConfig.datacenter;
     }
 
-    public void gossiperStarting()
+    @Override
+    public boolean preferLocalConnections()
     {
-        super.gossiperStarting();
-        Gossiper.instance.addLocalApplicationState(ApplicationState.INTERNAL_IP,
-                                                   StorageService.instance.valueFactory.internalIP(FBUtilities.getLocalAddress().getHostAddress()));
-        Gossiper.instance.register(new ReconnectableSnitchHelper(this, myDC, preferLocal));
+        return preferLocal;
     }
 }

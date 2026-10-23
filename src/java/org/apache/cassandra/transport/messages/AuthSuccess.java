@@ -17,11 +17,13 @@
  */
 package org.apache.cassandra.transport.messages;
 
+import java.nio.ByteBuffer;
+
 import org.apache.cassandra.transport.CBUtil;
 import org.apache.cassandra.transport.Message;
-import org.jboss.netty.buffer.ChannelBuffer;
+import org.apache.cassandra.transport.ProtocolVersion;
 
-import java.nio.ByteBuffer;
+import io.netty.buffer.ByteBuf;
 
 /**
  * Indicates to the client that authentication has succeeded.
@@ -33,20 +35,24 @@ public class AuthSuccess extends Message.Response
 {
     public static final Message.Codec<AuthSuccess> codec = new Message.Codec<AuthSuccess>()
     {
-        public AuthSuccess decode(ChannelBuffer body, int version)
+        public AuthSuccess decode(ByteBuf body, ProtocolVersion version)
         {
             ByteBuffer b = CBUtil.readValue(body);
-            byte[] token = new byte[b.remaining()];
-            b.get(token);
+            byte[] token = null;
+            if (b != null)
+            {
+                token = new byte[b.remaining()];
+                b.get(token);
+            }
             return new AuthSuccess(token);
         }
 
-        public void encode(AuthSuccess success, ChannelBuffer dest, int version)
+        public void encode(AuthSuccess success, ByteBuf dest, ProtocolVersion version)
         {
             CBUtil.writeValue(success.token, dest);
         }
 
-        public int encodedSize(AuthSuccess success, int version)
+        public int encodedSize(AuthSuccess success, ProtocolVersion version)
         {
             return CBUtil.sizeOfValue(success.token);
         }

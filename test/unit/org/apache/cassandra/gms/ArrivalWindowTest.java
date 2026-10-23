@@ -21,23 +21,34 @@ package org.apache.cassandra.gms;
  */
 
 
-import static org.junit.Assert.*;
-
+import org.junit.BeforeClass;
 import org.junit.Test;
+
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.utils.FBUtilities;
+
+import static org.junit.Assert.assertEquals;
 
 public class ArrivalWindowTest
 {
+    @BeforeClass
+    public static void beforeClass()
+    {
+        DatabaseDescriptor.setDefaultFailureDetector();
+    }
+
     @Test
     public void testWithNanoTime()
     {
         final ArrivalWindow windowWithNano = new ArrivalWindow(4);
         final long toNano = 1000000L;
-
-        windowWithNano.add(111 * toNano);
-        windowWithNano.add(222 * toNano);
-        windowWithNano.add(333 * toNano);
-        windowWithNano.add(444 * toNano);
-        windowWithNano.add(555 * toNano);
+        InetAddressAndPort ep = FBUtilities.getLocalAddressAndPort();
+        windowWithNano.add(111 * toNano, ep);
+        windowWithNano.add(222 * toNano, ep);
+        windowWithNano.add(333 * toNano, ep);
+        windowWithNano.add(444 * toNano, ep);
+        windowWithNano.add(555 * toNano, ep);
 
         //all good
         assertEquals(1.0, windowWithNano.phi(666 * toNano), 0.01);

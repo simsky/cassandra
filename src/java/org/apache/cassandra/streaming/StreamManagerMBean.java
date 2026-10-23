@@ -18,6 +18,7 @@
 package org.apache.cassandra.streaming;
 
 import java.util.Set;
+
 import javax.management.NotificationEmitter;
 import javax.management.openmbean.CompositeData;
 
@@ -29,4 +30,24 @@ public interface StreamManagerMBean extends NotificationEmitter
      * Returns the current state of all ongoing streams.
      */
     Set<CompositeData> getCurrentStreams();
+
+    /**
+     * @return whether the streaming virtual table should collect stats while streaming is running
+     */
+    boolean getStreamingStatsEnabled();
+
+    /**
+     * enable/disable collection of streaming stats while streaming is running.
+     */
+    void setStreamingStatsEnabled(boolean streamingStatsEnabled);
+
+    /**
+     * @return current timeout for streaming slow events log
+     */
+    String getStreamingSlowEventsLogTimeout();
+
+    /**
+     * Sets the timeout for the streaming slow events log
+     */
+    void setStreamingSlowEventsLogTimeout(String value);
 }

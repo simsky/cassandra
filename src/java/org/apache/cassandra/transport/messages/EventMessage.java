@@ -17,28 +17,31 @@
  */
 package org.apache.cassandra.transport.messages;
 
-import org.jboss.netty.buffer.ChannelBuffer;
-
 import org.apache.cassandra.transport.Event;
 import org.apache.cassandra.transport.Message;
+import org.apache.cassandra.transport.ProtocolVersion;
+
+import io.netty.buffer.ByteBuf;
 
 public class EventMessage extends Message.Response
 {
+    public static final int EVENT_MESSAGE_STREAM_ID = -1;
+
     public static final Message.Codec<EventMessage> codec = new Message.Codec<EventMessage>()
     {
-        public EventMessage decode(ChannelBuffer body, int version)
+        public EventMessage decode(ByteBuf body, ProtocolVersion version)
         {
-            return new EventMessage(Event.deserialize(body));
+            return new EventMessage(Event.deserialize(body, version));
         }
 
-        public void encode(EventMessage msg, ChannelBuffer dest, int version)
+        public void encode(EventMessage msg, ByteBuf dest, ProtocolVersion version)
         {
-            msg.event.serialize(dest);
+            msg.event.serialize(dest, version);
         }
 
-        public int encodedSize(EventMessage msg, int version)
+        public int encodedSize(EventMessage msg, ProtocolVersion version)
         {
-            return msg.event.serializedSize();
+            return msg.event.serializedSize(version);
         }
     };
 
@@ -48,7 +51,6 @@ public class EventMessage extends Message.Response
     {
         super(Message.Type.EVENT);
         this.event = event;
-        this.setStreamId(-1);
     }
 
     @Override

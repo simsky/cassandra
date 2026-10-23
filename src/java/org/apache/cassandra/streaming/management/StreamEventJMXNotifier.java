@@ -18,10 +18,17 @@
 package org.apache.cassandra.streaming.management;
 
 import java.util.concurrent.atomic.AtomicLong;
+
 import javax.management.Notification;
 import javax.management.NotificationBroadcasterSupport;
 
-import org.apache.cassandra.streaming.*;
+import org.apache.cassandra.streaming.ProgressInfo;
+import org.apache.cassandra.streaming.StreamEvent;
+import org.apache.cassandra.streaming.StreamEventHandler;
+import org.apache.cassandra.streaming.StreamManagerMBean;
+import org.apache.cassandra.streaming.StreamState;
+
+import static org.apache.cassandra.utils.Clock.Global.currentTimeMillis;
 
 /**
  */
@@ -37,7 +44,8 @@ public class StreamEventJMXNotifier extends NotificationBroadcasterSupport imple
     public void handleStreamEvent(StreamEvent event)
     {
         Notification notif = null;
-        switch (event.eventType) {
+        switch (event.eventType)
+        {
             case STREAM_PREPARED:
                 notif = new Notification(StreamEvent.SessionPreparedEvent.class.getCanonicalName(),
                                                 StreamManagerMBean.OBJECT_NAME,
@@ -52,15 +60,17 @@ public class StreamEventJMXNotifier extends NotificationBroadcasterSupport imple
                 break;
             case FILE_PROGRESS:
                 ProgressInfo progress = ((StreamEvent.ProgressEvent) event).progress;
-                long current = System.currentTimeMillis();
+                long current = currentTimeMillis();
                 if (current - progressLastSent >= PROGRESS_NOTIFICATION_INTERVAL || progress.isCompleted())
                 {
                     notif = new Notification(StreamEvent.ProgressEvent.class.getCanonicalName(),
                                              StreamManagerMBean.OBJECT_NAME,
                                              seq.getAndIncrement());
                     notif.setUserData(ProgressInfoCompositeData.toCompositeData(event.planId, progress));
-                    progressLastSent = System.currentTimeMillis();
-                } else {
+                    progressLastSent = currentTimeMillis();
+                }
+                else
+                {
                     return;
                 }
                 break;
@@ -82,7 +92,7 @@ public class StreamEventJMXNotifier extends NotificationBroadcasterSupport imple
         Notification notif = new Notification(StreamEvent.class.getCanonicalName() + ".failure",
                                               StreamManagerMBean.OBJECT_NAME,
                                               seq.getAndIncrement());
-        notif.setUserData(t.fillInStackTrace().toString());
+        notif.setUserData(t.toString());
         sendNotification(notif);
     }
 }

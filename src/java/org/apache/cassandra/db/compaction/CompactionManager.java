@@ -17,107 +17,227 @@
  */
 package org.apache.cassandra.db.compaction;
 
-import java.io.File;
 import java.io.IOException;
-import java.lang.management.ManagementFactory;
-import java.util.*;
-import java.util.concurrent.*;
-import javax.management.MBeanServer;
-import javax.management.ObjectName;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BooleanSupplier;
+import java.util.function.Predicate;
+import java.util.function.Supplier;
+import java.util.stream.Collectors;
+
 import javax.management.openmbean.OpenDataException;
 import javax.management.openmbean.TabularData;
 
-import com.google.common.base.Throwables;
-import com.google.common.collect.*;
+import com.codahale.metrics.Meter;
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Preconditions;
+import com.google.common.base.Predicates;
+import com.google.common.collect.Collections2;
+import com.google.common.collect.ConcurrentHashMultiset;
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.Iterables;
+import com.google.common.collect.Lists;
+import com.google.common.collect.Maps;
+import com.google.common.collect.Multimap;
+import com.google.common.collect.Multiset;
+import com.google.common.collect.Sets;
 import com.google.common.util.concurrent.RateLimiter;
+import com.google.common.util.concurrent.Uninterruptibles;
+
+import net.openhft.chronicle.core.util.ThrowingSupplier;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.cache.AutoSavingCache;
-import org.apache.cassandra.concurrent.DebuggableThreadPoolExecutor;
-import org.apache.cassandra.concurrent.NamedThreadFactory;
-import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.concurrent.ExecutorFactory;
+import org.apache.cassandra.concurrent.WrappedExecutorPlus;
 import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.config.Schema;
-import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.Directories;
+import org.apache.cassandra.db.DiskBoundaries;
+import org.apache.cassandra.db.Keyspace;
+import org.apache.cassandra.db.SerializationHeader;
+import org.apache.cassandra.db.SystemKeyspace;
 import org.apache.cassandra.db.compaction.CompactionInfo.Holder;
-import org.apache.cassandra.db.index.SecondaryIndexBuilder;
-import org.apache.cassandra.dht.Bounds;
+import org.apache.cassandra.db.lifecycle.ILifecycleTransaction;
+import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
+import org.apache.cassandra.db.lifecycle.SSTableIntervalTree;
+import org.apache.cassandra.db.lifecycle.SSTableSet;
+import org.apache.cassandra.db.lifecycle.View;
+import org.apache.cassandra.db.lifecycle.WrappedLifecycleTransaction;
+import org.apache.cassandra.db.rows.UnfilteredRowIterator;
+import org.apache.cassandra.db.view.ViewBuilderTask;
+import org.apache.cassandra.dht.AbstractBounds;
+import org.apache.cassandra.dht.IPartitioner;
+import org.apache.cassandra.dht.LocalPartitioner;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
-import org.apache.cassandra.io.sstable.*;
+import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.index.SecondaryIndexBuilder;
+import org.apache.cassandra.index.sai.StorageAttachedIndexGroup;
+import org.apache.cassandra.io.sstable.Descriptor;
+import org.apache.cassandra.io.sstable.ISSTableScanner;
+import org.apache.cassandra.io.sstable.IScrubber;
+import org.apache.cassandra.io.sstable.IVerifier;
+import org.apache.cassandra.io.sstable.SSTableRewriter;
+import org.apache.cassandra.io.sstable.format.SSTableFormat;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.io.sstable.format.SSTableWriter;
+import org.apache.cassandra.io.sstable.metadata.MetadataCollector;
+import org.apache.cassandra.io.sstable.metadata.StatsMetadata;
+import org.apache.cassandra.io.util.File;
 import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.locator.MetaStrategy;
+import org.apache.cassandra.locator.RangesAtEndpoint;
+import org.apache.cassandra.locator.Replica;
 import org.apache.cassandra.metrics.CompactionMetrics;
-import org.apache.cassandra.repair.Validator;
+import org.apache.cassandra.metrics.TableMetrics;
+import org.apache.cassandra.repair.NoSuchRepairSessionException;
+import org.apache.cassandra.schema.CompactionParams.TombstoneOption;
+import org.apache.cassandra.schema.Schema;
+import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.service.ActiveRepairService;
 import org.apache.cassandra.service.StorageService;
-import org.apache.cassandra.utils.*;
+import org.apache.cassandra.streaming.PreviewKind;
+import org.apache.cassandra.tcm.ClusterMetadata;
+import org.apache.cassandra.tcm.ownership.DataPlacement;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.JVMStabilityInspector;
+import org.apache.cassandra.utils.MBeanWrapper;
+import org.apache.cassandra.utils.OutputHandler;
+import org.apache.cassandra.utils.Throwables;
+import org.apache.cassandra.utils.TimeUUID;
+import org.apache.cassandra.utils.WrappedRunnable;
+import org.apache.cassandra.utils.concurrent.AsyncPromise;
+import org.apache.cassandra.utils.concurrent.Future;
+import org.apache.cassandra.utils.concurrent.ImmediateFuture;
+import org.apache.cassandra.utils.concurrent.Promise;
+import org.apache.cassandra.utils.concurrent.Refs;
+
+import static java.util.Collections.singleton;
+import static org.apache.cassandra.concurrent.ExecutorFactory.Global.executorFactory;
+import static org.apache.cassandra.concurrent.FutureTask.callable;
+import static org.apache.cassandra.config.DatabaseDescriptor.getConcurrentCompactors;
+import static org.apache.cassandra.db.compaction.CompactionManager.CompactionExecutor.compactionThreadGroup;
+import static org.apache.cassandra.db.lifecycle.SSTableIntervalTree.buildSSTableIntervalTree;
+import static org.apache.cassandra.service.ActiveRepairService.NO_PENDING_REPAIR;
+import static org.apache.cassandra.service.ActiveRepairService.UNREPAIRED_SSTABLE;
+import static org.apache.cassandra.utils.Clock.Global.nanoTime;
+import static org.apache.cassandra.utils.TimeUUID.Generator.nextTimeUUID;
 
 /**
+ * <p>
  * A singleton which manages a private executor of ongoing compactions.
- * <p/>
+ * </p>
  * Scheduling for compaction is accomplished by swapping sstables to be compacted into
- * a set via DataTracker. New scheduling attempts will ignore currently compacting
+ * a set via Tracker. New scheduling attempts will ignore currently compacting
  * sstables.
  */
-public class CompactionManager implements CompactionManagerMBean
+public class CompactionManager implements CompactionManagerMBean, ICompactionManager
 {
     public static final String MBEAN_OBJECT_NAME = "org.apache.cassandra.db:type=CompactionManager";
     private static final Logger logger = LoggerFactory.getLogger(CompactionManager.class);
     public static final CompactionManager instance;
 
-    public static final int NO_GC = Integer.MIN_VALUE;
-    public static final int GC_ALL = Integer.MAX_VALUE;
+    @VisibleForTesting
+    public final AtomicInteger currentlyBackgroundUpgrading = new AtomicInteger(0);
 
-    // A thread local that tells us if the current thread is owned by the compaction manager. Used
-    // by CounterContext to figure out if it should log a warning for invalid counter shards.
-    public static final ThreadLocal<Boolean> isCompactionManager = new ThreadLocal<Boolean>()
-    {
-        @Override
-        protected Boolean initialValue()
-        {
-            return false;
-        }
-    };
+    public static final int NO_GC = Integer.MIN_VALUE;
 
     static
     {
         instance = new CompactionManager();
-        MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
-        try
-        {
-            mbs.registerMBean(instance, new ObjectName(MBEAN_OBJECT_NAME));
-        }
-        catch (Exception e)
-        {
-            throw new RuntimeException(e);
-        }
+
+        MBeanWrapper.instance.registerMBean(instance, MBEAN_OBJECT_NAME);
     }
 
     private final CompactionExecutor executor = new CompactionExecutor();
-    private final CompactionExecutor validationExecutor = new ValidationExecutor();
-    private final static CompactionExecutor cacheCleanupExecutor = new CacheCleanupExecutor();
+    private final ValidationExecutor validationExecutor = new ValidationExecutor();
+    private final CompactionExecutor cacheCleanupExecutor = new CacheCleanupExecutor();
+    private final CompactionExecutor viewBuildExecutor = new ViewBuildExecutor();
 
-    private final CompactionMetrics metrics = new CompactionMetrics(executor, validationExecutor);
-    private final Multiset<ColumnFamilyStore> compactingCF = ConcurrentHashMultiset.create();
+    // We can't house 2i builds in SecondaryIndexManagement because it could cause deadlocks with itself, and can cause
+    // massive to indefinite pauses if prioritized either before or after normal compactions so we instead put it in its
+    // own pool to prevent either scenario.
+    private final SecondaryIndexExecutor secondaryIndexExecutor = new SecondaryIndexExecutor();
+
+    private final CompactionMetrics metrics = new CompactionMetrics(executor, validationExecutor, viewBuildExecutor, secondaryIndexExecutor);
+
+    @VisibleForTesting
+    final Multiset<ColumnFamilyStore> compactingCF = ConcurrentHashMultiset.create();
+
+    public final ActiveCompactions active = new ActiveCompactions();
+
+    // used to temporarily pause non-strategy managed compactions (like index summary redistribution)
+    private final AtomicInteger globalCompactionPauseCount = new AtomicInteger(0);
 
     private final RateLimiter compactionRateLimiter = RateLimiter.create(Double.MAX_VALUE);
 
+    public CompactionMetrics getMetrics()
+    {
+        return metrics;
+    }
+
     /**
-     * Gets compaction rate limiter. When compaction_throughput_mb_per_sec is 0 or node is bootstrapping,
-     * this returns rate limiter with the rate of Double.MAX_VALUE bytes per second.
+     * Gets compaction rate limiter.
      * Rate unit is bytes per sec.
      *
      * @return RateLimiter with rate limit set
      */
     public RateLimiter getRateLimiter()
     {
-        double currentThroughput = DatabaseDescriptor.getCompactionThroughputMbPerSec() * 1024 * 1024;
-        // if throughput is set to 0, throttling is disabled
-        if (currentThroughput == 0 || StorageService.instance.isBootstrapMode())
-            currentThroughput = Double.MAX_VALUE;
-        if (compactionRateLimiter.getRate() != currentThroughput)
-            compactionRateLimiter.setRate(currentThroughput);
+        setRateInBytes(DatabaseDescriptor.getCompactionThroughputBytesPerSec());
         return compactionRateLimiter;
+    }
+
+    /**
+     * Sets the rate for the rate limiter. When compaction_throughput is 0 or node is bootstrapping,
+     * this sets the rate to Double.MAX_VALUE bytes per second.
+     * @param throughputMbPerSec throughput to set in MiB/s
+     * @deprecated Use setRateInBytes instead See CASSANDRA-17225
+     */
+    @Deprecated(since = "4.1")
+    public void setRate(final double throughputMbPerSec)
+    {
+        setRateInBytes(throughputMbPerSec * 1024.0 * 1024);
+    }
+
+    /**
+     * Sets the rate for the rate limiter. When compaction_throughput is 0 or node is bootstrapping,
+     * this sets the rate to Double.MAX_VALUE bytes per second.
+     * @param throughputBytesPerSec throughput to set in B/s
+     */
+    public void setRateInBytes(final double throughputBytesPerSec)
+    {
+        double throughput = throughputBytesPerSec;
+        // if throughput is set to 0, throttling is disabled
+        if (throughput == 0 || StorageService.instance.isBootstrapMode())
+            throughput = Double.MAX_VALUE;
+        if (compactionRateLimiter.getRate() != throughput)
+            compactionRateLimiter.setRate(throughput);
+    }
+
+    public Meter getCompactionThroughput()
+    {
+        return metrics.bytesCompactedThroughput;
     }
 
     /**
@@ -129,215 +249,1190 @@ public class CompactionManager implements CompactionManagerMBean
     {
         if (cfs.isAutoCompactionDisabled())
         {
-            logger.debug("Autocompaction is disabled");
+            logger.debug("Autocompaction on {}.{} is disabled (disabled: {}, paused: {})",
+                         cfs.keyspace.getName(), cfs.name,
+                         !cfs.getCompactionStrategyManager().isEnabled(),
+                         !cfs.getCompactionStrategyManager().isActive());
+
             return Collections.emptyList();
         }
 
+        /**
+         * If a CF is currently being compacted, and there are no idle threads, submitBackground should be a no-op;
+         * we can wait for the current compaction to finish and re-submit when more information is available.
+         * Otherwise, we should submit at least one task to prevent starvation by busier CFs, and more if there
+         * are idle threads stil. (CASSANDRA-4310)
+         */
         int count = compactingCF.count(cfs);
-        if (count > 0 && executor.getActiveCount() >= executor.getMaximumPoolSize())
+        if (count > 0 && executor.getActiveTaskCount() >= executor.getMaximumPoolSize())
         {
-            logger.debug("Background compaction is still running for {}.{} ({} remaining). Skipping",
-                         cfs.keyspace.getName(), cfs.name, count);
+            if (logger.isTraceEnabled())
+                logger.trace("Background compaction is still running for {}.{} ({} remaining). Skipping",
+                             cfs.getKeyspaceName(), cfs.name, count);
+
             return Collections.emptyList();
         }
 
-        logger.debug("Scheduling a background task check for {}.{} with {}",
-                     cfs.keyspace.getName(),
+        logger.trace("Scheduling a background task check for {}.{} with {}",
+                     cfs.getKeyspaceName(),
                      cfs.name,
-                     cfs.getCompactionStrategy().getClass().getSimpleName());
-        List<Future<?>> futures = new ArrayList<Future<?>>();
+                     cfs.getCompactionStrategyManager().getName());
 
-        // we must schedule it at least once, otherwise compaction will stop for a CF until next flush
-        do {
-            futures.add(executor.submit(new BackgroundCompactionTask(cfs)));
-            compactingCF.add(cfs);
-            // if we have room for more compactions, then fill up executor
-        } while (executor.getActiveCount() + futures.size() < executor.getMaximumPoolSize());
-
+        List<Future<?>> futures = new ArrayList<>(1);
+        Promise<Void> promise = new AsyncPromise<>();
+        if (!executor.submitIfRunning(new BackgroundCompactionCandidate(cfs, promise), "background task").isCancelled())
+            futures.add(promise);
+        else
+            compactingCF.remove(cfs);
         return futures;
     }
 
-    public boolean isCompacting(Iterable<ColumnFamilyStore> cfses)
+    public boolean isCompacting(Iterable<ColumnFamilyStore> cfses, Predicate<SSTableReader> sstablePredicate)
     {
         for (ColumnFamilyStore cfs : cfses)
-            if (!cfs.getDataTracker().getCompacting().isEmpty())
+            if (cfs.getTracker().getCompacting().stream().anyMatch(sstablePredicate))
                 return true;
         return false;
     }
 
+    @VisibleForTesting
+    public boolean hasOngoingOrPendingTasks()
+    {
+        if (!active.getCompactions().isEmpty() || !compactingCF.isEmpty())
+            return true;
+
+        int pendingTasks = executor.getPendingTaskCount() +
+                           validationExecutor.getPendingTaskCount() +
+                           viewBuildExecutor.getPendingTaskCount() +
+                           cacheCleanupExecutor.getPendingTaskCount() +
+                           secondaryIndexExecutor.getPendingTaskCount();
+        if (pendingTasks > 0)
+            return true;
+
+        int activeTasks = executor.getActiveTaskCount() +
+                          validationExecutor.getActiveTaskCount() +
+                          viewBuildExecutor.getActiveTaskCount() +
+                          cacheCleanupExecutor.getActiveTaskCount() +
+                          secondaryIndexExecutor.getActiveTaskCount();
+
+        return activeTasks > 0;
+    }
+
+    /**
+     * Shutdowns both compaction and validation executors, cancels running compaction / validation,
+     * and waits for tasks to complete if tasks were not cancelable.
+     */
+    public void forceShutdown()
+    {
+        // shutdown executors to prevent further submission
+        executor.shutdown();
+        validationExecutor.shutdown();
+        viewBuildExecutor.shutdown();
+        cacheCleanupExecutor.shutdown();
+        secondaryIndexExecutor.shutdown();
+
+        // interrupt compactions and validations
+        for (Holder compactionHolder : active.getCompactions())
+        {
+            compactionHolder.stop();
+        }
+
+        // wait for tasks to terminate
+        // compaction tasks are interrupted above, so it shuold be fairy quick
+        // until not interrupted tasks to complete.
+        for (ExecutorService exec : Arrays.asList(executor, validationExecutor, viewBuildExecutor,
+                                                  cacheCleanupExecutor, secondaryIndexExecutor))
+        {
+            try
+            {
+                if (!exec.awaitTermination(1, TimeUnit.MINUTES))
+                    logger.warn("Failed to wait for compaction executors shutdown");
+            }
+            catch (InterruptedException e)
+            {
+                logger.error("Interrupted while waiting for tasks to be terminated", e);
+            }
+        }
+    }
+
+    public void finishCompactionsAndShutdown(long timeout, TimeUnit unit) throws InterruptedException
+    {
+        executor.shutdown();
+        executor.awaitTermination(timeout, unit);
+    }
+
     // the actual sstables to compact are not determined until we run the BCT; that way, if new sstables
     // are created between task submission and execution, we execute against the most up-to-date information
-    class BackgroundCompactionTask implements Runnable
+    @VisibleForTesting
+    class BackgroundCompactionCandidate implements Runnable
     {
         private final ColumnFamilyStore cfs;
+        private final Promise<Void> toSignalWhenDone;
+        private final AtomicReference<Throwable> asyncErrors = new AtomicReference<>(null);
 
-        BackgroundCompactionTask(ColumnFamilyStore cfs)
+        BackgroundCompactionCandidate(ColumnFamilyStore cfs, Promise<Void> toSignalWhenDone)
         {
+            compactingCF.add(cfs);
             this.cfs = cfs;
+            this.toSignalWhenDone = toSignalWhenDone;
         }
 
         public void run()
         {
+            boolean ranCompaction = false;
+            boolean async = false;
+            Throwable error = null;
+            Collection<AbstractCompactionTask> tasks = null;
             try
             {
-                logger.debug("Checking {}.{}", cfs.keyspace.getName(), cfs.name);
+                logger.trace("Checking {}.{}", cfs.getKeyspaceName(), cfs.name);
                 if (!cfs.isValid())
                 {
-                    logger.debug("Aborting compaction for dropped CF");
+                    logger.trace("Aborting compaction for dropped CF");
                     return;
                 }
 
-                AbstractCompactionStrategy strategy = cfs.getCompactionStrategy();
-                AbstractCompactionTask task = strategy.getNextBackgroundTask(getDefaultGcBefore(cfs));
-                if (task == null)
+                CompactionStrategyManager strategy = cfs.getCompactionStrategyManager();
+                tasks = strategy.getNextBackgroundTasks(cfs.getDefaultGcBefore(FBUtilities.nowInSeconds()));
+                if (tasks == null || tasks.isEmpty())
                 {
-                    logger.debug("No tasks available");
-                    return;
+                    if (DatabaseDescriptor.automaticSSTableUpgrade())
+                        ranCompaction = maybeRunUpgradeTask(strategy);
                 }
-                task.execute(metrics);
+                else if (tasks.size() == 1)
+                {
+                    // If just one task, run it directly on this thread
+                    for (AbstractCompactionTask task : tasks)
+                        task.execute(active);
+                    ranCompaction = true;
+                }
+                else
+                {
+                    // more than 1 task: we need to do this outside the catch and complete block
+                    async = true;
+                }
+            }
+            catch (Throwable t)
+            {
+                error = t;
+            }
+
+            if (!async)
+            {
+                complete(ranCompaction, error);
+                Throwables.maybeFail(error);
+            }
+            else    // async
+                processTasksAsync(tasks);
+        }
+
+        private void processTasksAsync(Collection<AbstractCompactionTask> tasks)
+        {
+            assert tasks != null;
+
+            // We should only signal overall completion when all tasks are done
+            AtomicInteger toComplete = new AtomicInteger(tasks.size());
+
+            AbstractCompactionTask lastTask = null;
+            // Submit all but the last task for execution,
+            for (AbstractCompactionTask task : tasks)
+            {
+                if (lastTask != null)
+                {
+                    AbstractCompactionTask toRun = lastTask;
+                    try
+                    {
+                        executor.submit(() -> runTask(toRun, toComplete));
+                    }
+                    catch (RejectedExecutionException e)
+                    {
+                        logger.debug("Failed to submit background compaction task: {}", e.getMessage());
+                        rejectTask(toRun, toComplete);
+                    }
+                }
+                lastTask = task;
+            }
+
+            // and run the last task directly in this thread.
+            assert lastTask != null;
+            runTask(lastTask, toComplete);
+        }
+
+        private void runTask(AbstractCompactionTask task, AtomicInteger toComplete)
+        {
+            try
+            {
+                task.execute(active);
+            }
+            catch (Throwable t)
+            {
+                addAsyncError(t);
             }
             finally
             {
-                compactingCF.remove(cfs);
+                if (toComplete.decrementAndGet() == 0)
+                    complete(true, asyncErrors.get());
             }
-            submitBackground(cfs);
+        }
+
+        private void rejectTask(AbstractCompactionTask task, AtomicInteger toComplete)
+        {
+            try
+            {
+                task.rejected();
+                throw new RuntimeException("Failed to submit background compaction task");
+            }
+            catch (Throwable t) // make sure we catch exceptions thrown by task.rejected() as well
+            {
+                addAsyncError(t);
+            }
+            finally
+            {
+                if (toComplete.decrementAndGet() == 0)
+                    complete(false, asyncErrors.get());
+            }
+        }
+
+        private void complete(boolean submitNew, Throwable error)
+        {
+            compactingCF.remove(cfs);
+            if (error == null)
+            {
+                toSignalWhenDone.setSuccess(null);
+                if (submitNew)
+                    submitBackground(cfs);
+            }
+            else
+                toSignalWhenDone.setFailure(error);
+        }
+
+        private void addAsyncError(Throwable t)
+        {
+            asyncErrors.accumulateAndGet(t, (a, b) ->
+            {
+                if (a == null)
+                    return b;
+                else
+                {
+                    a.addSuppressed(b);
+                    return a;
+                }
+            });
+        }
+
+        boolean maybeRunUpgradeTask(CompactionStrategyManager strategy)
+        {
+            logger.debug("Checking for upgrade tasks {}.{}", cfs.getKeyspaceName(), cfs.getTableName());
+            try
+            {
+                if (currentlyBackgroundUpgrading.incrementAndGet() <= DatabaseDescriptor.maxConcurrentAutoUpgradeTasks())
+                {
+                    AbstractCompactionTask upgradeTask = strategy.findUpgradeSSTableTask();
+                    if (upgradeTask != null)
+                    {
+                        upgradeTask.execute(active);
+                        return true;
+                    }
+                }
+            }
+            finally
+            {
+                currentlyBackgroundUpgrading.decrementAndGet();
+            }
+            logger.trace("No tasks available");
+            return false;
         }
     }
 
-    private static interface AllSSTablesOperation
+    @VisibleForTesting
+    public BackgroundCompactionCandidate getBackgroundCompactionCandidate(ColumnFamilyStore cfs)
     {
-        public void perform(ColumnFamilyStore store, Iterable<SSTableReader> sstables) throws IOException;
+        return new BackgroundCompactionCandidate(cfs, new AsyncPromise<>());
     }
 
-    private void performAllSSTableOperation(final ColumnFamilyStore cfs, final AllSSTablesOperation operation) throws InterruptedException, ExecutionException
+    /**
+     * Run an operation over all sstables using jobs threads
+     *
+     * @param cfs the column family store to run the operation on
+     * @param operation the operation to run
+     * @param jobs the number of threads to use - 0 means use all available. It never uses more than concurrent_compactors threads
+     * @return status of the operation
+     */
+    private AllSSTableOpStatus parallelAllSSTableOperation(final ColumnFamilyStore cfs,
+                                                           final OneSSTableOperation operation,
+                                                           int jobs,
+                                                           OperationType operationType)
     {
-        final Iterable<SSTableReader> sstables = cfs.markAllCompacting();
-        if (sstables == null)
-            return;
-
-        Callable<Object> runnable = new Callable<Object>()
-        {
-            public Object call() throws IOException
+        String operationName = operationType.name();
+        String keyspace = cfs.getKeyspaceName();
+        String table = cfs.getTableName();
+        return cfs.withAllSSTables(operationType, (compacting) -> {
+            logger.info("Starting {} for {}.{}", operationType, cfs.getKeyspaceName(), cfs.getTableName());
+            List<LifecycleTransaction> transactions = new ArrayList<>();
+            List<Future<?>> futures = new ArrayList<>();
+            try
             {
-                operation.perform(cfs, sstables);
-                cfs.getDataTracker().unmarkCompacting(sstables);
-                return this;
-            }
-        };
-        executor.submit(runnable).get();
-    }
+                if (compacting == null)
+                    return AllSSTableOpStatus.UNABLE_TO_CANCEL;
 
-    public void performScrub(ColumnFamilyStore cfStore) throws InterruptedException, ExecutionException
-    {
-        performAllSSTableOperation(cfStore, new AllSSTablesOperation()
-        {
-            public void perform(ColumnFamilyStore store, Iterable<SSTableReader> sstables) throws IOException
-            {
-                doScrub(store, sstables);
-            }
-        });
-    }
+                List<SSTableReader> sstables = Lists.newArrayList(operation.filterSSTables(compacting));
+                int originalCount = compacting.originals().size();
+                int processedCount = sstables.size();
+                if (sstables.isEmpty())
+                {
+                    logger.info("No sstables to {} for {}.{}", operationName, keyspace, table);
+                    return AllSSTableOpStatus.SUCCESSFUL;
+                }
 
-    public void performSSTableRewrite(ColumnFamilyStore cfStore, final boolean excludeCurrentVersion) throws InterruptedException, ExecutionException
-    {
-        performAllSSTableOperation(cfStore, new AllSSTablesOperation()
-        {
-            public void perform(ColumnFamilyStore cfs, Iterable<SSTableReader> sstables)
-            {
                 for (final SSTableReader sstable : sstables)
                 {
-                    if (excludeCurrentVersion && sstable.descriptor.version.equals(Descriptor.Version.CURRENT))
-                        continue;
+                    final LifecycleTransaction txn = compacting.split(singleton(sstable));
+                    transactions.add(txn);
+                    Callable<Object> callable = new Callable<Object>()
+                    {
+                        @Override
+                        public Object call() throws Exception
+                        {
+                            operation.execute(txn);
+                            return this;
+                        }
+                    };
+                    Future<?> fut = executor.submitIfRunning(callable, "parallel SSTable operation");
+                    if (!fut.isCancelled())
+                        futures.add(fut);
+                    else
+                        return AllSSTableOpStatus.ABORTED;
 
-                    // SSTables are marked by the caller
-                    // NOTE: it is important that the task create one and only one sstable, even for Leveled compaction (see LeveledManifest.replace())
-                    CompactionTask task = new CompactionTask(cfs, Collections.singletonList(sstable), NO_GC);
-                    task.setUserDefined(true);
-                    task.setCompactionType(OperationType.UPGRADE_SSTABLES);
-                    task.execute(metrics);
+                    if (jobs > 0 && futures.size() == jobs)
+                    {
+                        Future<?> f = FBUtilities.waitOnFirstFuture(futures);
+                        futures.remove(f);
+                    }
+                }
+                FBUtilities.waitOnFutures(futures);
+                // For full-set operations processedCount == originalCount, so compacting.originals()
+                // is empty here; for user-defined / partial operations the un-touched sstables stay
+                // in compacting.originals(). Either way the count must shrink by exactly what we
+                // split out.
+                assert compacting.originals().size() == originalCount - processedCount
+                    : String.format("originals=%d, expected %d after processing %d sstables",
+                                    compacting.originals().size(), originalCount - processedCount, processedCount);
+                logger.info("Finished {} for {}.{} successfully", operationType, keyspace, table);
+                return AllSSTableOpStatus.SUCCESSFUL;
+            }
+            finally
+            {
+                // wait on any unfinished futures to make sure we don't close an ongoing transaction
+                try
+                {
+                    FBUtilities.waitOnFutures(futures);
+                }
+                catch (Throwable t)
+                {
+                    // these are handled/logged in CompactionExecutor#afterExecute
+                }
+                Throwable fail = Throwables.close(null, transactions);
+                if (fail != null)
+                    logger.error("Failed to cleanup lifecycle transactions ({} for {}.{})", operationType, keyspace, table, fail);
+            }
+        });
+    }
+
+    private static interface OneSSTableOperation
+    {
+        Iterable<SSTableReader> filterSSTables(LifecycleTransaction transaction);
+        void execute(LifecycleTransaction input) throws IOException;
+    }
+
+    public enum AllSSTableOpStatus
+    {
+        SUCCESSFUL(0),
+        ABORTED(1),
+        UNABLE_TO_CANCEL(2);
+
+        public final int statusCode;
+
+        AllSSTableOpStatus(int statusCode)
+        {
+            this.statusCode = statusCode;
+        }
+    }
+
+    public AllSSTableOpStatus performScrub(ColumnFamilyStore cfs, IScrubber.Options options, int jobs)
+    {
+        return parallelAllSSTableOperation(cfs, new OneSSTableOperation()
+        {
+            @Override
+            public Iterable<SSTableReader> filterSSTables(LifecycleTransaction input)
+            {
+                return input.originals();
+            }
+
+            @Override
+            public void execute(LifecycleTransaction input)
+            {
+                scrubOne(cfs, input, options, active);
+            }
+        }, jobs, OperationType.SCRUB);
+    }
+
+    public AllSSTableOpStatus performVerify(ColumnFamilyStore cfs, IVerifier.Options options) throws InterruptedException, ExecutionException
+    {
+        assert !cfs.isIndex();
+        StorageAttachedIndexGroup indexGroup = StorageAttachedIndexGroup.getIndexGroup(cfs);
+        boolean skipSaiCheck = indexGroup == null;
+        if (options.onlySai && skipSaiCheck)
+        {
+            logger.info("Skipping table {} during SAI-only verify because it has no SAI indexes.", cfs.getTableName());
+            return AllSSTableOpStatus.SUCCESSFUL;
+
+        }
+
+        return parallelAllSSTableOperation(cfs, new OneSSTableOperation()
+        {
+            @Override
+            public Iterable<SSTableReader> filterSSTables(LifecycleTransaction input)
+            {
+                return input.originals();
+            }
+
+            @Override
+            public void execute(LifecycleTransaction input)
+            {
+                verifyOne(cfs, input.onlyOne(), options, active);
+            }
+        }, 0, OperationType.VERIFY);
+    }
+
+    public AllSSTableOpStatus performSSTableRewrite(final ColumnFamilyStore cfs,
+                                                    final boolean skipIfCurrentVersion,
+                                                    final long skipIfOlderThanTimestamp,
+                                                    final boolean skipIfCompressionMatches,
+                                                    int jobs) throws InterruptedException, ExecutionException
+    {
+        return performSSTableRewrite(cfs, (sstable) -> {
+            // Skip if descriptor version matches current version
+            if (skipIfCurrentVersion && sstable.descriptor.version.equals(sstable.descriptor.getFormat().getLatestVersion()))
+                return false;
+
+            // Skip if SSTable creation time is past given timestamp
+            if (sstable.getDataCreationTime() > skipIfOlderThanTimestamp)
+                return false;
+
+            TableMetadata metadata = cfs.metadata.get();
+            // Skip if SSTable compression parameters match current ones
+            if (skipIfCompressionMatches &&
+                ((!sstable.compression && !metadata.params.compression.isEnabled()) ||
+                 (sstable.compression && metadata.params.compression.equals(sstable.getCompressionMetadata().parameters))))
+                return false;
+
+            return true;
+        }, jobs);
+    }
+
+    /**
+     * Perform SSTable rewrite
+
+     * @param sstableFilter sstables for which predicate returns {@link false} will be excluded
+     */
+    public AllSSTableOpStatus performSSTableRewrite(final ColumnFamilyStore cfs, Predicate<SSTableReader> sstableFilter, int jobs) throws InterruptedException, ExecutionException
+    {
+        return parallelAllSSTableOperation(cfs, new OneSSTableOperation()
+        {
+            @Override
+            public Iterable<SSTableReader> filterSSTables(LifecycleTransaction transaction)
+            {
+                List<SSTableReader> sortedSSTables = Lists.newArrayList(transaction.originals());
+                Collections.sort(sortedSSTables, SSTableReader.sizeComparator.reversed());
+                Iterator<SSTableReader> iter = sortedSSTables.iterator();
+                while (iter.hasNext())
+                {
+                    SSTableReader sstable = iter.next();
+                    if (!sstableFilter.test(sstable))
+                    {
+                        transaction.cancel(sstable);
+                        iter.remove();
+                    }
+                }
+                return sortedSSTables;
+            }
+
+            @Override
+            public void execute(LifecycleTransaction txn)
+            {
+                AbstractCompactionTask task = cfs.getCompactionStrategyManager().getCompactionTask(txn, NO_GC, Long.MAX_VALUE);
+                task.setUserDefined(true);
+                task.setCompactionType(OperationType.UPGRADE_SSTABLES);
+                task.execute(active);
+            }
+        }, jobs, OperationType.UPGRADE_SSTABLES);
+    }
+
+    public AllSSTableOpStatus performCleanup(final ColumnFamilyStore cfStore, int jobs) throws InterruptedException, ExecutionException
+    {
+        assert !cfStore.isIndex();
+        Keyspace keyspace = cfStore.keyspace;
+
+        if (!StorageService.instance.isJoined())
+        {
+            logger.info("Cleanup cannot run before a node has joined the ring");
+            return AllSSTableOpStatus.ABORTED;
+        }
+        if (cfStore.getPartitioner() == MetaStrategy.partitioner)
+            return AllSSTableOpStatus.SUCCESSFUL; // todo - we probably want to be able to cleanup MetaStrategy keyspaces. When we fix this, also fix
+                                                  //        SortedTableVerifier to make sure system_cluster_metadata is empty for non-CMS instances
+        final boolean hasIndexes = cfStore.indexManager.hasIndexes();
+
+        // if local ranges is empty, it means no data should remain
+        // we only consider write placements during cleanup as range movements always ensure
+        // overlap between new replicas accepting reads and old replicas accepting writes
+        ClusterMetadata cm = ClusterMetadata.current();
+        DataPlacement placement = cm.placement(keyspace.getMetadata().params.replication);
+        InetAddressAndPort local = FBUtilities.getBroadcastAddressAndPort();
+        RangesAtEndpoint localWrites = placement.writes.byEndpoint().get(local);
+        // TODO review: Hack to get local partitioner not to fail out because it's handled very poorly with data placements
+        IPartitioner partitioner = cfStore.getPartitioner();
+        if (partitioner.getClass() == LocalPartitioner.class)
+            localWrites = RangesAtEndpoint.of(Replica.fullReplica(local, new Range<>(partitioner.getMinimumToken(), partitioner.getMinimumToken())));
+
+        final Set<Range<Token>> allRanges = new HashSet<>(localWrites.ranges());
+        final Set<Range<Token>> transientRanges = new HashSet<>(localWrites.onlyTransient().ranges());
+        final Set<Range<Token>> fullRanges = new HashSet<>(localWrites.onlyFull().ranges());
+
+        return parallelAllSSTableOperation(cfStore, new OneSSTableOperation()
+        {
+            @Override
+            public Iterable<SSTableReader> filterSSTables(LifecycleTransaction transaction)
+            {
+                List<SSTableReader> sortedSSTables = Lists.newArrayList(transaction.originals());
+                Iterator<SSTableReader> sstableIter = sortedSSTables.iterator();
+                int totalSSTables = 0;
+                int skippedSStables = 0;
+                while (sstableIter.hasNext())
+                {
+                    SSTableReader sstable = sstableIter.next();
+                    boolean needsCleanupFull = needsCleanup(sstable, fullRanges);
+                    boolean needsCleanupTransient = !transientRanges.isEmpty() && sstable.isRepaired() && needsCleanup(sstable, transientRanges);
+                    //If there are no ranges for which the table needs cleanup either due to lack of intersection or lack
+                    //of the table being repaired.
+                    totalSSTables++;
+                    if (!needsCleanupFull && !needsCleanupTransient)
+                    {
+                        logger.debug("Skipping {} ([{}, {}]) for cleanup; all rows should be kept. Needs cleanup full ranges: {} Needs cleanup transient ranges: {} Repaired: {}",
+                                    sstable,
+                                    sstable.getFirst().getToken(),
+                                    sstable.getLast().getToken(),
+                                    needsCleanupFull,
+                                    needsCleanupTransient,
+                                    sstable.isRepaired());
+                        sstableIter.remove();
+                        transaction.cancel(sstable);
+                        skippedSStables++;
+                    }
+                }
+                logger.info("Skipping cleanup for {}/{} sstables for {}.{} since they are fully contained in owned ranges (full ranges: {}, transient ranges: {})",
+                            skippedSStables, totalSSTables, cfStore.getKeyspaceName(), cfStore.getTableName(), fullRanges, transientRanges);
+                sortedSSTables.sort(SSTableReader.sizeComparator);
+                return sortedSSTables;
+            }
+
+            @Override
+            public void execute(LifecycleTransaction txn) throws IOException
+            {
+                CleanupStrategy cleanupStrategy = CleanupStrategy.get(cfStore, allRanges, transientRanges, txn.onlyOne().isRepaired(), FBUtilities.nowInSeconds());
+                doCleanupOne(cfStore, txn, cleanupStrategy, allRanges, hasIndexes);
+            }
+        }, jobs, OperationType.CLEANUP);
+    }
+
+    public AllSSTableOpStatus performGarbageCollection(ColumnFamilyStore cfStore, TombstoneOption tombstoneOption, int jobs)
+    {
+        return performGarbageCollection(cfStore, tombstoneOption, jobs, descriptor -> true);
+    }
+
+    public AllSSTableOpStatus performGarbageCollection(ColumnFamilyStore cfStore, TombstoneOption tombstoneOption, int jobs, Collection<Descriptor> dataFiles)
+    {
+        Set<Descriptor> files = new HashSet<>(dataFiles);
+        return performGarbageCollection(cfStore, tombstoneOption, jobs, files::contains);
+    }
+
+    @VisibleForTesting
+    AllSSTableOpStatus performGarbageCollection(ColumnFamilyStore cfStore, TombstoneOption tombstoneOption, int jobs, Predicate<Descriptor> allowedFile)
+    {
+        assert !cfStore.isIndex();
+
+        return parallelAllSSTableOperation(cfStore, new OneSSTableOperation()
+        {
+            @Override
+            public Iterable<SSTableReader> filterSSTables(LifecycleTransaction transaction)
+            {
+                List<SSTableReader> filteredSSTables = new ArrayList<>();
+                if (cfStore.getCompactionStrategyManager().onlyPurgeRepairedTombstones())
+                {
+                    // Copy originals to avoid ConcurrentModificationException when cancel()
+                    // modifies the underlying collection when calling `cancel(..)`
+                    for (SSTableReader sstable : new ArrayList<>(transaction.originals()))
+                    {
+                        if (!sstable.isRepaired())
+                        {
+                            try
+                            {
+                                transaction.cancel(sstable);
+                            }
+                            catch (Throwable t)
+                            {
+                                logger.warn(String.format("Unable to cancel %s from transaction %s", sstable, transaction.opIdString()), t);
+                            }
+                        }
+                        else
+                        {
+                            filteredSSTables.add(sstable);
+                        }
+                    }
+                }
+                else
+                {
+                    filteredSSTables.addAll(transaction.originals());
+                }
+
+                return filteredSSTables.stream()
+                                       .filter(reader -> allowedFile.test(reader.descriptor))
+                                       .sorted(SSTableReader.maxTimestampAscending)
+                                       .collect(Collectors.toList());
+            }
+
+            @Override
+            public void execute(LifecycleTransaction txn)
+            {
+                logger.debug("Garbage collecting {}", txn.originals());
+                CompactionTask task = new CompactionTask(cfStore, txn, cfStore.getDefaultGcBefore(FBUtilities.nowInSeconds()))
+                {
+                    @Override
+                    protected CompactionController getCompactionController(Set<SSTableReader> toCompact, long gcBefore)
+                    {
+                        return new CompactionController(cfStore, toCompact, gcBefore, null, tombstoneOption);
+                    }
+
+                    @Override
+                    protected int getLevel()
+                    {
+                        return txn.onlyOne().getSSTableLevel();
+                    }
+                };
+                task.setUserDefined(true);
+                task.setCompactionType(OperationType.GARBAGE_COLLECT);
+                task.execute(active);
+            }
+        }, jobs, OperationType.GARBAGE_COLLECT);
+    }
+
+    public AllSSTableOpStatus relocateSSTables(final ColumnFamilyStore cfs, int jobs) throws ExecutionException, InterruptedException
+    {
+        if (!cfs.getPartitioner().splitter().isPresent())
+        {
+            logger.info("Partitioner does not support splitting");
+            return AllSSTableOpStatus.ABORTED;
+        }
+
+        if (StorageService.instance.getLocalReplicas(cfs.getKeyspaceName()).isEmpty())
+        {
+            logger.info("Relocate cannot run before a node has joined the ring");
+            return AllSSTableOpStatus.ABORTED;
+        }
+
+        final DiskBoundaries diskBoundaries = cfs.getDiskBoundaries();
+
+        return parallelAllSSTableOperation(cfs, new OneSSTableOperation()
+        {
+            @Override
+            public Iterable<SSTableReader> filterSSTables(LifecycleTransaction transaction)
+            {
+                Set<SSTableReader> originals = Sets.newHashSet(transaction.originals());
+                Set<SSTableReader> needsRelocation = originals.stream().filter(s -> !inCorrectLocation(s)).collect(Collectors.toSet());
+                transaction.cancel(Sets.difference(originals, needsRelocation));
+
+                Map<Integer, List<SSTableReader>> groupedByDisk = groupByDiskIndex(needsRelocation);
+
+                int maxSize = 0;
+                for (List<SSTableReader> diskSSTables : groupedByDisk.values())
+                    maxSize = Math.max(maxSize, diskSSTables.size());
+
+                List<SSTableReader> mixedSSTables = new ArrayList<>();
+
+                for (int i = 0; i < maxSize; i++)
+                    for (List<SSTableReader> diskSSTables : groupedByDisk.values())
+                        if (i < diskSSTables.size())
+                            mixedSSTables.add(diskSSTables.get(i));
+
+                return mixedSSTables;
+            }
+
+            public Map<Integer, List<SSTableReader>> groupByDiskIndex(Set<SSTableReader> needsRelocation)
+            {
+                return needsRelocation.stream().collect(Collectors.groupingBy((s) -> diskBoundaries.getDiskIndex(s)));
+            }
+
+            private boolean inCorrectLocation(SSTableReader sstable)
+            {
+                if (!cfs.getPartitioner().splitter().isPresent())
+                    return true;
+
+                // Compare the expected data directory for the sstable with its current data directory
+                Directories.DataDirectory currentDirectory = cfs.getDirectories().getDataDirectoryForFile(sstable.descriptor);
+                return diskBoundaries.isInCorrectLocation(sstable, currentDirectory);
+            }
+
+            @Override
+            public void execute(LifecycleTransaction txn)
+            {
+                logger.debug("Relocating {}", txn.originals());
+                AbstractCompactionTask task = cfs.getCompactionStrategyManager().getCompactionTask(txn, NO_GC, Long.MAX_VALUE);
+                task.setUserDefined(true);
+                task.setCompactionType(OperationType.RELOCATE);
+                task.execute(active);
+            }
+        }, jobs, OperationType.RELOCATE);
+    }
+
+    /**
+     * Splits the given token ranges of the given sstables into a pending repair silo
+     */
+    public Future<Void> submitPendingAntiCompaction(ColumnFamilyStore cfs,
+                                                    RangesAtEndpoint tokenRanges,
+                                                    Refs<SSTableReader> sstables,
+                                                    LifecycleTransaction txn,
+                                                    TimeUUID sessionId,
+                                                    BooleanSupplier isCancelled)
+    {
+        Runnable runnable = new WrappedRunnable()
+        {
+            protected void runMayThrow() throws Exception
+            {
+                try (TableMetrics.TableTimer.Context ctx = cfs.metric.anticompactionTime.time())
+                {
+                    performAnticompaction(cfs, tokenRanges, sstables, txn, sessionId, isCancelled);
                 }
             }
-        });
-    }
+        };
 
-    public void performCleanup(ColumnFamilyStore cfStore, final CounterId.OneShotRenewer renewer) throws InterruptedException, ExecutionException
-    {
-        performAllSSTableOperation(cfStore, new AllSSTablesOperation()
+        Future<Void> task = null;
+        try
         {
-            public void perform(ColumnFamilyStore store, Iterable<SSTableReader> sstables) throws IOException
+            task = executor.submitIfRunning(runnable, "pending anticompaction");
+            return task;
+        }
+        finally
+        {
+            if (task == null || task.isCancelled())
             {
-                // Sort the column families in order of SSTable size, so cleanup of smaller CFs
-                // can free up space for larger ones
-                List<SSTableReader> sortedSSTables = Lists.newArrayList(sstables);
-                Collections.sort(sortedSSTables, new SSTableReader.SizeComparator());
-
-                doCleanupCompaction(store, sortedSSTables, renewer);
+                sstables.release();
+                txn.abort();
             }
-        });
+        }
     }
 
-    public void performMaximal(final ColumnFamilyStore cfStore) throws InterruptedException, ExecutionException
+    /**
+     * for sstables that are fully contained in the given ranges, just rewrite their metadata with
+     * the pending repair id and remove them from the transaction
+     */
+    private static void mutateFullyContainedSSTables(ColumnFamilyStore cfs,
+                                                     Refs<SSTableReader> refs,
+                                                     Iterator<SSTableReader> sstableIterator,
+                                                     Collection<Range<Token>> ranges,
+                                                     LifecycleTransaction txn,
+                                                     TimeUUID sessionID,
+                                                     boolean isTransient) throws IOException
     {
-        submitMaximal(cfStore, getDefaultGcBefore(cfStore)).get();
+        if (ranges.isEmpty())
+            return;
+
+        List<Range<Token>> normalizedRanges = Range.normalize(ranges);
+
+        Set<SSTableReader> fullyContainedSSTables = findSSTablesToAnticompact(sstableIterator, normalizedRanges, sessionID);
+
+        cfs.metric.bytesMutatedAnticompaction.mark(SSTableReader.getTotalBytes(fullyContainedSSTables));
+        cfs.getCompactionStrategyManager().mutateRepaired(fullyContainedSSTables, UNREPAIRED_SSTABLE, sessionID, isTransient);
+        // since we're just re-writing the sstable metdata for the fully contained sstables, we don't want
+        // them obsoleted when the anti-compaction is complete. So they're removed from the transaction here
+        txn.cancel(fullyContainedSSTables);
+        refs.release(fullyContainedSSTables);
     }
 
-    public Future<?> submitMaximal(final ColumnFamilyStore cfStore, final int gcBefore)
+    /**
+     * Make sure the {validatedForRepair} are marked for compaction before calling this.
+     *
+     * Caller must reference the validatedForRepair sstables (via ParentRepairSession.getActiveRepairedSSTableRefs(..)).
+     *
+     * @param cfs
+     * @param replicas token ranges to be repaired
+     * @param validatedForRepair SSTables containing the repaired ranges. Should be referenced before passing them.
+     * @param sessionID the repair session we're anti-compacting for
+     * @param isCancelled function that indicates if active anti-compaction should be canceled
+     * @throws InterruptedException
+     * @throws IOException
+     */
+    public void performAnticompaction(ColumnFamilyStore cfs,
+                                      RangesAtEndpoint replicas,
+                                      Refs<SSTableReader> validatedForRepair,
+                                      LifecycleTransaction txn,
+                                      TimeUUID sessionID,
+                                      BooleanSupplier isCancelled) throws IOException
     {
+        try
+        {
+            ActiveRepairService.ParentRepairSession prs;
+            try
+            {
+                prs = ActiveRepairService.instance().getParentRepairSession(sessionID);
+            }
+            catch (NoSuchRepairSessionException e)
+            {
+                throw new CompactionInterruptedException(e.getMessage());
+            }
+            Preconditions.checkArgument(!prs.isPreview(), "Cannot anticompact for previews");
+            Preconditions.checkArgument(!replicas.isEmpty(), "No ranges to anti-compact");
+
+            if (logger.isInfoEnabled())
+                logger.info("{} Starting anticompaction for {}.{} on {}/{} sstables", PreviewKind.NONE.logPrefix(sessionID), cfs.getKeyspaceName(), cfs.getTableName(), validatedForRepair.size(), cfs.getLiveSSTables().size());
+            if (logger.isTraceEnabled())
+                logger.trace("{} Starting anticompaction for ranges {}", PreviewKind.NONE.logPrefix(sessionID), replicas);
+
+            Set<SSTableReader> sstables = new HashSet<>(validatedForRepair);
+            validateSSTableBoundsForAnticompaction(sessionID, sstables, replicas);
+            mutateFullyContainedSSTables(cfs, validatedForRepair, sstables.iterator(), replicas.onlyFull().ranges(), txn, sessionID, false);
+            mutateFullyContainedSSTables(cfs, validatedForRepair, sstables.iterator(), replicas.onlyTransient().ranges(), txn, sessionID, true);
+
+            assert txn.originals().equals(sstables);
+            if (!sstables.isEmpty())
+                doAntiCompaction(cfs, replicas, txn, sessionID, isCancelled);
+            txn.finish();
+        }
+        finally
+        {
+            validatedForRepair.release();
+            txn.close();
+        }
+
+        logger.info("{} Completed anticompaction successfully", PreviewKind.NONE.logPrefix(sessionID));
+    }
+
+    static void validateSSTableBoundsForAnticompaction(TimeUUID sessionID,
+                                                       Collection<SSTableReader> sstables,
+                                                       RangesAtEndpoint ranges)
+    {
+        List<Range<Token>> normalizedRanges = Range.normalize(ranges.ranges());
+        for (SSTableReader sstable : sstables)
+        {
+            AbstractBounds<Token> bounds = sstable.getBounds();
+
+            if (!Iterables.any(normalizedRanges, r -> (r.contains(bounds.left) && r.contains(bounds.right)) || r.intersects(bounds)))
+            {
+                // this should never happen - in PendingAntiCompaction#getSSTables we select all sstables that intersect the repaired ranges, that can't have changed here
+                String message = String.format("%s SSTable %s (%s) does not intersect repaired ranges %s, this sstable should not have been included.",
+                                               PreviewKind.NONE.logPrefix(sessionID), sstable, bounds, normalizedRanges);
+                logger.error(message);
+                throw new IllegalStateException(message);
+            }
+        }
+
+    }
+
+    @VisibleForTesting
+    static Set<SSTableReader> findSSTablesToAnticompact(Iterator<SSTableReader> sstableIterator, List<Range<Token>> normalizedRanges, TimeUUID parentRepairSession)
+    {
+        Set<SSTableReader> fullyContainedSSTables = new HashSet<>();
+        while (sstableIterator.hasNext())
+        {
+            SSTableReader sstable = sstableIterator.next();
+
+            AbstractBounds<Token> sstableBounds = sstable.getBounds();
+
+            for (Range<Token> r : normalizedRanges)
+            {
+                // ranges are normalized - no wrap around - if first and last are contained we know that all tokens are contained in the range
+                if (r.contains(sstable.getFirst().getToken()) && r.contains(sstable.getLast().getToken()))
+                {
+                    logger.info("{} SSTable {} fully contained in range {}, mutating repairedAt instead of anticompacting", PreviewKind.NONE.logPrefix(parentRepairSession), sstable, r);
+                    fullyContainedSSTables.add(sstable);
+                    sstableIterator.remove();
+                    break;
+                }
+                else if (r.intersects(sstableBounds))
+                {
+                    logger.info("{} SSTable {} ({}) will be anticompacted on range {}", PreviewKind.NONE.logPrefix(parentRepairSession), sstable, sstableBounds, r);
+                }
+            }
+        }
+        return fullyContainedSSTables;
+    }
+
+    public void performMaximal(final ColumnFamilyStore cfStore)
+    {
+        performMaximal(cfStore, false, -1);
+    }
+
+    public void performMaximal(final ColumnFamilyStore cfStore, boolean splitOutput, int permittedParallelism)
+    {
+        FBUtilities.waitOnFutures(submitMaximal(cfStore, cfStore.getDefaultGcBefore(FBUtilities.nowInSeconds()), splitOutput, permittedParallelism));
+    }
+
+    public List<Future<?>> submitMaximal(final ColumnFamilyStore cfStore, boolean splitOutput, int permittedParallelism)
+    {
+        return submitMaximal(cfStore, cfStore.getDefaultGcBefore(FBUtilities.nowInSeconds()), splitOutput, permittedParallelism);
+    }
+
+    public List<Future<?>> submitMaximal(final ColumnFamilyStore cfStore, final long gcBefore, boolean splitOutput, int permittedParallelism)
+    {
+            return submitMaximal(cfStore, gcBefore, splitOutput, permittedParallelism, OperationType.MAJOR_COMPACTION);
+    }
+
+    public List<Future<?>> submitMaximal(final ColumnFamilyStore cfStore, final long gcBefore, boolean splitOutput, int permittedParallelism, OperationType operationType)
+    {
+        if (permittedParallelism < 0)
+            permittedParallelism = getCoreCompactorThreads() / 2;
+        else if (permittedParallelism == 0)
+            permittedParallelism = Integer.MAX_VALUE;
+
         // here we compute the task off the compaction executor, so having that present doesn't
         // confuse runWithCompactionsDisabled -- i.e., we don't want to deadlock ourselves, waiting
         // for ourselves to finish/acknowledge cancellation before continuing.
-        final AbstractCompactionTask task = cfStore.getCompactionStrategy().getMaximalTask(gcBefore);
-        Runnable runnable = new WrappedRunnable()
+        CompactionTasks tasks = cfStore.getCompactionStrategyManager().getMaximalTasks(gcBefore, splitOutput, permittedParallelism, operationType);
+
+        if (tasks == null || tasks.isEmpty())
+            return Collections.emptyList();
+
+        List<Future<?>> futures = new ArrayList<>();
+
+        int nonEmptyTasks = 0;
+        for (final AbstractCompactionTask task : tasks)
         {
-            protected void runMayThrow() throws IOException
+            if (task.transaction.originals().size() > 0)
+                nonEmptyTasks++;
+
+            Runnable runnable = new WrappedRunnable()
             {
-                if (task == null)
-                    return;
-                task.execute(metrics);
-            }
-        };
-        return executor.submit(runnable);
+                protected void runMayThrow()
+                {
+                    task.execute(active);
+                }
+            };
+
+            Future<?> fut = executor.submitIfRunning(runnable, "maximal task");
+            if (!fut.isCancelled())
+                futures.add(fut);
+            else
+                task.rejected();
+        }
+        if (nonEmptyTasks > 1)
+            logger.info("Major compaction will not result in a single sstable - repaired and unrepaired data is kept separate and compaction runs per data_file_directory.");
+
+        return futures;
     }
 
+    public void forceCompaction(ColumnFamilyStore cfStore, Supplier<Collection<SSTableReader>> sstablesFn, com.google.common.base.Predicate<SSTableReader> sstablesPredicate)
+    {
+        Callable<CompactionTasks> taskCreator = () -> {
+            Collection<SSTableReader> sstables = sstablesFn.get();
+            if (sstables == null || sstables.isEmpty())
+            {
+                logger.debug("No sstables found for the provided token range");
+                return CompactionTasks.empty();
+            }
+            return cfStore.getCompactionStrategyManager().getUserDefinedTasks(sstables, cfStore.getDefaultGcBefore(FBUtilities.nowInSeconds()));
+        };
+
+        try (CompactionTasks tasks = cfStore.runWithCompactionsDisabled(taskCreator,
+                                                                        sstablesPredicate,
+                                                                        OperationType.MAJOR_COMPACTION,
+                                                                        false,
+                                                                        false,
+                                                                        false))
+        {
+            if (tasks == null)
+                throw new RuntimeException("Unable to cancel in-progress compactions for " + cfStore.getKeyspaceName() + '.' + cfStore.getTableName() + ". Usually retrying will work.");
+
+            if (tasks.isEmpty())
+                return;
+
+            Runnable runnable = new WrappedRunnable()
+            {
+                protected void runMayThrow()
+                {
+                    for (AbstractCompactionTask task : tasks)
+                        if (task != null)
+                        {
+                            task.setCompactionType(OperationType.MAJOR_COMPACTION);
+                            task.execute(active);
+                        }
+                }
+            };
+
+            FBUtilities.waitOnFuture(executor.submitIfRunning(runnable, "force compaction for token range"));
+        }
+    }
+
+    /**
+     * Forces a major compaction of specified token ranges of the specified column family.
+     * <p>
+     * The token ranges will be interpreted as closed intervals to match the closed interval defined by the first and
+     * last keys of a sstable, even though the {@link Range} class is suppossed to be half-open by definition.
+     *
+     * @param cfStore The column family store to be compacted.
+     * @param ranges The token ranges to be compacted, interpreted as closed intervals.
+     */
+    public void forceCompactionForTokenRange(ColumnFamilyStore cfStore, Collection<Range<Token>> ranges)
+    {
+        forceCompaction(cfStore,
+                        () -> sstablesInBounds(cfStore, ranges),
+                        sstable -> sstable.getBounds().intersects(ranges));
+    }
+
+    /**
+     * Returns the sstables of the specified column family store that intersect with the specified token ranges.
+     * <p>
+     * The token ranges will be interpreted as closed intervals to match the closed interval defined by the first and
+     * last keys of a sstable, even though the {@link Range} class is suppossed to be half-open by definition.
+     */
+    private static Collection<SSTableReader> sstablesInBounds(ColumnFamilyStore cfs, Collection<Range<Token>> tokenRangeCollection)
+    {
+        final Set<SSTableReader> sstables = new HashSet<>();
+        Iterable<SSTableReader> liveTables = cfs.getTracker().getView().select(SSTableSet.LIVE);
+        SSTableIntervalTree tree = buildSSTableIntervalTree(ImmutableList.copyOf(liveTables));
+        for (Range<Token> tokenRange : tokenRangeCollection)
+        {
+            if (!AbstractBounds.strictlyWrapsAround(tokenRange.left, tokenRange.right))
+            {
+                Iterable<SSTableReader> ssTableReaders = View.sstablesInBounds(tokenRange.left.minKeyBound(), tokenRange.right.maxKeyBound(), tree);
+                Iterables.addAll(sstables, ssTableReaders);
+            }
+            else
+            {
+                // Searching an interval tree will not return the correct results for a wrapping range
+                // so we have to unwrap it first
+                for (Range<Token> unwrappedRange : tokenRange.unwrap())
+                {
+                    Iterable<SSTableReader> ssTableReaders = View.sstablesInBounds(unwrappedRange.left.minKeyBound(), unwrappedRange.right.maxKeyBound(), tree);
+                    Iterables.addAll(sstables, ssTableReaders);
+                }
+            }
+        }
+        return sstables;
+    }
+
+    public void forceCompactionForKey(ColumnFamilyStore cfStore, DecoratedKey key)
+    {
+        forceCompaction(cfStore, () -> sstablesWithKey(cfStore, key), Predicates.alwaysTrue());
+    }
+
+    public void forceCompactionForKeys(ColumnFamilyStore cfStore, Collection<DecoratedKey> keys)
+    {
+        forceCompaction(cfStore, () -> sstablesWithKeys(cfStore, keys), Predicates.alwaysTrue());
+    }
+
+    private static Collection<SSTableReader> sstablesWithKey(ColumnFamilyStore cfs, DecoratedKey key)
+    {
+        final Set<SSTableReader> sstables = new HashSet<>();
+        Iterable<SSTableReader> liveTables = cfs.getTracker().getView().liveSSTablesInBounds(key.getToken().minKeyBound(),
+                                                                                             key.getToken().maxKeyBound());
+        for (SSTableReader sstable : liveTables)
+        {
+            if (sstable.mayContainAssumingKeyIsInRange(key))
+                sstables.add(sstable);
+        }
+        return sstables.isEmpty() ? Collections.emptyList() : sstables;
+    }
+
+    private static Collection<SSTableReader> sstablesWithKeys(ColumnFamilyStore cfs, Collection<DecoratedKey> decoratedKeys)
+    {
+        final Set<SSTableReader> sstables = new HashSet<>();
+
+        for (DecoratedKey decoratedKey : decoratedKeys)
+        {
+            sstables.addAll(sstablesWithKey(cfs, decoratedKey));
+        }
+
+        return sstables;
+    }
+
+    @Override
     public void forceUserDefinedCompaction(String dataFiles)
     {
+        Multimap<ColumnFamilyStore, Descriptor> descriptors = Descriptor.fromFilenamesGrouped(Arrays.asList(dataFiles.split(",")));
+
+        List<Future<?>> futures = new ArrayList<>(descriptors.size());
+        long nowInSec = FBUtilities.nowInSeconds();
+        for (ColumnFamilyStore cfs : descriptors.keySet())
+            futures.add(submitUserDefined(cfs, descriptors.get(cfs), cfs.getDefaultGcBefore(nowInSec)));
+        FBUtilities.waitOnFutures(futures);
+    }
+
+    @Override
+    public void forceUserDefinedCleanup(String dataFiles)
+    {
         String[] filenames = dataFiles.split(",");
-        Multimap<Pair<String, String>, Descriptor> descriptors = ArrayListMultimap.create();
+        HashMap<ColumnFamilyStore, Descriptor> descriptors = Maps.newHashMap();
 
         for (String filename : filenames)
         {
             // extract keyspace and columnfamily name from filename
-            Descriptor desc = Descriptor.fromFilename(filename.trim());
-            if (Schema.instance.getCFMetaData(desc) == null)
+            Descriptor desc = Descriptor.fromFileWithComponent(new File(filename.trim()), false).left;
+            if (Schema.instance.getTableMetadataRef(desc) == null)
             {
                 logger.warn("Schema does not exist for file {}. Skipping.", filename);
                 continue;
             }
-            File directory = new File(desc.ksname + File.separator + desc.cfname);
             // group by keyspace/columnfamily
-            Pair<Descriptor, String> p = Descriptor.fromFilename(directory, filename.trim());
-            Pair<String, String> key = Pair.create(p.left.ksname, p.left.cfname);
-            descriptors.put(key, p.left);
+            ColumnFamilyStore cfs = Keyspace.open(desc.ksname).getColumnFamilyStore(desc.cfname);
+            desc = cfs.getDirectories().find(new File(filename.trim()).name());
+            if (desc != null)
+                descriptors.put(cfs, desc);
         }
 
-        List<Future<?>> futures = new ArrayList<>();
-        for (Pair<String, String> key : descriptors.keySet())
+        if (!StorageService.instance.isJoined())
         {
-            ColumnFamilyStore cfs = Keyspace.open(key.left).getColumnFamilyStore(key.right);
-            futures.add(submitUserDefined(cfs, descriptors.get(key), getDefaultGcBefore(cfs)));
+            logger.error("Cleanup cannot run before a node has joined the ring");
+            return;
         }
-        FBUtilities.waitOnFutures(futures);
+
+        for (Map.Entry<ColumnFamilyStore,Descriptor> entry : descriptors.entrySet())
+        {
+            ColumnFamilyStore cfs = entry.getKey();
+            Keyspace keyspace = cfs.keyspace;
+            final RangesAtEndpoint replicas = StorageService.instance.getLocalReplicas(keyspace.getName());
+            final Set<Range<Token>> allRanges = replicas.ranges();
+            final Set<Range<Token>> transientRanges = replicas.onlyTransient().ranges();
+            boolean hasIndexes = cfs.indexManager.hasIndexes();
+            SSTableReader sstable = lookupSSTable(cfs, entry.getValue());
+
+            if (sstable == null)
+            {
+                logger.warn("Will not clean {}, it is not an active sstable", entry.getValue());
+            }
+            else
+            {
+                CleanupStrategy cleanupStrategy = CleanupStrategy.get(cfs, allRanges, transientRanges, sstable.isRepaired(), FBUtilities.nowInSeconds());
+                try (LifecycleTransaction txn = cfs.getTracker().tryModify(sstable, OperationType.CLEANUP))
+                {
+                    doCleanupOne(cfs, txn, cleanupStrategy, allRanges, hasIndexes);
+                }
+                catch (IOException e)
+                {
+                    logger.error("forceUserDefinedCleanup failed: {}", e.getLocalizedMessage());
+                }
+            }
+        }
     }
 
-    public Future<?> submitUserDefined(final ColumnFamilyStore cfs, final Collection<Descriptor> dataFiles, final int gcBefore)
+
+    public Future<?> submitUserDefined(final ColumnFamilyStore cfs, final Collection<Descriptor> dataFiles, final long gcBefore)
     {
         Runnable runnable = new WrappedRunnable()
         {
-            protected void runMayThrow() throws IOException
+            protected void runMayThrow() throws Exception
             {
                 // look up the sstables now that we're on the compaction executor, so we don't try to re-compact
                 // something that was already being compacted earlier.
-                Collection<SSTableReader> sstables = new ArrayList<SSTableReader>(dataFiles.size());
+                Collection<SSTableReader> sstables = new ArrayList<>(dataFiles.size());
                 for (Descriptor desc : dataFiles)
                 {
                     // inefficient but not in a performance sensitive path
@@ -358,112 +1453,114 @@ public class CompactionManager implements CompactionManagerMBean
                 }
                 else
                 {
-                    AbstractCompactionTask task = cfs.getCompactionStrategy().getUserDefinedTask(sstables, gcBefore);
-                    if (task != null)
-                        task.execute(metrics);
+                    try (CompactionTasks tasks = cfs.getCompactionStrategyManager().getUserDefinedTasks(sstables, gcBefore))
+                    {
+                        for (AbstractCompactionTask task : tasks)
+                        {
+                            if (task != null)
+                                task.execute(active);
+                        }
+                    }
                 }
             }
         };
-        return executor.submit(runnable);
+
+        return executor.submitIfRunning(runnable, "user defined task");
     }
 
     // This acquire a reference on the sstable
-    // This is not efficent, do not use in any critical path
+    // This is not efficient, do not use in any critical path
     private SSTableReader lookupSSTable(final ColumnFamilyStore cfs, Descriptor descriptor)
     {
-        for (SSTableReader sstable : cfs.getSSTables())
+        for (SSTableReader sstable : cfs.getSSTables(SSTableSet.CANONICAL))
         {
-            // .equals() with no other changes won't work because in sstable.descriptor, the directory is an absolute path.
-            // We could construct descriptor with an absolute path too but I haven't found any satisfying way to do that
-            // (DB.getDataFileLocationForTable() may not return the right path if you have multiple volumes). Hence the
-            // endsWith.
-            if (sstable.descriptor.toString().endsWith(descriptor.toString()))
+            if (sstable.descriptor.equals(descriptor))
                 return sstable;
         }
         return null;
     }
 
-    /**
-     * Does not mutate data, so is not scheduled.
-     */
-    public Future<Object> submitValidation(final ColumnFamilyStore cfStore, final Validator validator)
+    public Future<?> submitValidation(Callable<Object> validation)
     {
-        Callable<Object> callable = new Callable<Object>()
-        {
-            public Object call() throws IOException
-            {
-                try
-                {
-                    doValidationCompaction(cfStore, validator);
-                }
-                catch (Throwable e)
-                {
-                    // we need to inform the remote end of our failure, otherwise it will hang on repair forever
-                    validator.fail();
-                    throw e;
-                }
-                return this;
-            }
-        };
-        return validationExecutor.submit(callable);
+        return validationExecutor.submitIfRunning(validation, "validation");
     }
 
     /* Used in tests. */
     public void disableAutoCompaction()
     {
-        for (String ksname : Schema.instance.getNonSystemKeyspaces())
+        for (String ksname : Schema.instance.getKeyspaces())
         {
             for (ColumnFamilyStore cfs : Keyspace.open(ksname).getColumnFamilyStores())
                 cfs.disableAutoCompaction();
         }
     }
 
-    /**
-     * Deserialize everything in the CFS and re-serialize w/ the newest version.  Also attempts to recover
-     * from bogus row keys / sizes using data from the index, and skips rows with garbage columns that resulted
-     * from early ByteBuffer bugs.
-     *
-     * @throws IOException
-     */
-    private void doScrub(ColumnFamilyStore cfs, Iterable<SSTableReader> sstables) throws IOException
+    @VisibleForTesting
+    void scrubOne(ColumnFamilyStore cfs, LifecycleTransaction modifier, IScrubber.Options options, ActiveCompactionsTracker activeCompactions)
     {
-        assert !cfs.isIndex();
-        for (final SSTableReader sstable : sstables)
-            scrubOne(cfs, sstable);
-    }
-
-    private void scrubOne(ColumnFamilyStore cfs, SSTableReader sstable) throws IOException
-    {
-        Scrubber scrubber = new Scrubber(cfs, sstable);
-
-        CompactionInfo.Holder scrubInfo = scrubber.getScrubInfo();
-        metrics.beginCompaction(scrubInfo);
-        try
+        CompactionInfo.Holder scrubInfo = null;
+        SSTableFormat format = modifier.onlyOne().descriptor.getFormat();
+        try (IScrubber scrubber = format.getScrubber(cfs, modifier, new OutputHandler.LogOutput(), options))
         {
+            scrubInfo = scrubber.getScrubInfo();
+            activeCompactions.beginCompaction(scrubInfo);
             scrubber.scrub();
         }
         finally
         {
-            scrubber.close();
-            metrics.finishCompaction(scrubInfo);
+            if (scrubInfo != null)
+                activeCompactions.finishCompaction(scrubInfo);
+        }
+    }
+
+    @VisibleForTesting
+    void verifyOne(ColumnFamilyStore cfs, SSTableReader sstable, IVerifier.Options options, ActiveCompactionsTracker activeCompactions)
+    {
+
+        StorageAttachedIndexGroup indexGroup = StorageAttachedIndexGroup.getIndexGroup(cfs);
+        boolean skipSaiCheck = indexGroup == null;
+
+        // Skip early if no SAI indexes on table
+        if (options.onlySai && skipSaiCheck)
+        {
+            logger.info("Skipping SAI validation for table {} because it has no SAI indexes.", cfs.getTableName());
+            return;
         }
 
-        if (scrubber.getNewInOrderSSTable() != null)
-            cfs.addSSTable(scrubber.getNewInOrderSSTable());
+        CompactionInfo.Holder verifyInfo = null;
 
-        if (scrubber.getNewSSTable() == null)
-            cfs.markObsolete(Collections.singletonList(sstable), OperationType.SCRUB);
-        else
-            cfs.replaceCompactedSSTables(Collections.singletonList(sstable), Collections.singletonList(scrubber.getNewSSTable()), OperationType.SCRUB);
+        if (!options.onlySai)
+        {
+            try (IVerifier verifier = sstable.getVerifier(cfs, new OutputHandler.LogOutput(), false, options))
+            {
+                verifyInfo = verifier.getVerifyInfo();
+                activeCompactions.beginCompaction(verifyInfo);
+                verifier.verify();
+            }
+            finally
+            {
+                if (verifyInfo != null)
+                    activeCompactions.finishCompaction(verifyInfo);
+            }
+        }
+
+        if ((options.onlySai || options.includeSai) && !skipSaiCheck)
+        {
+            cfs.indexManager.validateSSTableAttachedIndexes(Collections.singleton(sstable), true, true);
+        }
     }
 
     /**
      * Determines if a cleanup would actually remove any data in this SSTable based
      * on a set of owned ranges.
      */
-    static boolean needsCleanup(SSTableReader sstable, Collection<Range<Token>> ownedRanges)
+    @VisibleForTesting
+    public static boolean needsCleanup(SSTableReader sstable, Collection<Range<Token>> ownedRanges)
     {
-        assert !ownedRanges.isEmpty(); // cleanup checks for this
+        if (ownedRanges.isEmpty())
+        {
+            return true; // all data will be cleaned
+        }
 
         // unwrap and sort the ranges by LHS token
         List<Range<Token>> sortedRanges = Range.normalize(ownedRanges);
@@ -471,7 +1568,7 @@ public class CompactionManager implements CompactionManagerMBean
         // see if there are any keys LTE the token for the start of the first range
         // (token range ownership is exclusive on the LHS.)
         Range<Token> firstRange = sortedRanges.get(0);
-        if (sstable.first.token.compareTo(firstRange.left) <= 0)
+        if (sstable.getFirst().getToken().compareTo(firstRange.left) <= 0)
             return true;
 
         // then, iterate over all owned ranges and see if the next key beyond the end of the owned
@@ -493,14 +1590,14 @@ public class CompactionManager implements CompactionManagerMBean
                 return false;
             }
 
-            if (i == (ownedRanges.size() - 1))
+            if (i == (sortedRanges.size() - 1))
             {
                 // we're at the last range and we found a key beyond the end of the range
                 return true;
             }
 
             Range<Token> nextRange = sortedRanges.get(i + 1);
-            if (!nextRange.contains(firstBeyondRange.token))
+            if (firstBeyondRange.getToken().compareTo(nextRange.left) <= 0)
             {
                 // we found a key in between the owned ranges
                 return true;
@@ -511,136 +1608,152 @@ public class CompactionManager implements CompactionManagerMBean
     }
 
     /**
-     * This function goes over each file and removes the keys that the node is not responsible for
+     * This function goes over a file and removes the keys that the node is not responsible for
      * and only keeps keys that this node is responsible for.
      *
      * @throws IOException
      */
-    private void doCleanupCompaction(final ColumnFamilyStore cfs, Collection<SSTableReader> sstables, CounterId.OneShotRenewer renewer) throws IOException
+    private void doCleanupOne(final ColumnFamilyStore cfs,
+                              LifecycleTransaction txn,
+                              CleanupStrategy cleanupStrategy,
+                              Collection<Range<Token>> allRanges,
+                              boolean hasIndexes) throws IOException
     {
         assert !cfs.isIndex();
-        Keyspace keyspace = cfs.keyspace;
-        Collection<Range<Token>> ranges = StorageService.instance.getLocalRanges(keyspace.getName());
-        if (ranges.isEmpty())
+
+        SSTableReader sstable = txn.onlyOne();
+
+        // if ranges is empty and no index, entire sstable is discarded
+        if (!hasIndexes && !sstable.getBounds().intersects(allRanges))
         {
-            logger.info("Cleanup cannot run before a node has joined the ring");
+            txn.obsoleteOriginals();
+            txn.finish();
+            logger.info("SSTable {} ([{}, {}]) does not intersect the owned ranges ({}), dropping it", sstable, sstable.getFirst().getToken(), sstable.getLast().getToken(), allRanges);
             return;
         }
 
-        boolean hasIndexes = cfs.indexManager.hasIndexes();
-        CleanupStrategy cleanupStrategy = CleanupStrategy.get(cfs, ranges, renewer);
+        long start = nanoTime();
 
-        for (SSTableReader sstable : sstables)
+        long totalkeysWritten = 0;
+
+        long expectedBloomFilterSize = Math.max(cfs.metadata().params.minIndexInterval,
+                                                SSTableReader.getApproximateKeyCount(txn.originals()));
+
+        logger.trace("Expected bloom filter size : {}", expectedBloomFilterSize);
+        logger.info("Cleaning up {}", sstable);
+
+        File compactionFileLocation = sstable.descriptor.directory;
+        RateLimiter limiter = getRateLimiter();
+        double compressionRatio = sstable.getCompressionRatio();
+        if (compressionRatio == MetadataCollector.NO_COMPRESSION_RATIO)
+            compressionRatio = 1.0;
+
+        List<SSTableReader> finished;
+
+        long nowInSec = FBUtilities.nowInSeconds();
+        try (SSTableRewriter writer = SSTableRewriter.construct(cfs, txn, false, sstable.maxDataAge);
+             ISSTableScanner scanner = cleanupStrategy.getScanner(sstable);
+             CompactionController controller = new CompactionController(cfs, txn.originals(), cfs.getDefaultGcBefore(nowInSec));
+             Refs<SSTableReader> refs = Refs.ref(Collections.singleton(sstable));
+             CompactionIterator ci = new CompactionIterator(OperationType.CLEANUP, Collections.singletonList(scanner), controller, nowInSec, nextTimeUUID(), active, null))
         {
-            if (!hasIndexes && !new Bounds<Token>(sstable.first.token, sstable.last.token).intersects(ranges))
+            StatsMetadata metadata = sstable.getSSTableMetadata();
+            writer.switchWriter(createWriter(cfs, compactionFileLocation, expectedBloomFilterSize, metadata.repairedAt, metadata.pendingRepair, metadata.isTransient, sstable, txn));
+            long lastBytesScanned = 0;
+
+            while (ci.hasNext())
             {
-                cfs.replaceCompactedSSTables(Arrays.asList(sstable), Collections.<SSTableReader>emptyList(), OperationType.CLEANUP);
-                continue;
-            }
-            if (!needsCleanup(sstable, ranges))
-            {
-                logger.debug("Skipping {} for cleanup; all rows should be kept", sstable);
-                continue;
-            }
-
-            CompactionController controller = new CompactionController(cfs, Collections.singleton(sstable), getDefaultGcBefore(cfs));
-            long start = System.nanoTime();
-
-            long totalkeysWritten = 0;
-
-            int expectedBloomFilterSize = Math.max(cfs.metadata.getIndexInterval(),
-                                                   (int) (SSTableReader.getApproximateKeyCount(Arrays.asList(sstable), cfs.metadata)));
-            if (logger.isDebugEnabled())
-                logger.debug("Expected bloom filter size : {}", expectedBloomFilterSize);
-
-            logger.info("Cleaning up {}", sstable);
-
-            File compactionFileLocation = cfs.directories.getDirectoryForNewSSTables();
-            if (compactionFileLocation == null)
-                throw new IOException("disk full");
-
-            ICompactionScanner scanner = cleanupStrategy.getScanner(sstable, getRateLimiter());
-            CleanupInfo ci = new CleanupInfo(sstable, (SSTableScanner)scanner);
-
-            metrics.beginCompaction(ci);
-            SSTableWriter writer = createWriter(cfs,
-                                                compactionFileLocation,
-                                                expectedBloomFilterSize,
-                                                sstable);
-            SSTableReader newSstable = null;
-            try
-            {
-                while (scanner.hasNext())
+                ci.setTargetDirectory(writer.currentWriter().getFilename());
+                try (UnfilteredRowIterator partition = ci.next();
+                     UnfilteredRowIterator notCleaned = cleanupStrategy.cleanup(partition))
                 {
-                    if (ci.isStopRequested())
-                        throw new CompactionInterruptedException(ci.getCompactionInfo());
-                    SSTableIdentityIterator row = (SSTableIdentityIterator) scanner.next();
-
-                    row = cleanupStrategy.cleanup(row);
-                    if (row == null)
+                    if (notCleaned == null)
                         continue;
-                    AbstractCompactedRow compactedRow = new LazilyCompactedRow(controller, Collections.singletonList(row));
-                    if (writer.append(compactedRow) != null)
+
+                    if (writer.append(notCleaned) != null)
                         totalkeysWritten++;
+
+                    long bytesScanned = scanner.getBytesScanned();
+
+                    compactionRateLimiterAcquire(limiter, bytesScanned, lastBytesScanned, compressionRatio);
+
+                    lastBytesScanned = bytesScanned;
                 }
-                if (totalkeysWritten > 0)
-                    newSstable = writer.closeAndOpenReader(sstable.maxDataAge);
-                else
-                    writer.abort();
-            }
-            catch (Throwable e)
-            {
-                writer.abort();
-                throw Throwables.propagate(e);
-            }
-            finally
-            {
-                controller.close();
-                scanner.close();
-                metrics.finishCompaction(ci);
-            }
-
-            List<SSTableReader> results = new ArrayList<SSTableReader>(1);
-            if (newSstable != null)
-            {
-                results.add(newSstable);
-
-                String format = "Cleaned up to %s.  %,d to %,d (~%d%% of original) bytes for %,d keys.  Time: %,dms.";
-                long dTime = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
-                long startsize = sstable.onDiskLength();
-                long endsize = newSstable.onDiskLength();
-                double ratio = (double) endsize / (double) startsize;
-                logger.info(String.format(format, writer.getFilename(), startsize, endsize, (int) (ratio * 100), totalkeysWritten, dTime));
             }
 
             // flush to ensure we don't lose the tombstones on a restart, since they are not commitlog'd
-            cfs.indexManager.flushIndexesBlocking();
+            cfs.indexManager.flushAllIndexesBlocking();
 
-            cfs.replaceCompactedSSTables(Arrays.asList(sstable), results, OperationType.CLEANUP);
+            finished = writer.finish();
+        }
+
+        if (!finished.isEmpty())
+        {
+            String format = "Cleaned up to %s.  %s to %s (~%d%% of original) for %,d keys.  Time: %,dms.";
+            long dTime = TimeUnit.NANOSECONDS.toMillis(nanoTime() - start);
+            long startsize = sstable.onDiskLength();
+            long endsize = 0;
+            for (SSTableReader newSstable : finished)
+                endsize += newSstable.onDiskLength();
+            double ratio = (double) endsize / (double) startsize;
+            logger.info(String.format(format, finished.get(0).getFilename(), FBUtilities.prettyPrintMemory(startsize),
+                                      FBUtilities.prettyPrintMemory(endsize), (int) (ratio * 100), totalkeysWritten, dTime));
+        }
+
+    }
+
+    protected void compactionRateLimiterAcquire(RateLimiter limiter, long bytesScanned, long lastBytesScanned, double compressionRatio)
+    {
+        long lengthRead = (long) ((bytesScanned - lastBytesScanned) * compressionRatio) + 1;
+        metrics.bytesCompactedThroughput.mark(lengthRead);
+        while (lengthRead >= Integer.MAX_VALUE)
+        {
+            limiter.acquire(Integer.MAX_VALUE);
+            lengthRead -= Integer.MAX_VALUE;
+        }
+        if (lengthRead > 0)
+        {
+            limiter.acquire((int) lengthRead);
         }
     }
 
     private static abstract class CleanupStrategy
     {
-        public static CleanupStrategy get(ColumnFamilyStore cfs, Collection<Range<Token>> ranges, CounterId.OneShotRenewer renewer)
-        {
-            if (cfs.indexManager.hasIndexes() || cfs.metadata.getDefaultValidator().isCommutative())
-                return new Full(cfs, ranges, renewer);
+        protected final Collection<Range<Token>> ranges;
+        protected final long nowInSec;
 
-            return new Bounded(cfs, ranges);
+        protected CleanupStrategy(Collection<Range<Token>> ranges, long nowInSec)
+        {
+            this.ranges = ranges;
+            this.nowInSec = nowInSec;
         }
 
-        public abstract ICompactionScanner getScanner(SSTableReader sstable, RateLimiter limiter);
-        public abstract SSTableIdentityIterator cleanup(SSTableIdentityIterator row);
+        public static CleanupStrategy get(ColumnFamilyStore cfs, Collection<Range<Token>> ranges, Collection<Range<Token>> transientRanges, boolean isRepaired, long nowInSec)
+        {
+            if (cfs.indexManager.hasIndexes())
+            {
+                if (!transientRanges.isEmpty())
+                {
+                    //Shouldn't have been possible to create this situation
+                    throw new AssertionError("Can't have indexes and transient ranges");
+                }
+                return new Full(cfs, ranges, nowInSec);
+            }
+            return new Bounded(cfs, ranges, transientRanges, isRepaired, nowInSec);
+        }
+
+        public abstract ISSTableScanner getScanner(SSTableReader sstable);
+        public abstract UnfilteredRowIterator cleanup(UnfilteredRowIterator partition);
 
         private static final class Bounded extends CleanupStrategy
         {
-            private final Collection<Range<Token>> ranges;
+            private final Collection<Range<Token>> transientRanges;
+            private final boolean isRepaired;
 
-            public Bounded(final ColumnFamilyStore cfs, Collection<Range<Token>> ranges)
+            public Bounded(final ColumnFamilyStore cfs, Collection<Range<Token>> ranges, Collection<Range<Token>> transientRanges, boolean isRepaired, long nowInSec)
             {
-                this.ranges = ranges;
-                cacheCleanupExecutor.submit(new Runnable()
+                super(ranges, nowInSec);
+                instance.cacheCleanupExecutor.submit(new Runnable()
                 {
                     @Override
                     public void run()
@@ -648,81 +1761,57 @@ public class CompactionManager implements CompactionManagerMBean
                         cfs.cleanupCache();
                     }
                 });
-
-            }
-            @Override
-            public ICompactionScanner getScanner(SSTableReader sstable, RateLimiter limiter)
-            {
-                return sstable.getScanner(ranges, limiter);
+                this.transientRanges = transientRanges;
+                this.isRepaired = isRepaired;
             }
 
             @Override
-            public SSTableIdentityIterator cleanup(SSTableIdentityIterator row)
+            public ISSTableScanner getScanner(SSTableReader sstable)
             {
-                return row;
+                //If transient replication is enabled and there are transient ranges
+                //then cleanup should remove any partitions that are repaired and in the transient range
+                //as they should already be synchronized at other full replicas.
+                //So just don't scan the portion of the table containing the repaired transient ranges
+                Collection<Range<Token>> rangesToScan = ranges;
+                if (isRepaired)
+                {
+                    rangesToScan = Collections2.filter(ranges, range -> !transientRanges.contains(range));
+                }
+                return sstable.getScanner(rangesToScan, DatabaseDescriptor.getCompactionReadDiskAccessMode());
+            }
+
+            @Override
+            public UnfilteredRowIterator cleanup(UnfilteredRowIterator partition)
+            {
+                return partition;
             }
         }
 
         private static final class Full extends CleanupStrategy
         {
-            private final Collection<Range<Token>> ranges;
             private final ColumnFamilyStore cfs;
-            private List<Column> indexedColumnsInRow;
-            private final CounterId.OneShotRenewer renewer;
 
-            public Full(ColumnFamilyStore cfs, Collection<Range<Token>> ranges, CounterId.OneShotRenewer renewer)
+            public Full(ColumnFamilyStore cfs, Collection<Range<Token>> ranges, long nowInSec)
             {
+                super(ranges, nowInSec);
                 this.cfs = cfs;
-                this.ranges = ranges;
-                this.indexedColumnsInRow = null;
-                this.renewer = renewer;
             }
 
             @Override
-            public ICompactionScanner getScanner(SSTableReader sstable, RateLimiter limiter)
+            public ISSTableScanner getScanner(SSTableReader sstable)
             {
-                return sstable.getScanner(limiter);
+                return sstable.getScanner(DatabaseDescriptor.getCompactionReadDiskAccessMode());
             }
 
             @Override
-            public SSTableIdentityIterator cleanup(SSTableIdentityIterator row)
+            public UnfilteredRowIterator cleanup(UnfilteredRowIterator partition)
             {
-                if (Range.isInRanges(row.getKey().token, ranges))
-                    return row;
+                if (Range.isInRanges(partition.partitionKey().getToken(), ranges))
+                    return partition;
 
-                cfs.invalidateCachedRow(row.getKey());
+                cfs.invalidateCachedPartition(partition.partitionKey());
 
-                if (indexedColumnsInRow != null)
-                    indexedColumnsInRow.clear();
-
-                while (row.hasNext())
-                {
-                    OnDiskAtom column = row.next();
-                    if (column instanceof CounterColumn)
-                        renewer.maybeRenew((CounterColumn) column);
-
-                    if (column instanceof Column && cfs.indexManager.indexes((Column) column))
-                    {
-                        if (indexedColumnsInRow == null)
-                            indexedColumnsInRow = new ArrayList<>();
-
-                        indexedColumnsInRow.add((Column) column);
-                    }
-                }
-
-                if (indexedColumnsInRow != null && !indexedColumnsInRow.isEmpty())
-                {
-                    // acquire memtable lock here because secondary index deletion may cause a race. See CASSANDRA-3712
-                    Keyspace.switchLock.readLock().lock();
-                    try
-                    {
-                        cfs.indexManager.deleteFromIndexes(row.getKey(), indexedColumnsInRow);
-                    }
-                    finally
-                    {
-                        Keyspace.switchLock.readLock().unlock();
-                    }
-                }
+                cfs.indexManager.deletePartition(partition, nowInSec);
                 return null;
             }
         }
@@ -730,92 +1819,318 @@ public class CompactionManager implements CompactionManagerMBean
 
     public static SSTableWriter createWriter(ColumnFamilyStore cfs,
                                              File compactionFileLocation,
-                                             int expectedBloomFilterSize,
-                                             SSTableReader sstable)
+                                             long expectedBloomFilterSize,
+                                             long repairedAt,
+                                             TimeUUID pendingRepair,
+                                             boolean isTransient,
+                                             SSTableReader sstable,
+                                             LifecycleTransaction txn)
     {
         FileUtils.createDirectory(compactionFileLocation);
-        return new SSTableWriter(cfs.getTempSSTablePath(compactionFileLocation),
-                                 expectedBloomFilterSize,
-                                 cfs.metadata,
-                                 cfs.partitioner,
-                                 SSTableMetadata.createCollector(Collections.singleton(sstable), cfs.metadata.comparator, sstable.getSSTableLevel()));
+
+        Descriptor descriptor = cfs.newSSTableDescriptor(compactionFileLocation);
+        return descriptor.getFormat().getWriterFactory().builder(descriptor)
+                         .setKeyCount(expectedBloomFilterSize)
+                         .setRepairedAt(repairedAt)
+                         .setPendingRepair(pendingRepair)
+                         .setTransientSSTable(isTransient)
+                         .setTableMetadataRef(cfs.metadata)
+                         .setMetadataCollector(new MetadataCollector(cfs.metadata().comparator).sstableLevel(sstable.getSSTableLevel()))
+                         .setSerializationHeader(sstable.header)
+                         .addDefaultComponents(cfs.indexManager.listIndexGroups())
+                         .setSecondaryIndexGroups(cfs.indexManager.listIndexGroups())
+                         .setCompressionDictionaryManager(cfs.compressionDictionaryManager())
+                         .build(txn, cfs);
+    }
+
+    public static SSTableWriter createWriterForAntiCompaction(ColumnFamilyStore cfs,
+                                                              File compactionFileLocation,
+                                                              int expectedBloomFilterSize,
+                                                              long repairedAt,
+                                                              TimeUUID pendingRepair,
+                                                              boolean isTransient,
+                                                              Collection<SSTableReader> sstables,
+                                                              ILifecycleTransaction txn)
+    {
+        FileUtils.createDirectory(compactionFileLocation);
+        int minLevel = Integer.MAX_VALUE;
+        // if all sstables have the same level, we can compact them together without creating overlap during anticompaction
+        // note that we only anticompact from unrepaired sstables, which is not leveled, but we still keep original level
+        // after first migration to be able to drop the sstables back in their original place in the repaired sstable manifest
+        for (SSTableReader sstable : sstables)
+        {
+            if (minLevel == Integer.MAX_VALUE)
+                minLevel = sstable.getSSTableLevel();
+
+            if (minLevel != sstable.getSSTableLevel())
+            {
+                minLevel = 0;
+                break;
+            }
+        }
+
+        Descriptor descriptor = cfs.newSSTableDescriptor(compactionFileLocation);
+        return descriptor.getFormat().getWriterFactory().builder(descriptor)
+                         .setKeyCount(expectedBloomFilterSize)
+                         .setRepairedAt(repairedAt)
+                         .setPendingRepair(pendingRepair)
+                         .setTransientSSTable(isTransient)
+                         .setTableMetadataRef(cfs.metadata)
+                         .setMetadataCollector(new MetadataCollector(sstables, cfs.metadata().comparator).sstableLevel(minLevel))
+                         .setSerializationHeader(SerializationHeader.make(cfs.metadata(), sstables))
+                         .addDefaultComponents(cfs.indexManager.listIndexGroups())
+                         .setSecondaryIndexGroups(cfs.indexManager.listIndexGroups())
+                         .setCompressionDictionaryManager(cfs.compressionDictionaryManager())
+                         .build(txn, cfs);
     }
 
     /**
-     * Performs a readonly "compaction" of all sstables in order to validate complete rows,
-     * but without writing the merge result
+     * Splits up an sstable into two new sstables. The first of the new tables will store repaired ranges, the second
+     * will store the non-repaired ranges. Once anticompation is completed, the original sstable is marked as compacted
+     * and subsequently deleted.
+     * @param cfs
+     * @param txn a transaction over the repaired sstables to anticompact
+     * @param ranges full and transient ranges to be placed into one of the new sstables. The repaired table will be tracked via
+     *   the {@link org.apache.cassandra.io.sstable.metadata.StatsMetadata#pendingRepair} field.
+     * @param pendingRepair the repair session we're anti-compacting for
+     * @param isCancelled function that indicates if active anti-compaction should be canceled
      */
-    private void doValidationCompaction(ColumnFamilyStore cfs, Validator validator) throws IOException
+    private void doAntiCompaction(ColumnFamilyStore cfs,
+                                  RangesAtEndpoint ranges,
+                                  LifecycleTransaction txn,
+                                  TimeUUID pendingRepair,
+                                  BooleanSupplier isCancelled)
     {
-        // this isn't meant to be race-proof, because it's not -- it won't cause bugs for a CFS to be dropped
-        // mid-validation, or to attempt to validate a droped CFS.  this is just a best effort to avoid useless work,
-        // particularly in the scenario where a validation is submitted before the drop, and there are compactions
-        // started prior to the drop keeping some sstables alive.  Since validationCompaction can run
-        // concurrently with other compactions, it would otherwise go ahead and scan those again.
-        if (!cfs.isValid())
-            return;
+        int originalCount = txn.originals().size();
+        logger.info("Performing anticompaction on {} sstables for {}", originalCount, pendingRepair);
 
-        Collection<SSTableReader> sstables;
-        String snapshotName = validator.desc.sessionId.toString();
-        int gcBefore;
-        boolean isSnapshotValidation = cfs.snapshotExists(snapshotName);
-        if (isSnapshotValidation)
+        //Group SSTables
+        Set<SSTableReader> sstables = txn.originals();
+
+        // Repairs can take place on both unrepaired (incremental + full) and repaired (full) data.
+        // Although anti-compaction could work on repaired sstables as well and would result in having more accurate
+        // repairedAt values for these, we still avoid anti-compacting already repaired sstables, as we currently don't
+        // make use of any actual repairedAt value and splitting up sstables just for that is not worth it at this point.
+        Set<SSTableReader> unrepairedSSTables = sstables.stream().filter((s) -> !s.isRepaired()).collect(Collectors.toSet());
+        cfs.metric.bytesAnticompacted.mark(SSTableReader.getTotalBytes(unrepairedSSTables));
+        Collection<Collection<SSTableReader>> groupedSSTables = cfs.getCompactionStrategyManager().groupSSTablesForAntiCompaction(unrepairedSSTables);
+
+        // iterate over sstables to check if the full / transient / unrepaired ranges intersect them.
+        int antiCompactedSSTableCount = 0;
+        for (Collection<SSTableReader> sstableGroup : groupedSSTables)
         {
-            // If there is a snapshot created for the session then read from there.
-            sstables = cfs.getSnapshotSSTableReader(snapshotName);
-
-            // Computing gcbefore based on the current time wouldn't be very good because we know each replica will execute
-            // this at a different time (that's the whole purpose of repair with snaphsot). So instead we take the creation
-            // time of the snapshot, which should give us roughtly the same time on each replica (roughtly being in that case
-            // 'as good as in the non-snapshot' case)
-            gcBefore = cfs.gcBefore(cfs.getSnapshotCreationTime(snapshotName));
+            try (LifecycleTransaction groupTxn = txn.split(sstableGroup))
+            {
+                int antiCompacted = antiCompactGroup(cfs, ranges, groupTxn, pendingRepair, isCancelled);
+                antiCompactedSSTableCount += antiCompacted;
+            }
         }
-        else
-        {
-            // flush first so everyone is validating data that is as similar as possible
-            StorageService.instance.forceKeyspaceFlush(cfs.keyspace.getName(), cfs.name);
+        String format = "Anticompaction completed successfully, anticompacted from {} to {} sstable(s) for {}.";
+        logger.info(format, originalCount, antiCompactedSSTableCount, pendingRepair);
+    }
 
-            // we don't mark validating sstables as compacting in DataTracker, so we have to mark them referenced
-            // instead so they won't be cleaned up if they do get compacted during the validation
-            sstables = cfs.markCurrentSSTablesReferenced();
-            if (validator.gcBefore > 0)
-                gcBefore = validator.gcBefore;
+    @VisibleForTesting
+    int antiCompactGroup(ColumnFamilyStore cfs,
+                         RangesAtEndpoint ranges,
+                         LifecycleTransaction txn,
+                         TimeUUID pendingRepair,
+                         BooleanSupplier isCancelled)
+    {
+        Preconditions.checkArgument(!ranges.isEmpty(), "need at least one full or transient range");
+        long groupMaxDataAge = -1;
+
+        for (Iterator<SSTableReader> i = txn.originals().iterator(); i.hasNext();)
+        {
+            SSTableReader sstable = i.next();
+            if (groupMaxDataAge < sstable.maxDataAge)
+                groupMaxDataAge = sstable.maxDataAge;
+        }
+
+        if (txn.originals().size() == 0)
+        {
+            logger.info("No valid anticompactions for this group, All sstables were compacted and are no longer available");
+            return 0;
+        }
+
+        logger.info("Anticompacting {} in {}.{} for {}", txn.originals(), cfs.getKeyspaceName(), cfs.getTableName(), pendingRepair);
+        Set<SSTableReader> sstableAsSet = txn.originals();
+
+        File destination = cfs.getDirectories().getWriteableLocationAsFile(cfs.getExpectedCompactedFileSize(sstableAsSet, OperationType.ANTICOMPACTION));
+        long nowInSec = FBUtilities.nowInSeconds();
+        RateLimiter limiter = getRateLimiter();
+
+        /**
+         * HACK WARNING
+         *
+         * We have multiple writers operating over the same Transaction, producing different sets of sstables that all
+         * logically replace the transaction's originals.  The SSTableRewriter assumes it has exclusive control over
+         * the transaction state, and this will lead to temporarily inconsistent sstable/tracker state if we do not
+         * take special measures to avoid it.
+         *
+         * Specifically, if a number of rewriter have prepareToCommit() invoked in sequence, then two problematic things happen:
+         *   1. The obsoleteOriginals() call of the first rewriter immediately remove the originals from the tracker, despite
+         *      their having been only partially replaced.  To avoid this, we must either avoid obsoleteOriginals() or checkpoint()
+         *   2. The LifecycleTransaction may only have prepareToCommit() invoked once, and this will checkpoint() also.
+         *
+         * Similarly commit() would finalise partially complete on-disk state.
+         *
+         * To avoid these problems, we introduce a SharedTxn that proxies all calls onto the underlying transaction
+         * except prepareToCommit(), checkpoint(), obsoleteOriginals(), and commit().
+         * We then invoke these methods directly once each of the rewriter has updated the transaction
+         * with their share of replacements.
+         *
+         * Note that for the same essential reason we also explicitly disable early open.
+         * By noop-ing checkpoint we avoid any of the problems with early open, but by continuing to explicitly
+         * disable it we also prevent any of the extra associated work from being performed.
+         */
+        class SharedTxn extends WrappedLifecycleTransaction
+        {
+            public SharedTxn(ILifecycleTransaction delegate) { super(delegate); }
+            public Throwable commit(Throwable accumulate) { return accumulate; }
+            public void prepareToCommit() {}
+            public void checkpoint() {}
+            public void obsoleteOriginals() {}
+            public void close() {}
+        }
+
+        CompactionStrategyManager strategy = cfs.getCompactionStrategyManager();
+        try (SharedTxn sharedTxn = new SharedTxn(txn);
+             SSTableRewriter fullWriter = SSTableRewriter.constructWithoutEarlyOpening(sharedTxn, false, groupMaxDataAge);
+             SSTableRewriter transWriter = SSTableRewriter.constructWithoutEarlyOpening(sharedTxn, false, groupMaxDataAge);
+             SSTableRewriter unrepairedWriter = SSTableRewriter.constructWithoutEarlyOpening(sharedTxn, false, groupMaxDataAge);
+
+             AbstractCompactionStrategy.ScannerList scanners = strategy.getScanners(txn.originals());
+             CompactionController controller = new CompactionController(cfs, sstableAsSet, cfs.getDefaultGcBefore(nowInSec));
+             CompactionIterator ci = getAntiCompactionIterator(scanners.scanners, controller, nowInSec, nextTimeUUID(), active, isCancelled))
+        {
+            int expectedBloomFilterSize = Math.max(cfs.metadata().params.minIndexInterval, (int)(SSTableReader.getApproximateKeyCount(sstableAsSet)));
+
+            fullWriter.switchWriter(CompactionManager.createWriterForAntiCompaction(cfs, destination, expectedBloomFilterSize, UNREPAIRED_SSTABLE, pendingRepair, false, sstableAsSet, txn));
+            transWriter.switchWriter(CompactionManager.createWriterForAntiCompaction(cfs, destination, expectedBloomFilterSize, UNREPAIRED_SSTABLE, pendingRepair, true, sstableAsSet, txn));
+            unrepairedWriter.switchWriter(CompactionManager.createWriterForAntiCompaction(cfs, destination, expectedBloomFilterSize, UNREPAIRED_SSTABLE, NO_PENDING_REPAIR, false, sstableAsSet, txn));
+
+            Predicate<Token> fullChecker = !ranges.onlyFull().isEmpty() ? new Range.OrderedRangeContainmentChecker(ranges.onlyFull().ranges()) : t -> false;
+            Predicate<Token> transChecker = !ranges.onlyTransient().isEmpty() ? new Range.OrderedRangeContainmentChecker(ranges.onlyTransient().ranges()) : t -> false;
+            double compressionRatio = scanners.getCompressionRatio();
+            if (compressionRatio == MetadataCollector.NO_COMPRESSION_RATIO)
+                compressionRatio = 1.0;
+
+            long lastBytesScanned = 0;
+
+            while (ci.hasNext())
+            {
+                try (UnfilteredRowIterator partition = ci.next())
+                {
+                    Token token = partition.partitionKey().getToken();
+                    // if this row is contained in the full or transient ranges, append it to the appropriate sstable
+                    if (fullChecker.test(token))
+                    {
+                        fullWriter.append(partition);
+                        ci.setTargetDirectory(fullWriter.currentWriter().getFilename());
+                    }
+                    else if (transChecker.test(token))
+                    {
+                        transWriter.append(partition);
+                        ci.setTargetDirectory(transWriter.currentWriter().getFilename());
+                    }
+                    else
+                    {
+                        // otherwise, append it to the unrepaired sstable
+                        unrepairedWriter.append(partition);
+                        ci.setTargetDirectory(unrepairedWriter.currentWriter().getFilename());
+                    }
+                    long bytesScanned = scanners.getTotalBytesScanned();
+                    compactionRateLimiterAcquire(limiter, bytesScanned, lastBytesScanned, compressionRatio);
+                    lastBytesScanned = bytesScanned;
+                }
+            }
+
+            fullWriter.prepareToCommit();
+            transWriter.prepareToCommit();
+            unrepairedWriter.prepareToCommit();
+            txn.checkpoint();
+            txn.obsoleteOriginals();
+            txn.prepareToCommit();
+
+            List<SSTableReader> fullSSTables = new ArrayList<>(fullWriter.finished());
+            List<SSTableReader> transSSTables = new ArrayList<>(transWriter.finished());
+            List<SSTableReader> unrepairedSSTables = new ArrayList<>(unrepairedWriter.finished());
+
+            fullWriter.commit();
+            transWriter.commit();
+            unrepairedWriter.commit();
+            txn.commit();
+            logger.info("Anticompacted {} in {}.{} to full = {}, transient = {}, unrepaired = {} for {}",
+                        sstableAsSet,
+                        cfs.getKeyspaceName(),
+                        cfs.getTableName(),
+                        fullSSTables,
+                        transSSTables,
+                        unrepairedSSTables,
+                        pendingRepair);
+            return fullSSTables.size() + transSSTables.size() + unrepairedSSTables.size();
+        }
+        catch (Throwable e)
+        {
+            if (e instanceof CompactionInterruptedException)
+            {
+                if (isCancelled.getAsBoolean())
+                {
+                    logger.info("Anticompaction has been canceled for session {}", pendingRepair);
+                    logger.trace(e.getMessage(), e);
+                }
+                else
+                {
+                    logger.info("Anticompaction for session {} has been stopped by request.", pendingRepair);
+                }
+            }
             else
-                gcBefore = getDefaultGcBefore(cfs);
+            {
+                JVMStabilityInspector.inspectThrowable(e);
+                logger.error("Error anticompacting " + txn + " for " + pendingRepair, e);
+            }
+            throw e;
         }
+    }
 
-        CompactionIterable ci = new ValidationCompactionIterable(cfs, sstables, validator.desc.range, gcBefore);
-        CloseableIterator<AbstractCompactedRow> iter = ci.iterator();
-        metrics.beginCompaction(ci);
-        try
+    @VisibleForTesting
+    public static CompactionIterator getAntiCompactionIterator(List<ISSTableScanner> scanners, CompactionController controller, long nowInSec, TimeUUID timeUUID, ActiveCompactionsTracker activeCompactions, BooleanSupplier isCancelled)
+    {
+        return new CompactionIterator(OperationType.ANTICOMPACTION, scanners, controller, nowInSec, timeUUID, activeCompactions, null)
         {
-            // validate the CF as we iterate over it
-            validator.prepare(cfs);
-            while (iter.hasNext())
+            public boolean isStopRequested()
             {
-                if (ci.isStopRequested())
-                    throw new CompactionInterruptedException(ci.getCompactionInfo());
-                AbstractCompactedRow row = iter.next();
-                validator.add(row);
+                return super.isStopRequested() || isCancelled.getAsBoolean();
             }
-            validator.complete();
-        }
-        finally
-        {
-            iter.close();
-            if (isSnapshotValidation)
-            {
-                for (SSTableReader sstable : sstables)
-                    FileUtils.closeQuietly(sstable);
-                cfs.clearSnapshot(snapshotName);
-            }
-            else
-            {
-                SSTableReader.releaseReferences(sstables);
-            }
+        };
+    }
 
-            metrics.finishCompaction(ci);
+    @VisibleForTesting
+    Future<?> submitIndexBuild(final SecondaryIndexBuilder builder, ActiveCompactionsTracker activeCompactions)
+    {
+        Runnable runnable = new Runnable()
+        {
+            public void run()
+            {
+                activeCompactions.beginCompaction(builder);
+                try
+                {
+                    builder.build();
+                }
+                finally
+                {
+                    activeCompactions.finishCompaction(builder);
+                }
+            }
+        };
+
+        Future<?> future = secondaryIndexExecutor.submitIfRunning(runnable, "index build");
+        if (future.isCancelled())
+        {
+            // Let the builder release any resources it reserved during construction.
+            builder.onNotExecuted();
         }
+        return future;
     }
 
     /**
@@ -823,26 +2138,15 @@ public class CompactionManager implements CompactionManagerMBean
      */
     public Future<?> submitIndexBuild(final SecondaryIndexBuilder builder)
     {
-        Runnable runnable = new Runnable()
-        {
-            public void run()
-            {
-                metrics.beginCompaction(builder);
-                try
-                {
-                    builder.build();
-                }
-                finally
-                {
-                    metrics.finishCompaction(builder);
-                }
-            }
-        };
-
-        return executor.submit(runnable);
+        return submitIndexBuild(builder, active);
     }
 
     public Future<?> submitCacheWrite(final AutoSavingCache.Writer writer)
+    {
+        return submitCacheWrite(writer, active);
+    }
+
+    Future<?> submitCacheWrite(final AutoSavingCache.Writer writer, ActiveCompactionsTracker activeCompactions)
     {
         Runnable runnable = new Runnable()
         {
@@ -850,19 +2154,19 @@ public class CompactionManager implements CompactionManagerMBean
             {
                 if (!AutoSavingCache.flushInProgress.add(writer.cacheType()))
                 {
-                    logger.debug("Cache flushing was already in progress: skipping {}", writer.getCompactionInfo());
+                    logger.trace("Cache flushing was already in progress: skipping {}", writer.getCompactionInfo());
                     return;
                 }
                 try
                 {
-                    metrics.beginCompaction(writer);
+                    activeCompactions.beginCompaction(writer);
                     try
                     {
                         writer.saveCache();
                     }
                     finally
                     {
-                        metrics.finishCompaction(writer);
+                        activeCompactions.finishCompaction(writer);
                     }
                 }
                 finally
@@ -871,116 +2175,165 @@ public class CompactionManager implements CompactionManagerMBean
                 }
             }
         };
-        return executor.submit(runnable);
+
+        return executor.submitIfRunning(runnable, "cache write");
     }
 
-    static int getDefaultGcBefore(ColumnFamilyStore cfs)
+    public <T, E extends Throwable> T runAsActiveCompaction(Holder activeCompactionInfo, ThrowingSupplier<T, E> callable) throws E
     {
-        // 2ndary indexes have ExpiringColumns too, so we need to purge tombstones deleted before now. We do not need to
-        // add any GcGrace however since 2ndary indexes are local to a node.
-        return cfs.isIndex() ? (int) (System.currentTimeMillis() / 1000) : cfs.gcBefore(System.currentTimeMillis());
-    }
-
-    private static class ValidationCompactionIterable extends CompactionIterable
-    {
-        public ValidationCompactionIterable(ColumnFamilyStore cfs, Collection<SSTableReader> sstables, Range<Token> range, int gcBefore)
+        active.beginCompaction(activeCompactionInfo);
+        try
         {
-            super(OperationType.VALIDATION,
-                  cfs.getCompactionStrategy().getScanners(sstables, range),
-                  new ValidationCompactionController(cfs, gcBefore));
+            return callable.get();
+        }
+        finally
+        {
+            active.finishCompaction(activeCompactionInfo);
         }
     }
 
-    /*
-     * Controller for validation compaction that always purges.
-     * Note that we should not call cfs.getOverlappingSSTables on the provided
-     * sstables because those sstables are not guaranteed to be active sstables
-     * (since we can run repair on a snapshot).
-     */
-    private static class ValidationCompactionController extends CompactionController
+    public Future<Long> submitViewBuilder(final ViewBuilderTask task)
     {
-        public ValidationCompactionController(ColumnFamilyStore cfs, int gcBefore)
-        {
-            super(cfs, gcBefore);
-        }
+        return submitViewBuilder(task, active);
+    }
 
-        @Override
-        public long maxPurgeableTimestamp(DecoratedKey key)
-        {
-            /*
-             * The main reason we always purge is that including gcable tombstone would mean that the
-             * repair digest will depends on the scheduling of compaction on the different nodes. This
-             * is still not perfect because gcbefore is currently dependend on the current time at which
-             * the validation compaction start, which while not too bad for normal repair is broken for
-             * repair on snapshots. A better solution would be to agree on a gcbefore that all node would
-             * use, and we'll do that with CASSANDRA-4932.
-             * Note validation compaction includes all sstables, so we don't have the problem of purging
-             * a tombstone that could shadow a column in another sstable, but this is doubly not a concern
-             * since validation compaction is read-only.
-             */
-            return Long.MAX_VALUE;
-        }
+    @VisibleForTesting
+    Future<Long> submitViewBuilder(final ViewBuilderTask task, ActiveCompactionsTracker activeCompactions)
+    {
+        return viewBuildExecutor.submitIfRunning(() -> {
+            activeCompactions.beginCompaction(task);
+            try
+            {
+                return task.call();
+            }
+            finally
+            {
+                activeCompactions.finishCompaction(task);
+            }
+        }, "view build");
     }
 
     public int getActiveCompactions()
     {
-        return CompactionMetrics.getCompactions().size();
+        return active.getCompactions().size();
     }
 
-    private static class CompactionExecutor extends ThreadPoolExecutor
+    public static boolean isCompactor(Thread thread)
     {
-        protected CompactionExecutor(int minThreads, int maxThreads, String name, BlockingQueue<Runnable> queue)
-        {
-            super(minThreads, maxThreads, 60, TimeUnit.SECONDS, queue, new NamedThreadFactory(name, Thread.MIN_PRIORITY));
-            allowCoreThreadTimeOut(true);
-        }
+        return thread.getThreadGroup().getParent() == compactionThreadGroup;
+    }
 
-        private CompactionExecutor(int threadCount, String name)
-        {
-            this(threadCount, threadCount, name, new LinkedBlockingQueue<Runnable>());
-        }
+    // TODO: this is a bit ugly, but no uglier than it was
+    static class CompactionExecutor extends WrappedExecutorPlus
+    {
+        static final ThreadGroup compactionThreadGroup = executorFactory().newThreadGroup("compaction");
 
         public CompactionExecutor()
         {
-            this(Math.max(1, DatabaseDescriptor.getConcurrentCompactors()), "CompactionExecutor");
+            this(executorFactory(), getConcurrentCompactors(), "CompactionExecutor", Integer.MAX_VALUE);
         }
 
-        protected void beforeExecute(Thread t, Runnable r)
+        public CompactionExecutor(int threads, String name, int queueSize)
         {
-            // can't set this in Thread factory, so we do it redundantly here
-            isCompactionManager.set(true);
-            super.beforeExecute(t, r);
+            this(executorFactory(), threads, name, queueSize);
         }
 
-        // modified from DebuggableThreadPoolExecutor so that CompactionInterruptedExceptions are not logged
-        @Override
-        public void afterExecute(Runnable r, Throwable t)
+        protected CompactionExecutor(ExecutorFactory executorFactory, int threads, String name, int queueSize)
         {
-            super.afterExecute(r, t);
+            super(executorFactory
+                    .withJmxInternal()
+                    .configurePooled(name, threads)
+                    .withThreadGroup(compactionThreadGroup)
+                    .withQueueLimit(queueSize).build());
+        }
 
-            if (t == null)
-                t = DebuggableThreadPoolExecutor.extractThrowable(r);
+        public Future<Void> submitIfRunning(Runnable task, String name)
+        {
+            return submitIfRunning(callable(name, task), name);
+        }
 
-            if (t != null)
+        /**
+         * Submit the task but only if the executor has not been shutdown.If the executor has
+         * been shutdown, or in case of a rejected execution exception return a cancelled future.
+         *
+         * @param task - the task to submit
+         * @param name - the task name to use in log messages
+         *
+         * @return the future that will deliver the task result, or a future that has already been
+         *         cancelled if the task could not be submitted.
+         */
+        public <T> Future<T> submitIfRunning(Callable<T> task, String name)
+        {
+            try
             {
-                if (t instanceof CompactionInterruptedException)
-                {
-                    logger.info(t.getMessage());
-                    logger.debug("Full interruption stack trace:", t);
-                }
-                else
-                {
-                    DebuggableThreadPoolExecutor.handleOrLog(t);
-                }
+                return submit(task);
             }
+            catch (RejectedExecutionException ex)
+            {
+                if (isShutdown())
+                    logger.info("Executor has shut down, could not submit {}", name);
+                else
+                    logger.error("Failed to submit {}", name, ex);
+
+                return ImmediateFuture.cancelled();
+            }
+        }
+
+        public void execute(Runnable command)
+        {
+            executor.execute(command);
+        }
+
+        public <T> Future<T> submit(Callable<T> task)
+        {
+            return executor.submit(task);
+        }
+
+        public <T> Future<T> submit(Runnable task, T result)
+        {
+            return submit(callable(task, result));
+        }
+
+        public Future<?> submit(Runnable task)
+        {
+            return submit(task, null);
         }
     }
 
-    private static class ValidationExecutor extends CompactionExecutor
+    // TODO: pull out relevant parts of CompactionExecutor and move to ValidationManager
+    public static class ValidationExecutor extends CompactionExecutor
     {
+        // CompactionExecutor, and by extension ValidationExecutor, use ExecutorPlus's
+        // default RejectedExecutionHandler which blocks the submitting thread when the work queue is
+        // full. The calling thread in this case is AntiEntropyStage, so in most cases we don't actually
+        // want to block when the ValidationExecutor is saturated as this prevents progress on all
+        // repair tasks and may cause repair sessions to time out. Also, it can lead to references to
+        // heavyweight validation responses containing merkle trees being held for extended periods which
+        // increases GC pressure. Using LinkedBlockingQueue instead of the default SynchronousQueue allows
+        // tasks to be submitted without blocking the caller, but will always prefer queueing to creating
+        // new threads if the pool already has at least `corePoolSize` threads already running. For this
+        // reason we set corePoolSize to the maximum desired concurrency, but allow idle core threads to
+        // be terminated.
+
         public ValidationExecutor()
         {
-            super(1, Integer.MAX_VALUE, "ValidationExecutor", new SynchronousQueue<Runnable>());
+            super(DatabaseDescriptor.getConcurrentValidations(),
+                  "ValidationExecutor",
+                  Integer.MAX_VALUE);
+        }
+
+        public void adjustPoolSize()
+        {
+            setMaximumPoolSize(DatabaseDescriptor.getConcurrentValidations());
+            setCorePoolSize(DatabaseDescriptor.getConcurrentValidations());
+        }
+    }
+
+    private static class ViewBuildExecutor extends CompactionExecutor
+    {
+        public ViewBuildExecutor()
+        {
+            super(DatabaseDescriptor.getConcurrentViewBuilders(), "ViewBuildExecutor", Integer.MAX_VALUE);
         }
     }
 
@@ -988,35 +2341,54 @@ public class CompactionManager implements CompactionManagerMBean
     {
         public CacheCleanupExecutor()
         {
-            super(1, "CacheCleanupExecutor");
+            super(1, "CacheCleanupExecutor", Integer.MAX_VALUE);
         }
     }
 
-    public interface CompactionExecutorStatsCollector
+    public void incrementAborted()
     {
-        void beginCompaction(CompactionInfo.Holder ci);
-
-        void finishCompaction(CompactionInfo.Holder ci);
+        metrics.compactionsAborted.inc();
     }
 
+    public void incrementCompactionsReduced()
+    {
+        metrics.compactionsReduced.inc();
+    }
+
+    public void incrementSstablesDropppedFromCompactions(long num)
+    {
+        metrics.sstablesDropppedFromCompactions.inc(num);
+    }
+
+    private static class SecondaryIndexExecutor extends CompactionExecutor
+    {
+        public SecondaryIndexExecutor()
+        {
+            super(DatabaseDescriptor.getConcurrentIndexBuilders(), "SecondaryIndexExecutor", Integer.MAX_VALUE);
+        }
+    }
+
+    @Override
     public List<Map<String, String>> getCompactions()
     {
-        List<Holder> compactionHolders = CompactionMetrics.getCompactions();
+        List<Holder> compactionHolders = active.getCompactions();
         List<Map<String, String>> out = new ArrayList<Map<String, String>>(compactionHolders.size());
         for (CompactionInfo.Holder ci : compactionHolders)
             out.add(ci.getCompactionInfo().asMap());
         return out;
     }
 
+    @Override
     public List<String> getCompactionSummary()
     {
-        List<Holder> compactionHolders = CompactionMetrics.getCompactions();
+        List<Holder> compactionHolders = active.getCompactions();
         List<String> out = new ArrayList<String>(compactionHolders.size());
         for (CompactionInfo.Holder ci : compactionHolders)
             out.add(ci.getCompactionInfo().toString());
         return out;
     }
 
+    @Override
     public TabularData getCompactionHistory()
     {
         try
@@ -1031,99 +2403,240 @@ public class CompactionManager implements CompactionManagerMBean
 
     public long getTotalBytesCompacted()
     {
-        return metrics.bytesCompacted.count();
+        return metrics.bytesCompacted.getCount();
     }
 
     public long getTotalCompactionsCompleted()
     {
-        return metrics.totalCompactionsCompleted.count();
+        return metrics.totalCompactionsCompleted.getCount();
     }
 
+    @Override
     public int getPendingTasks()
     {
-        return metrics.pendingTasks.value();
+        return metrics.pendingTasks.getValue();
     }
 
     public long getCompletedTasks()
     {
-        return metrics.completedTasks.value();
+        return metrics.completedTasks.getValue();
     }
 
-    private static class CleanupInfo extends CompactionInfo.Holder
-    {
-        private final SSTableReader sstable;
-        private final SSTableScanner scanner;
-
-        public CleanupInfo(SSTableReader sstable, SSTableScanner scanner)
-        {
-            this.sstable = sstable;
-            this.scanner = scanner;
-        }
-
-        public CompactionInfo getCompactionInfo()
-        {
-            try
-            {
-                return new CompactionInfo(sstable.metadata,
-                                          OperationType.CLEANUP,
-                                          scanner.getCurrentPosition(),
-                                          scanner.getLengthInBytes());
-            }
-            catch (Exception e)
-            {
-                throw new RuntimeException();
-            }
-        }
-    }
-
+    @Override
     public void stopCompaction(String type)
     {
         OperationType operation = OperationType.valueOf(type);
-        for (Holder holder : CompactionMetrics.getCompactions())
+        for (Holder holder : active.getCompactions())
         {
             if (holder.getCompactionInfo().getTaskType() == operation)
                 holder.stop();
         }
     }
 
+    @Override
+    public void stopCompactionById(String compactionId)
+    {
+        for (Holder holder : active.getCompactions())
+        {
+            TimeUUID holderId = holder.getCompactionInfo().getTaskId();
+            if (holderId != null && holderId.equals(TimeUUID.fromString(compactionId)))
+                holder.stop();
+        }
+    }
+
+    public void setConcurrentCompactors(int value)
+    {
+        adjustCoreSize(executor, value);
+    }
+
+    public void setConcurrentValidations()
+    {
+        validationExecutor.adjustPoolSize();
+    }
+
+    public void setConcurrentViewBuilders(int value)
+    {
+        adjustCoreSize(viewBuildExecutor, value);
+    }
+
+    public void setConcurrentIndexBuilders(int value)
+    {
+        adjustCoreSize(secondaryIndexExecutor, value);
+    }
+
+    private void adjustCoreSize(CompactionExecutor executor, int value)
+    {
+        if (value > executor.getCorePoolSize())
+        {
+            // we are increasing the value
+            executor.setMaximumPoolSize(value);
+            executor.setCorePoolSize(value);
+        }
+        else if (value < executor.getCorePoolSize())
+        {
+            // we are reducing the value
+            executor.setCorePoolSize(value);
+            executor.setMaximumPoolSize(value);
+        }
+    }
+
+    @Override
     public int getCoreCompactorThreads()
     {
         return executor.getCorePoolSize();
     }
 
+    @Override
     public void setCoreCompactorThreads(int number)
     {
         executor.setCorePoolSize(number);
     }
 
+    @Override
     public int getMaximumCompactorThreads()
     {
         return executor.getMaximumPoolSize();
     }
 
+    @Override
     public void setMaximumCompactorThreads(int number)
     {
         executor.setMaximumPoolSize(number);
     }
 
+    @Override
     public int getCoreValidationThreads()
     {
         return validationExecutor.getCorePoolSize();
     }
 
+    @Override
     public void setCoreValidationThreads(int number)
     {
         validationExecutor.setCorePoolSize(number);
     }
 
+    @Override
     public int getMaximumValidatorThreads()
     {
         return validationExecutor.getMaximumPoolSize();
     }
 
+    @Override
     public void setMaximumValidatorThreads(int number)
     {
         validationExecutor.setMaximumPoolSize(number);
+    }
+
+    @Override
+    public int getMaximumSecondaryIndexExecutorThreads()
+    {
+        return secondaryIndexExecutor.getMaximumPoolSize();
+    }
+
+    @Override
+    public void setMaximumSecondaryIndexExecutorThreads(int number)
+    {
+        secondaryIndexExecutor.setMaximumPoolSize(number);
+    }
+
+    @Override
+    public int getCoreSecondaryIndexExecutorThreads()
+    {
+        return secondaryIndexExecutor.getCorePoolSize();
+    }
+
+    @Override
+    public void setCoreSecondaryIndexExecutorThreads(int number)
+    {
+        secondaryIndexExecutor.setCorePoolSize(number);
+    }
+
+    @Override
+    public boolean getDisableSTCSInL0()
+    {
+        return DatabaseDescriptor.getDisableSTCSInL0();
+    }
+
+    @Override
+    public void setDisableSTCSInL0(boolean disabled)
+    {
+        if (disabled != DatabaseDescriptor.getDisableSTCSInL0())
+            logger.info("Changing STCS in L0 disabled from {} to {}", DatabaseDescriptor.getDisableSTCSInL0(), disabled);
+        DatabaseDescriptor.setDisableSTCSInL0(disabled);
+    }
+
+    @Override
+    public int getCoreViewBuildThreads()
+    {
+        return viewBuildExecutor.getCorePoolSize();
+    }
+
+    @Override
+    public void setCoreViewBuildThreads(int number)
+    {
+        viewBuildExecutor.setCorePoolSize(number);
+    }
+
+    @Override
+    public int getMaximumViewBuildThreads()
+    {
+        return viewBuildExecutor.getMaximumPoolSize();
+    }
+
+    @Override
+    public void setMaximumViewBuildThreads(int number)
+    {
+        viewBuildExecutor.setMaximumPoolSize(number);
+    }
+
+    @Override
+    public boolean getAutomaticSSTableUpgradeEnabled()
+    {
+        return DatabaseDescriptor.automaticSSTableUpgrade();
+    }
+
+    @Override
+    public void setAutomaticSSTableUpgradeEnabled(boolean enabled)
+    {
+        DatabaseDescriptor.setAutomaticSSTableUpgradeEnabled(enabled);
+    }
+
+    @Override
+    public int getMaxConcurrentAutoUpgradeTasks()
+    {
+        return DatabaseDescriptor.maxConcurrentAutoUpgradeTasks();
+    }
+
+    @Override
+    public void setMaxConcurrentAutoUpgradeTasks(int value)
+    {
+        try
+        {
+            DatabaseDescriptor.setMaxConcurrentAutoUpgradeTasks(value);
+        }
+        catch (ConfigurationException e)
+        {
+            throw new RuntimeException(e.getMessage());
+        }
+    }
+
+    public List<Holder> getCompactionsMatching(Iterable<TableMetadata> columnFamilies, Predicate<CompactionInfo> predicate)
+    {
+        Preconditions.checkArgument(columnFamilies != null, "Attempted to getCompactionsMatching in CompactionManager with no columnFamilies specified.");
+
+        List<Holder> matched = new ArrayList<>();
+        // consider all in-progress compactions
+        for (Holder holder : active.getCompactions())
+        {
+            CompactionInfo info = holder.getCompactionInfo();
+            if (info.getTableMetadata() == null || Iterables.contains(columnFamilies, info.getTableMetadata()))
+            {
+                if (predicate.test(info))
+                    matched.add(holder);
+            }
+        }
+        return matched;
     }
 
     /**
@@ -1133,22 +2646,82 @@ public class CompactionManager implements CompactionManagerMBean
      * isCompacting if you want that behavior.
      *
      * @param columnFamilies The ColumnFamilies to try to stop compaction upon.
+     * @param sstablePredicate the sstable predicate to match on
      * @param interruptValidation true if validation operations for repair should also be interrupted
-     *
      */
-    public void interruptCompactionFor(Iterable<CFMetaData> columnFamilies, boolean interruptValidation)
+    public void interruptCompactionFor(Iterable<TableMetadata> columnFamilies, Predicate<SSTableReader> sstablePredicate, boolean interruptValidation)
     {
         assert columnFamilies != null;
 
         // interrupt in-progress compactions
-        for (Holder compactionHolder : CompactionMetrics.getCompactions())
+        for (Holder compactionHolder : active.getCompactions())
         {
             CompactionInfo info = compactionHolder.getCompactionInfo();
             if ((info.getTaskType() == OperationType.VALIDATION) && !interruptValidation)
                 continue;
 
-            if (Iterables.contains(columnFamilies, info.getCFMetaData()))
-                compactionHolder.stop(); // signal compaction to stop
+            if (info.getTableMetadata() == null || Iterables.contains(columnFamilies, info.getTableMetadata()))
+            {
+                if (info.shouldStop(sstablePredicate))
+                    compactionHolder.stop();
+            }
         }
+    }
+
+    public void interruptCompactionForCFs(Iterable<ColumnFamilyStore> cfss, Predicate<SSTableReader> sstablePredicate, boolean interruptValidation)
+    {
+        List<TableMetadata> metadata = new ArrayList<>();
+        for (ColumnFamilyStore cfs : cfss)
+            metadata.add(cfs.metadata());
+
+        interruptCompactionFor(metadata, sstablePredicate, interruptValidation);
+    }
+
+    public void waitForCessation(Iterable<ColumnFamilyStore> cfss, Predicate<SSTableReader> sstablePredicate)
+    {
+        long start = nanoTime();
+        long delay = TimeUnit.MINUTES.toNanos(1);
+
+        while (nanoTime() - start < delay)
+        {
+            if (CompactionManager.instance.isCompacting(cfss, sstablePredicate))
+                Uninterruptibles.sleepUninterruptibly(1, TimeUnit.MILLISECONDS);
+            else
+                break;
+        }
+    }
+
+
+    public List<CompactionInfo> getSSTableTasks()
+    {
+        return active.getCompactions()
+                     .stream()
+                     .map(CompactionInfo.Holder::getCompactionInfo)
+                     .filter(task -> task.getTaskType() != OperationType.COUNTER_CACHE_SAVE
+                                     && task.getTaskType() != OperationType.KEY_CACHE_SAVE
+                                     && task.getTaskType() != OperationType.ROW_CACHE_SAVE)
+                     .collect(Collectors.toList());
+    }
+
+    /**
+     * Return whether "global" compactions should be paused, used by ColumnFamilyStore#runWithCompactionsDisabled
+     *
+     * a global compaction is one that includes several/all tables, currently only IndexSummaryBuilder
+     */
+    public boolean isGlobalCompactionPaused()
+    {
+        return globalCompactionPauseCount.get() > 0;
+    }
+
+    public CompactionPauser pauseGlobalCompaction()
+    {
+        CompactionPauser pauser = globalCompactionPauseCount::decrementAndGet;
+        globalCompactionPauseCount.incrementAndGet();
+        return pauser;
+    }
+
+    public interface CompactionPauser extends AutoCloseable
+    {
+        public void close();
     }
 }

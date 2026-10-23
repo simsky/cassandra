@@ -18,71 +18,193 @@
 package org.apache.cassandra.utils;
 
 import java.io.IOException;
-import java.nio.ByteBuffer;
 
+import com.google.common.annotations.VisibleForTesting;
+
+import net.nicoulaj.compilecommand.annotations.Inline;
+
+import org.apache.cassandra.io.util.DataOutputStreamPlus;
+import org.apache.cassandra.utils.concurrent.Ref;
+import org.apache.cassandra.utils.concurrent.WrappedSharedCloseable;
 import org.apache.cassandra.utils.obs.IBitSet;
 
-public abstract class BloomFilter implements IFilter
+import io.netty.util.concurrent.FastThreadLocal;
+
+public class BloomFilter extends WrappedSharedCloseable implements IFilter
 {
+    private final static FastThreadLocal<long[]> reusableIndexes = new FastThreadLocal<long[]>()
+    {
+        @Override
+        protected long[] initialValue()
+        {
+            return new long[21];
+        }
+    };
+
     public final IBitSet bitset;
     public final int hashCount;
 
-    BloomFilter(int hashes, IBitSet bitset)
+    BloomFilter(int hashCount, IBitSet bitset)
     {
-        this.hashCount = hashes;
+        super(bitset);
+        this.hashCount = hashCount;
         this.bitset = bitset;
     }
 
-    private long[] getHashBuckets(ByteBuffer key)
+    private BloomFilter(BloomFilter copy)
     {
-        return getHashBuckets(key, hashCount, bitset.capacity());
+        super(copy);
+        this.hashCount = copy.hashCount;
+        this.bitset = copy.bitset;
     }
 
-    protected abstract long[] hash(ByteBuffer b, int position, int remaining, long seed);
+    public long serializedSize(boolean old)
+    {
+        return BloomFilterSerializer.forVersion(old).serializedSize(this);
+    }
+
+    @Override
+    public void serialize(DataOutputStreamPlus out, boolean old) throws IOException
+    {
+        BloomFilterSerializer.forVersion(old).serialize(this, out);
+    }
 
     // Murmur is faster than an SHA-based approach and provides as-good collision
     // resistance.  The combinatorial generation approach described in
-    // http://www.eecs.harvard.edu/~kirsch/pubs/bbbf/esa06.pdf
+    // https://www.eecs.harvard.edu/~michaelm/postscripts/tr-02-05.pdf
     // does prove to work in actual tests, and is obviously faster
     // than performing further iterations of murmur.
-    long[] getHashBuckets(ByteBuffer b, int hashCount, long max)
+
+    // tests ask for ridiculous numbers of hashes so here is a special case for them
+    // rather than using the threadLocal like we do in production
+    @VisibleForTesting
+    public long[] getHashBuckets(FilterKey key, int hashCount, long max)
     {
-        long[] result = new long[hashCount];
-        long[] hash = this.hash(b, b.position(), b.remaining(), 0L);
-        for (int i = 0; i < hashCount; ++i)
+        long[] hash = new long[2];
+        key.filterHash(hash);
+        long[] indexes = new long[hashCount];
+        setIndexes(hash[1], hash[0], hashCount, max, indexes);
+        return indexes;
+    }
+
+    // note that this method uses the threadLocal that may be longer than hashCount
+    // to avoid generating a lot of garbage since stack allocation currently does not support stores
+    // (CASSANDRA-6609).  it returns the array so that the caller does not need to perform
+    // a second threadlocal lookup.
+    @Inline
+    private long[] indexes(FilterKey key)
+    {
+        // we use the same array both for storing the hash result, and for storing the indexes we return,
+        // so that we do not need to allocate two arrays.
+        long[] indexes = reusableIndexes.get();
+
+        key.filterHash(indexes);
+        setIndexes(indexes[1], indexes[0], hashCount, bitset.capacity(), indexes);
+        return indexes;
+    }
+
+    private long[] indexes(byte[] key, int offset, int length)
+    {
+        // we use the same array both for storing the hash result, and for storing the indexes we return,
+        // so that we do not need to allocate two arrays.
+        long[] indexes = reusableIndexes.get();
+        return indexes(key, offset, length, indexes);
+    }
+
+    private long[] indexes(byte[] key, int offset, int length, long[] indexes)
+    {
+        MurmurHash.hash3_x64_128(key, offset, length, 0, indexes);
+
+        setIndexes(indexes[1], indexes[0], hashCount, bitset.capacity(), indexes);
+        return indexes;
+    }
+
+    @Inline
+    private void setIndexes(long base, long inc, int count, long max, long[] results)
+    {
+        for (int i = 0; i < count; i++)
         {
-            result[i] = Math.abs((hash[0] + (long)i * hash[1]) % max);
+            results[i] = FBUtilities.abs(base % max);
+            base += inc;
         }
-        return result;
     }
 
-    public void add(ByteBuffer key)
+    @Override
+    public void add(FilterKey key)
     {
-        for (long bucketIndex : getHashBuckets(key))
+        long[] indexes = indexes(key);
+        for (int i = 0; i < hashCount; i++)
         {
-            bitset.set(bucketIndex);
+            bitset.set(indexes[i]);
         }
     }
 
-    public boolean isPresent(ByteBuffer key)
+    public void add(byte[] key, int offset, int length)
     {
-      for (long bucketIndex : getHashBuckets(key))
-      {
-          if (!bitset.get(bucketIndex))
-          {
-              return false;
-          }
-      }
-      return true;
+        long[] indexes = indexes(key, offset, length);
+        for (int i = 0; i < hashCount; i++)
+        {
+            bitset.set(indexes[i]);
+        }
     }
 
+    public void add(byte[] key, int offset, int length, long[] indexes)
+    {
+        indexes(key, offset, length, indexes);
+        for (int i = 0; i < hashCount; i++)
+        {
+            bitset.set(indexes[i]);
+        }
+    }
+
+    @Override
+    public final boolean isPresent(FilterKey key)
+    {
+        long[] indexes = indexes(key);
+        for (int i = 0; i < hashCount; i++)
+        {
+            if (!bitset.get(indexes[i]))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    @Override
     public void clear()
     {
         bitset.clear();
     }
 
-    public void close() throws IOException
+    @Override
+    public BloomFilter sharedCopy()
     {
-        bitset.close();
+        return new BloomFilter(this);
+    }
+
+    @Override
+    public long offHeapSize()
+    {
+        return bitset.offHeapSize();
+    }
+
+    @Override
+    public boolean isInformative()
+    {
+        return bitset.offHeapSize() > 0;
+    }
+
+    @Override
+    public String toString()
+    {
+        return "BloomFilter[hashCount=" + hashCount + ";capacity=" + bitset.capacity() + ']';
+    }
+
+    @Override
+    public void addTo(Ref.IdentityCollection identities)
+    {
+        super.addTo(identities);
+        bitset.addTo(identities);
     }
 }

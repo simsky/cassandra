@@ -17,71 +17,149 @@
  */
 package org.apache.cassandra.io.sstable;
 
-import java.io.File;
+import java.io.Closeable;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
-import java.util.Arrays;
+import java.nio.file.NoSuchFileException;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.NavigableSet;
+import java.util.Set;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
+import java.util.stream.Collectors;
 
-import com.google.common.collect.ImmutableMap;
+import com.google.common.base.Preconditions;
+import com.google.common.collect.Sets;
 
-import org.apache.cassandra.cql3.statements.*;
-import org.apache.cassandra.cql3.*;
-import org.apache.cassandra.config.*;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.config.CassandraRelevantProperties;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.cql3.ColumnSpecification;
+import org.apache.cassandra.cql3.QueryOptions;
+import org.apache.cassandra.cql3.QueryProcessor;
+import org.apache.cassandra.cql3.RowUpdateBuilder;
+import org.apache.cassandra.cql3.RowUpdateBuilder.RegularRowUpdateBuilder;
+import org.apache.cassandra.cql3.functions.types.TypeCodec;
+import org.apache.cassandra.cql3.functions.types.UserType;
+import org.apache.cassandra.cql3.statements.ModificationStatement;
+import org.apache.cassandra.cql3.statements.schema.CreateIndexStatement;
+import org.apache.cassandra.cql3.statements.schema.CreateTableStatement;
+import org.apache.cassandra.cql3.statements.schema.CreateTypeStatement;
+import org.apache.cassandra.db.Clustering;
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.Directories;
+import org.apache.cassandra.db.Keyspace;
+import org.apache.cassandra.db.Slice;
+import org.apache.cassandra.db.Slices;
+import org.apache.cassandra.db.compression.CompressionDictionary;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.dht.IPartitioner;
 import org.apache.cassandra.dht.Murmur3Partitioner;
 import org.apache.cassandra.exceptions.InvalidRequestException;
-import org.apache.cassandra.exceptions.RequestValidationException;
-import org.apache.cassandra.io.compress.CompressionParameters;
-import org.apache.cassandra.locator.AbstractReplicationStrategy;
+import org.apache.cassandra.exceptions.SyntaxException;
+import org.apache.cassandra.index.sai.StorageAttachedIndexGroup;
+import org.apache.cassandra.io.compress.IDictionaryCompressor;
+import org.apache.cassandra.io.sstable.format.SSTableFormat;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.io.util.File;
+import org.apache.cassandra.schema.CompressionParams;
+import org.apache.cassandra.schema.KeyspaceMetadata;
+import org.apache.cassandra.schema.KeyspaceParams;
+import org.apache.cassandra.schema.Keyspaces;
+import org.apache.cassandra.schema.Schema;
+import org.apache.cassandra.schema.SchemaConstants;
+import org.apache.cassandra.schema.SchemaTransformation;
+import org.apache.cassandra.schema.SchemaTransformations;
+import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.schema.TableMetadataRef;
+import org.apache.cassandra.schema.Tables;
+import org.apache.cassandra.schema.Types;
+import org.apache.cassandra.schema.UserFunctions;
+import org.apache.cassandra.schema.Views;
 import org.apache.cassandra.service.ClientState;
-import org.apache.cassandra.utils.Pair;
+import org.apache.cassandra.tcm.ClusterMetadata;
+import org.apache.cassandra.tcm.ClusterMetadataService;
+import org.apache.cassandra.tcm.serialization.Version;
+import org.apache.cassandra.tcm.transformations.AlterSchema;
+import org.apache.cassandra.transport.ProtocolVersion;
+import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.JavaDriverUtils;
+
+import static org.apache.cassandra.utils.Clock.Global.currentTimeMillis;
 
 /**
  * Utility to write SSTables.
  * <p>
  * Typical usage looks like:
  * <pre>
+ *   String type = CREATE TYPE myKs.myType (a int, b int)";
  *   String schema = "CREATE TABLE myKs.myTable ("
  *                 + "  k int PRIMARY KEY,"
  *                 + "  v1 text,"
- *                 + "  v2 int"
+ *                 + "  v2 int,"
+ *                 + "  v3 myType,"
  *                 + ")";
- *   String insert = "INSERT INTO myKs.myTable (k, v1, v2) VALUES (?, ?, ?)";
+ *   String insert = "INSERT INTO myKs.myTable (k, v1, v2, v3) VALUES (?, ?, ?, ?)";
  *
  *   // Creates a new writer. You need to provide at least the directory where to write the created sstable,
- *   // the schema for the sstable to write and a (prepared) insert statement to use. If you do not use the
+ *   // the schema for the sstable to write and a (prepared) modification statement to use. If you do not use the
  *   // default partitioner (Murmur3Partitioner), you will also need to provide the partitioner in use, see
  *   // CQLSSTableWriter.Builder for more details on the available options.
  *   CQLSSTableWriter writer = CQLSSTableWriter.builder()
  *                                             .inDirectory("path/to/directory")
+ *                                             .withType(type)
  *                                             .forTable(schema)
  *                                             .using(insert).build();
  *
+ *   UserType myType = writer.getUDType("myType");
  *   // Adds a nember of rows to the resulting sstable
- *   writer.addRow(0, "test1", 24);
- *   writer.addRow(1, "test2", null);
- *   writer.addRow(2, "test3", 42);
+ *   writer.addRow(0, "test1", 24, myType.newValue().setInt("a", 10).setInt("b", 20));
+ *   writer.addRow(1, "test2", null, null);
+ *   writer.addRow(2, "test3", 42, myType.newValue().setInt("a", 30).setInt("b", 40));
  *
  *   // Close the writer, finalizing the sstable
  *   writer.close();
  * </pre>
+ * <p>
+ * Please note that {@code CQLSSTableWriter} is <b>not</b> thread-safe (multiple threads cannot access the
+ * same instance). It is however safe to use multiple instances in parallel (even if those instance write
+ * sstables for the same table).
  */
-public class CQLSSTableWriter
+public class CQLSSTableWriter implements Closeable
 {
-    private final AbstractSSTableSimpleWriter writer;
-    private final UpdateStatement insert;
-    private final List<ColumnSpecification> boundNames;
+    public static final ByteBuffer UNSET_VALUE = ByteBufferUtil.UNSET_BYTE_BUFFER;
 
-    private CQLSSTableWriter(AbstractSSTableSimpleWriter writer, UpdateStatement insert, List<ColumnSpecification> boundNames)
+    static
+    {
+        CassandraRelevantProperties.FORCE_LOAD_LOCAL_KEYSPACES.setBoolean(true);
+        DatabaseDescriptor.clientInitialization(false);
+        // Partitioner is not set in client mode.
+        if (DatabaseDescriptor.getPartitioner() == null)
+            DatabaseDescriptor.setPartitionerUnsafe(Murmur3Partitioner.instance);
+        ClusterMetadataService.initializeForClients();
+    }
+
+    private final AbstractSSTableSimpleWriter writer;
+    private final ModificationStatement modificationStatement;
+    private final List<ColumnSpecification> boundNames;
+    private final List<TypeCodec<?>> typeCodecs;
+
+    private CQLSSTableWriter(AbstractSSTableSimpleWriter writer, ModificationStatement modificationStatement, List<ColumnSpecification> boundNames)
     {
         this.writer = writer;
-        this.insert = insert;
+        this.modificationStatement = modificationStatement;
         this.boundNames = boundNames;
+        this.typeCodecs = boundNames.stream().map(bn -> JavaDriverUtils.codecFor(JavaDriverUtils.driverType(bn.type)))
+                                    .collect(Collectors.toList());
     }
 
     /**
@@ -100,7 +178,7 @@ public class CQLSSTableWriter
      * This is a shortcut for {@code addRow(Arrays.asList(values))}.
      *
      * @param values the row values (corresponding to the bind variables of the
-     * insertion statement used when creating by this writer).
+     *               modification statement used when creating by this writer).
      * @return this writer.
      */
     public CQLSSTableWriter addRow(Object... values)
@@ -121,7 +199,7 @@ public class CQLSSTableWriter
      * {@link #rawAddRow} instead.
      *
      * @param values the row values (corresponding to the bind variables of the
-     * insertion statement used when creating by this writer).
+     *               modification statement used when creating by this writer).
      * @return this writer.
      */
     public CQLSSTableWriter addRow(List<Object> values)
@@ -129,8 +207,13 @@ public class CQLSSTableWriter
     {
         int size = Math.min(values.size(), boundNames.size());
         List<ByteBuffer> rawValues = new ArrayList<>(size);
+
         for (int i = 0; i < size; i++)
-            rawValues.add(values.get(i) == null ? null : ((AbstractType)boundNames.get(i).type).decompose(values.get(i)));
+        {
+            Object value = values.get(i);
+            rawValues.add(serialize(value, typeCodecs.get(i), boundNames.get(i)));
+        }
+
         return rawAddRow(rawValues);
     }
 
@@ -139,24 +222,31 @@ public class CQLSSTableWriter
      * <p>
      * This is equivalent to the other addRow methods, but takes a map whose
      * keys are the names of the columns to add instead of taking a list of the
-     * values in the order of the insert statement used during construction of
+     * values in the order of the modification statement used during construction of
      * this write.
+     * <p>
+     * Please note that the column names in the map keys must be in lowercase unless
+     * the declared column name is a
+     * <a href="http://cassandra.apache.org/doc/cql3/CQL.html#identifiers">case-sensitive quoted identifier</a>
+     * (in which case the map key must use the exact case of the column).
      *
      * @param values a map of colum name to column values representing the new
-     * row to add. Note that if a column is not part of the map, it's value will
-     * be {@code null}. If the map contains keys that does not correspond to one
-     * of the column of the insert statement used when creating this writer, the
-     * the corresponding value is ignored.
+     *               row to add. Note that if a column is not part of the map, it's value will
+     *               be {@code null}. If the map contains keys that does not correspond to one
+     *               of the column of the modification statement used when creating this writer, the
+     *               the corresponding value is ignored.
      * @return this writer.
      */
     public CQLSSTableWriter addRow(Map<String, Object> values)
     throws InvalidRequestException, IOException
     {
-        int size = Math.min(values.size(), boundNames.size());
+        int size = boundNames.size();
         List<ByteBuffer> rawValues = new ArrayList<>(size);
-        for (int i = 0; i < size; i++) {
+        for (int i = 0; i < size; i++)
+        {
             ColumnSpecification spec = boundNames.get(i);
-            rawValues.add(((AbstractType)spec.type).decompose(values.get(spec.name.toString())));
+            Object value = values.get(spec.name.toString());
+            rawValues.add(serialize(value, typeCodecs.get(i), boundNames.get(i)));
         }
         return rawAddRow(rawValues);
     }
@@ -165,7 +255,7 @@ public class CQLSSTableWriter
      * Adds a new row to the writer given already serialized values.
      *
      * @param values the row values (corresponding to the bind variables of the
-     * insertion statement used when creating by this writer) as binary.
+     *               modification statement used when creating by this writer) as binary.
      * @return this writer.
      */
     public CQLSSTableWriter rawAddRow(ByteBuffer... values)
@@ -180,7 +270,7 @@ public class CQLSSTableWriter
      * This is a shortcut for {@code rawAddRow(Arrays.asList(values))}.
      *
      * @param values the row values (corresponding to the bind variables of the
-     * insertion statement used when creating by this writer) as binary.
+     *               modification statement used when creating by this writer) as binary.
      * @return this writer.
      */
     public CQLSSTableWriter rawAddRow(List<ByteBuffer> values)
@@ -189,23 +279,51 @@ public class CQLSSTableWriter
         if (values.size() != boundNames.size())
             throw new InvalidRequestException(String.format("Invalid number of arguments, expecting %d values but got %d", boundNames.size(), values.size()));
 
-        List<ByteBuffer> keys = insert.buildPartitionKeyNames(values);
-        ColumnNameBuilder clusteringPrefix = insert.createClusteringPrefixBuilder(values);
+        QueryOptions options = QueryOptions.forInternalCalls(null, values);
+        ClientState state = ClientState.forInternalCalls();
+        List<ByteBuffer> keys = modificationStatement.buildPartitionKeyNames(options, state);
 
-        long now = System.currentTimeMillis() * 1000;
-        UpdateParameters params = new UpdateParameters(insert.cfm,
-                                                       values,
-                                                       insert.getTimestamp(now, values),
-                                                       insert.getTimeToLive(values),
-                                                       Collections.<ByteBuffer, ColumnGroupMap>emptyMap());
+        long now = currentTimeMillis();
+        // Note that we asks indexes to not validate values (the last 'false' arg below) because that triggers a 'Keyspace.open'
+        // and that forces a lot of initialization that we don't want.
+        RowUpdateBuilder builder = new RegularRowUpdateBuilder(modificationStatement.metadata,
+                                                               ClientState.forInternalCalls(),
+                                                               options,
+                                                               modificationStatement.getTimestamp(TimeUnit.MILLISECONDS.toMicros(now), options),
+                                                               options.getNowInSec((int) TimeUnit.MILLISECONDS.toSeconds(now)),
+                                                               modificationStatement.getTimeToLive(options),
+                                                               null);
 
-        for (ByteBuffer key: keys)
+        try
         {
-            if (writer.currentKey() == null || !key.equals(writer.currentKey().key))
-                writer.newRow(key);
-            insert.addUpdateForKey(writer.currentColumnFamily(), key, clusteringPrefix, params);
+            if (modificationStatement.hasSlices())
+            {
+                Slices slices = modificationStatement.createSlices(options);
+
+                for (ByteBuffer key : keys)
+                {
+                    for (Slice slice : slices)
+                        modificationStatement.addUpdateForKey(writer.getUpdateFor(key), slice, builder);
+                }
+            }
+            else
+            {
+                NavigableSet<Clustering<?>> clusterings = modificationStatement.createClustering(options, state);
+
+                for (ByteBuffer key : keys)
+                {
+                    for (Clustering clustering : clusterings)
+                        modificationStatement.addUpdateForKey(writer.getUpdateFor(key), clustering, builder);
+                }
+            }
+            return this;
         }
-        return this;
+        catch (SSTableSimpleUnsortedWriter.SyncException e)
+        {
+            // If we use a BufferedWriter and had a problem writing to disk, the IOException has been
+            // wrapped in a SyncException (see BufferedWriter below). We want to extract that IOE.
+            throw (IOException) e.getCause();
+        }
     }
 
     /**
@@ -213,14 +331,14 @@ public class CQLSSTableWriter
      * <p>
      * This is equivalent to the other rawAddRow methods, but takes a map whose
      * keys are the names of the columns to add instead of taking a list of the
-     * values in the order of the insert statement used during construction of
+     * values in the order of the modification statement used during construction of
      * this write.
      *
      * @param values a map of colum name to column values representing the new
-     * row to add. Note that if a column is not part of the map, it's value will
-     * be {@code null}. If the map contains keys that does not correspond to one
-     * of the column of the insert statement used when creating this writer, the
-     * the corresponding value is ignored.
+     *               row to add. Note that if a column is not part of the map, it's value will
+     *               be {@code null}. If the map contains keys that does not correspond to one
+     *               of the column of the modification statement used when creating this writer, the
+     *               the corresponding value is ignored.
      * @return this writer.
      */
     public CQLSSTableWriter rawAddRow(Map<String, ByteBuffer> values)
@@ -228,11 +346,26 @@ public class CQLSSTableWriter
     {
         int size = Math.min(values.size(), boundNames.size());
         List<ByteBuffer> rawValues = new ArrayList<>(size);
-        for (int i = 0; i < size; i++) {
+        for (int i = 0; i < size; i++)
+        {
             ColumnSpecification spec = boundNames.get(i);
             rawValues.add(values.get(spec.name.toString()));
         }
         return rawAddRow(rawValues);
+    }
+
+    /**
+     * Returns the User Defined type, used in this SSTable Writer, that can
+     * be used to create UDTValue instances.
+     *
+     * @param dataType name of the User Defined type
+     * @return user defined type
+     */
+    public UserType getUDType(String dataType)
+    {
+        KeyspaceMetadata ksm = Schema.instance.getKeyspaceMetadata(modificationStatement.keyspace());
+        org.apache.cassandra.db.marshal.UserType userType = ksm.types.getNullable(ByteBufferUtil.bytes(dataType));
+        return (UserType) JavaDriverUtils.driverType(userType);
     }
 
     /**
@@ -246,22 +379,53 @@ public class CQLSSTableWriter
         writer.close();
     }
 
+    private ByteBuffer serialize(Object value, TypeCodec codec, ColumnSpecification columnSpecification)
+    {
+        if (value == null || value == UNSET_VALUE)
+            return (ByteBuffer) value;
+
+        try
+        {
+            return codec.serialize(value, ProtocolVersion.CURRENT);
+        }
+        catch (ClassCastException cce)
+        {
+            // For backwards-compatibility with consumers that may be passing
+            // an Integer for a Date field, for example.
+            return ((AbstractType) columnSpecification.type).decompose(value);
+        }
+    }
+
     /**
      * A Builder for a CQLSSTableWriter object.
      */
     public static class Builder
     {
+        private static final Logger logger = LoggerFactory.getLogger(Builder.class);
+        private static final long DEFAULT_BUFFER_SIZE_IN_MIB_FOR_UNSORTED = 128L;
+
+        protected SSTableFormat<?, ?> format = null;
+
+        private final List<CreateTypeStatement.Raw> typeStatements;
+        private final List<CreateIndexStatement.Raw> indexStatements;
+
         private File directory;
-        private IPartitioner partitioner = new Murmur3Partitioner();
-
-        private CFMetaData schema;
-        private UpdateStatement insert;
-        private List<ColumnSpecification> boundNames;
-
+        private CreateTableStatement.Raw schemaStatement;
+        private ModificationStatement.Parsed modificationStatement;
+        private IPartitioner partitioner;
         private boolean sorted = false;
-        private long bufferSizeInMB = 128;
+        private long maxSSTableSizeInMiB = -1L;
+        private boolean buildIndexes = true;
+        private Consumer<Collection<SSTableReader>> sstableProducedListener;
+        private boolean openSSTableOnProduced = false;
+        private CompressionDictionary compressionDictionary = null;
+        private SSTableId.Builder<? extends SSTableId> idBuilder = null;
 
-        private Builder() {}
+        protected Builder()
+        {
+            this.typeStatements = new ArrayList<>();
+            this.indexStatements = new ArrayList<>();
+        }
 
         /**
          * The directory where to write the sstables.
@@ -270,7 +434,6 @@ public class CQLSSTableWriter
          *
          * @param directory the directory to use, which should exists and be writable.
          * @return this builder.
-         *
          * @throws IllegalArgumentException if {@code directory} doesn't exist or is not writable.
          */
         public Builder inDirectory(String directory)
@@ -285,17 +448,22 @@ public class CQLSSTableWriter
          *
          * @param directory the directory to use, which should exists and be writable.
          * @return this builder.
-         *
          * @throws IllegalArgumentException if {@code directory} doesn't exist or is not writable.
          */
         public Builder inDirectory(File directory)
         {
             if (!directory.exists())
                 throw new IllegalArgumentException(directory + " doesn't exists");
-            if (!directory.canWrite())
+            if (!directory.isWritable())
                 throw new IllegalArgumentException(directory + " exists but is not writable");
 
             this.directory = directory;
+            return this;
+        }
+
+        public Builder withType(String typeDefinition) throws SyntaxException
+        {
+            typeStatements.add(QueryProcessor.parseStatement(typeDefinition, CreateTypeStatement.Raw.class, "CREATE TYPE"));
             return this;
         }
 
@@ -309,31 +477,27 @@ public class CQLSSTableWriter
          *
          * @param schema the schema of the table for which sstables are to be created.
          * @return this builder.
-         *
          * @throws IllegalArgumentException if {@code schema} is not a valid CREATE TABLE statement
-         * or does not have a fully-qualified table name.
+         *                                  or does not have a fully-qualified table name.
          */
         public Builder forTable(String schema)
         {
-            try
-            {
-                this.schema = getStatement(schema, CreateTableStatement.class, "CREATE TABLE").left.getCFMetaData().rebuild();
+            this.schemaStatement = QueryProcessor.parseStatement(schema, CreateTableStatement.Raw.class, "CREATE TABLE");
+            return this;
+        }
 
-                // We need to register the keyspace/table metadata through Schema, otherwise we won't be able to properly
-                // build the insert statement in using().
-                KSMetaData ksm = KSMetaData.newKeyspace(this.schema.ksName,
-                                                        AbstractReplicationStrategy.getClass("org.apache.cassandra.locator.SimpleStrategy"),
-                                                        ImmutableMap.of("replication_factor", "1"),
-                                                        true,
-                                                        Collections.singleton(this.schema));
+        /**
+         * The schema (CREATE INDEX statement) for index to be created for the table. Only SAI indexes are supported.
+         *
+         * @param indexes CQL statements representing SAI indexes to be created.
+         * @return this builder
+         */
+        public Builder withIndexes(String... indexes)
+        {
+            for (String index : indexes)
+                indexStatements.add(QueryProcessor.parseStatement(index, CreateIndexStatement.Raw.class, "CREATE INDEX"));
 
-                Schema.instance.load(ksm);
-                return this;
-            }
-            catch (RequestValidationException e)
-            {
-                throw new IllegalArgumentException(e.getMessage(), e);
-            }
+            return this;
         }
 
         /**
@@ -353,34 +517,44 @@ public class CQLSSTableWriter
         }
 
         /**
-         * The INSERT statement defining the order of the values to add for a given CQL row.
+         * The INSERT, UPDATE, or DELETE statement defining the order of the values to add for a given CQL row.
          * <p>
-         * Please note that the provided INSERT statement <b>must</b> use a fully-qualified
-         * table name, one that include the keyspace name. Morewover, said statement must use
-         * bind variables since it is those bind variables that will be bound to values by the
-         * resulting writer.
+         * Please note that the provided statement <b>must</b> use a fully-qualified
+         * table name, one that include the keyspace name. Moreover, said statement must use
+         * bind variables since these variables will be bound to values by the resulting writer.
          * <p>
-         * This is a mandatory option, and this needs to be called after foTable().
+         * This is a mandatory option.
          *
-         * @param insertStatement an insertion statement that defines the order
-         * of column values to use.
+         * @param modificationStatement an insert, update, or delete statement that defines the order
+         *                              of column values to use.
          * @return this builder.
-         *
-         * @throws IllegalArgumentException if {@code insertStatement} is not a valid insertion
-         * statement, does not have a fully-qualified table name or have no bind variables.
+         * @throws IllegalArgumentException if {@code modificationStatement} is not a valid insert, update, or delete
+         *                                  statement, does not have a fully-qualified table name or have no bind variables.
          */
-        public Builder using(String insertStatement)
+        public Builder using(String modificationStatement)
         {
-            if (schema == null)
-                throw new IllegalStateException("You need to define the schema by calling forTable() prior to this call.");
+            this.modificationStatement = QueryProcessor.parseStatement(modificationStatement,
+                                                                       ModificationStatement.Parsed.class,
+                                                                       "INSERT/UPDATE/DELETE");
+            return this;
+        }
 
-            Pair<UpdateStatement, List<ColumnSpecification>> p = getStatement(insertStatement, UpdateStatement.class, "INSERT");
-            this.insert = p.left;
-            this.boundNames = p.right;
-            if (this.insert.hasConditions())
-                throw new IllegalArgumentException("Conditional statements are not supported");
-            if (this.boundNames.isEmpty())
-                throw new IllegalArgumentException("Provided insert statement has no bind variables");
+        /**
+         * Defines the maximum SSTable size in mebibytes when using the sorted writer.
+         * By default, i.e. not specified, there is no maximum size limit for the produced SSTable
+         *
+         * @param size the maximum sizein mebibytes of each individual SSTable allowed
+         * @return this builder
+         */
+        public Builder withMaxSSTableSizeInMiB(int size)
+        {
+            if (size <= 0)
+            {
+                logger.warn("A non-positive value for maximum SSTable size is specified, " +
+                            "which disables the size limiting effectively. Please supply a positive value in order " +
+                            "to enforce size limiting for the produced SSTables.");
+            }
+            this.maxSSTableSizeInMiB = size;
             return this;
         }
 
@@ -388,19 +562,40 @@ public class CQLSSTableWriter
          * The size of the buffer to use.
          * <p>
          * This defines how much data will be buffered before being written as
-         * a new SSTable. This correspond roughly to the data size that will have the created
+         * a new SSTable. This corresponds roughly to the data size that will have the created
          * sstable.
          * <p>
-         * The default is 128MB, which should be reasonable for a 1GB heap. If you experience
+         * The default is 128MiB, which should be reasonable for a 1GiB heap. If you experience
          * OOM while using the writer, you should lower this value.
          *
-         * @param size the size to use in MB.
+         * @param size the size to use in MiB.
          * @return this builder.
+         * @deprecated This method is deprecated in favor of the new withMaxSSTableSizeInMiB(int size)
          */
+        @Deprecated(since = "5.0")
+        public Builder withBufferSizeInMiB(int size)
+        {
+            return withMaxSSTableSizeInMiB(size);
+        }
+
+        /**
+         * The size of the buffer to use.
+         * <p>
+         * This defines how much data will be buffered before being written as
+         * a new SSTable. This corresponds roughly to the data size that will have the created
+         * sstable.
+         * <p>
+         * The default is 128MiB, which should be reasonable for a 1GiB heap. If you experience
+         * OOM while using the writer, you should lower this value.
+         *
+         * @param size the size to use in MiB.
+         * @return this builder.
+         * @deprecated This method is deprecated in favor of the new withBufferSizeInMiB(int size). See CASSANDRA-17675
+         */
+        @Deprecated(since = "4.1")
         public Builder withBufferSizeInMB(int size)
         {
-            this.bufferSizeInMB = size;
-            return this;
+            return withBufferSizeInMiB(size);
         }
 
         /**
@@ -408,16 +603,15 @@ public class CQLSSTableWriter
          * <p>
          * If this option is used, the resulting writer will expect rows to be
          * added in SSTable sorted order (and an exception will be thrown if that
-         * is not the case during insertion). The SSTable sorted order means that
+         * is not the case during modification). The SSTable sorted order means that
          * rows are added such that their partition key respect the partitioner
-         * order and for a given partition, that the rows respect the clustering
-         * columns order.
+         * order.
          * <p>
          * You should thus only use this option is you know that you can provide
          * the rows in order, which is rarely the case. If you can provide the
          * rows in order however, using this sorted might be more efficient.
          * <p>
-         * Note that if used, some option like withBufferSizeInMB will be ignored.
+         * Note that if used, some option like withBufferSizeInMiB will be ignored.
          *
          * @return this builder.
          */
@@ -427,50 +621,306 @@ public class CQLSSTableWriter
             return this;
         }
 
-        private static <T extends CQLStatement> Pair<T, List<ColumnSpecification>> getStatement(String query, Class<T> klass, String type)
+        /**
+         * Whether indexes should be built and serialized to disk along data. Defaults to true.
+         *
+         * @param buildIndexes true if indexes should be built, false otherwise
+         * @return this builder
+         */
+        public Builder withBuildIndexes(boolean buildIndexes)
         {
-            try
-            {
-                ClientState state = ClientState.forInternalCalls();
-                ParsedStatement.Prepared prepared = QueryProcessor.getStatement(query, state);
-                CQLStatement stmt = prepared.statement;
-                stmt.validate(state);
+            this.buildIndexes = buildIndexes;
+            return this;
+        }
 
-                if (!stmt.getClass().equals(klass))
-                    throw new IllegalArgumentException("Invalid query, must be a " + type + " statement");
+        /**
+         * Set the listener to receive notifications on sstable produced
+         * <p>
+         * Note that if listener is registered, the sstables are opened into {@link SSTableReader}.
+         * The consumer is responsible for releasing the {@link SSTableReader}
+         *
+         * @param sstableProducedListener receives the produced sstables
+         * @return this builder
+         */
+        public Builder withSSTableProducedListener(Consumer<Collection<SSTableReader>> sstableProducedListener)
+        {
+            this.sstableProducedListener = sstableProducedListener;
+            return this;
+        }
 
-                return Pair.create(klass.cast(stmt), prepared.boundNames);
-            }
-            catch (RequestValidationException e)
-            {
-                throw new IllegalArgumentException(e.getMessage(), e);
-            }
+        /**
+         * Whether the produced sstable should be open or not.
+         * By default, the writer does not open the produced sstables
+         *
+         * @return this builder
+         */
+        public Builder openSSTableOnProduced()
+        {
+            this.openSSTableOnProduced = true;
+            return this;
+        }
+
+        /**
+         * Specifies the SSTable format this CQLSSTableWriter instance should use for writing.
+         *
+         * @param format The format to use
+         * @return this builder
+         */
+        public Builder withFormat(SSTableFormat<?, ?> format)
+        {
+            this.format = format;
+            return this;
+        }
+
+        public Builder withSSTableIdBuilder(SSTableId.Builder<? extends SSTableId> idBuilder)
+        {
+            this.idBuilder = idBuilder;
+            return this;
+        }
+
+        /**
+         * Use specific compression dictionary upon writing the data.
+         *
+         * @param compressionDictionary compression dictionary to use
+         * @return this builder
+         */
+        public Builder withCompressionDictionary(CompressionDictionary compressionDictionary)
+        {
+            this.compressionDictionary = compressionDictionary;
+            return this;
         }
 
         public CQLSSTableWriter build()
         {
             if (directory == null)
                 throw new IllegalStateException("No ouptut directory specified, you should provide a directory with inDirectory()");
-            if (schema == null)
+            if (schemaStatement == null)
                 throw new IllegalStateException("Missing schema, you should provide the schema for the SSTable to create with forTable()");
-            if (insert == null)
-                throw new IllegalStateException("No insert statement specified, you should provide an insert statement through using()");
+            if (modificationStatement == null)
+                throw new IllegalStateException("No modification (INSERT/UPDATE/DELETE) statement specified, you should provide a modification statement through using()");
 
-            AbstractSSTableSimpleWriter writer;
-            if (sorted)
+            Set<String> activeKeyspaces = new HashSet<>(SchemaConstants.LOCAL_SYSTEM_KEYSPACE_NAMES);
+
+            if (!DatabaseDescriptor.getAccordTransactionsEnabled())
+                activeKeyspaces.remove(SchemaConstants.ACCORD_KEYSPACE_NAME);
+
+            Preconditions.checkState(Sets.difference(activeKeyspaces, Schema.instance.getKeyspaces()).isEmpty(),
+                                     "Local keyspaces were not loaded. If this is running as a client, please make sure to add %s=true system property.",
+                                     CassandraRelevantProperties.FORCE_LOAD_LOCAL_KEYSPACES.getKey());
+
+            // Assign the default max SSTable size if not defined in builder
+            if (isMaxSSTableSizeUnset())
             {
-                writer = new SSTableSimpleWriter(directory,
-                                                 schema,
-                                                 partitioner);
+                maxSSTableSizeInMiB = sorted ? -1L : DEFAULT_BUFFER_SIZE_IN_MIB_FOR_UNSORTED;
             }
-            else
+
+            synchronized (CQLSSTableWriter.class)
             {
-                writer = new SSTableSimpleUnsortedWriter(directory,
-                                                         schema,
-                                                         partitioner,
-                                                         bufferSizeInMB);
+                String keyspaceName = schemaStatement.keyspace();
+                String tableName = schemaStatement.table();
+
+                Schema.instance.submit(SchemaTransformations.addKeyspace(KeyspaceMetadata.create(keyspaceName,
+                                                                                                 KeyspaceParams.simple(1),
+                                                                                                 Tables.none(),
+                                                                                                 Views.none(),
+                                                                                                 Types.none(),
+                                                                                                 UserFunctions.none()), true));
+
+                KeyspaceMetadata ksm = KeyspaceMetadata.create(keyspaceName,
+                                                               KeyspaceParams.simple(1),
+                                                               Tables.none(),
+                                                               Views.none(),
+                                                               Types.none(),
+                                                               UserFunctions.none());
+
+                TableMetadata tableMetadata = Schema.instance.getTableMetadata(keyspaceName, tableName);
+                if (tableMetadata == null)
+                {
+                    Types types = createTypes(keyspaceName);
+                    Schema.instance.submit(SchemaTransformations.addTypes(types, true));
+                    tableMetadata = createTable(types, ksm.userFunctions);
+                    Schema.instance.submit(SchemaTransformations.addTable(tableMetadata, true));
+
+                    if (buildIndexes && !indexStatements.isEmpty())
+                    {
+                        // we need to commit keyspace metadata first so applyIndexes sees that keyspace from TCM
+                        commitKeyspaceMetadata(ksm.withSwapped(ksm.tables.with(tableMetadata)));
+                        applyIndexes(keyspaceName);
+                    }
+
+                    KeyspaceMetadata keyspaceMetadata = ClusterMetadata.current().schema.getKeyspaceMetadata(keyspaceName);
+                    tableMetadata = keyspaceMetadata.tables.getNullable(tableName);
+
+                    Schema.instance.submit(SchemaTransformations.addTable(tableMetadata, true));
+                }
+
+                if (compressionDictionary != null)
+                {
+                    CompressionParams compressionParams = tableMetadata.params.compression;
+
+                    if (!compressionParams.isDictionaryCompressionEnabled())
+                    {
+                        throw new IllegalStateException("Table's compressor can not accept any dictionary: " + compressionParams.asMap());
+                    }
+
+                    IDictionaryCompressor compressor = (IDictionaryCompressor) compressionParams.getSstableCompressor();
+                    if (!compressor.canConsumeDictionary(compressionDictionary))
+                    {
+                        throw new IllegalStateException("Provided dictionary can not be consumed by table's compressor. " +
+                                                        "Provided dictionary type: " + compressionDictionary.kind() +
+                                                        "; expected dictionary type by the compressor: " + compressor.acceptableDictionaryKind());
+                    }
+                }
+
+                ColumnFamilyStore cfs = null;
+                if ((buildIndexes && !indexStatements.isEmpty()) || compressionDictionary != null)
+                {
+                    KeyspaceMetadata keyspaceMetadata = ClusterMetadata.current().schema.getKeyspaceMetadata(keyspaceName);
+                    Keyspace keyspace = Keyspace.mockKS(keyspaceMetadata);
+                    Directories directories = new Directories(tableMetadata, Collections.singleton(new Directories.DataDirectory(new File(directory.toPath()))));
+                    cfs = ColumnFamilyStore.createColumnFamilyStore(keyspace,
+                                                                    tableName,
+                                                                    tableMetadata,
+                                                                    directories,
+                                                                    false,
+                                                                    false);
+
+                    keyspace.initCfCustom(cfs);
+
+                    // this is the empty directory / leftover from times we initialized ColumnFamilyStore
+                    // it will automatically create directories for keyspace and table on disk after initialization
+                    // we set that directory to the destination of generated SSTables so we just remove empty directories here
+                    try
+                    {
+                        new File(directory, keyspaceName).deleteRecursive();
+                    }
+                    catch (UncheckedIOException ex)
+                    {
+                        if (!(ex.getCause() instanceof NoSuchFileException))
+                        {
+                            throw ex;
+                        }
+                    }
+                }
+
+                ModificationStatement preparedModificationStatement = prepareModificationStatement();
+
+                TableMetadataRef ref = tableMetadata.ref;
+                AbstractSSTableSimpleWriter writer = sorted
+                                                     ? new SSTableSimpleWriter(cfs, directory, ref, preparedModificationStatement.updatedColumns(), maxSSTableSizeInMiB, idBuilder)
+                                                     : new SSTableSimpleUnsortedWriter(cfs, directory, ref, preparedModificationStatement.updatedColumns(), maxSSTableSizeInMiB, idBuilder);
+
+                if (format != null)
+                    writer.setSSTableFormatType(format);
+
+                if (buildIndexes && !indexStatements.isEmpty() && cfs != null)
+                {
+                    StorageAttachedIndexGroup saiGroup = StorageAttachedIndexGroup.getIndexGroup(cfs);
+                    if (saiGroup != null)
+                        writer.addIndexGroup(saiGroup);
+                }
+
+                if (compressionDictionary != null && cfs != null)
+                {
+                    writer.setCompressionDictionary(compressionDictionary);
+                }
+
+                if (sstableProducedListener != null)
+                    writer.setSSTableProducedListener(sstableProducedListener);
+
+                writer.setShouldOpenProducedSSTable(openSSTableOnProduced);
+
+                return new CQLSSTableWriter(writer, preparedModificationStatement, preparedModificationStatement.getBindVariables());
             }
-            return new CQLSSTableWriter(writer, insert, boundNames);
+        }
+
+        private boolean isMaxSSTableSizeUnset()
+        {
+            return maxSSTableSizeInMiB <= 0;
+        }
+
+        private Types createTypes(String keyspace)
+        {
+            Types.RawBuilder builder = Types.rawBuilder(keyspace);
+            for (CreateTypeStatement.Raw st : typeStatements)
+                st.addToRawBuilder(builder);
+            return builder.build();
+        }
+
+        /**
+         * Applies any provided index definitions to the target table
+         *
+         * @param keyspaceName name of the keyspace to apply indexes for
+         * @return table metadata reflecting applied indexes
+         */
+        private void applyIndexes(String keyspaceName)
+        {
+            ClientState state = ClientState.forInternalCalls();
+
+            for (CreateIndexStatement.Raw statement : indexStatements)
+            {
+                Keyspaces keyspaces = statement.prepare(state).apply(ClusterMetadata.current());
+                commitKeyspaceMetadata(keyspaces.getNullable(keyspaceName));
+            }
+        }
+
+        private void commitKeyspaceMetadata(KeyspaceMetadata keyspaceMetadata)
+        {
+            SchemaTransformation schemaTransformation = new SchemaTransformation()
+            {
+                @Override
+                public Keyspaces apply(ClusterMetadata metadata)
+                {
+                    return metadata.schema.getKeyspaces().withAddedOrUpdated(keyspaceMetadata);
+                }
+
+                @Override
+                public boolean compatibleWith(ClusterMetadata metadata)
+                {
+                    return metadata.directory.commonSerializationVersion.isAtLeast(Version.V0);
+                }
+            };
+
+            ClusterMetadataService.instance().commit(new AlterSchema(schemaTransformation));
+        }
+
+        /**
+         * Creates the table according to schema statement
+         *
+         * @param types types this table should be created with
+         */
+        private TableMetadata createTable(Types types, UserFunctions functions)
+        {
+            ClientState state = ClientState.forInternalCalls();
+            CreateTableStatement statement = schemaStatement.prepare(state);
+            statement.validate(ClientState.forInternalCalls());
+
+            TableMetadata.Builder builder = statement.builder(types, functions);
+            if (partitioner != null)
+                builder.partitioner(partitioner);
+
+            return builder.build();
+        }
+
+        /**
+         * Prepares modification statement for writing data to SSTable
+         *
+         * @return prepared modification statement and it's bound names
+         */
+        private ModificationStatement prepareModificationStatement()
+        {
+            ClientState state = ClientState.forInternalCalls();
+            ModificationStatement preparedModificationStatement = modificationStatement.prepare(state);
+            preparedModificationStatement.validate(state);
+
+            if (preparedModificationStatement.hasConditions())
+                throw new IllegalArgumentException("Conditional statements are not supported");
+            if (preparedModificationStatement.isCounter())
+                throw new IllegalArgumentException("Counter modification statements are not supported");
+            if (preparedModificationStatement.getBindVariables().isEmpty())
+                throw new IllegalArgumentException("Provided preparedModificationStatement statement has no bind variables");
+
+            return preparedModificationStatement;
         }
     }
 }

@@ -20,41 +20,77 @@ package org.apache.cassandra.db.marshal;
 import java.nio.ByteBuffer;
 
 import org.apache.cassandra.cql3.CQL3Type;
-import org.apache.cassandra.db.*;
-import org.apache.cassandra.serializers.TypeSerializer;
+import org.apache.cassandra.cql3.functions.ArgumentDeserializer;
+import org.apache.cassandra.cql3.terms.Term;
+import org.apache.cassandra.db.context.CounterContext;
 import org.apache.cassandra.serializers.CounterSerializer;
+import org.apache.cassandra.serializers.MarshalException;
+import org.apache.cassandra.serializers.TypeSerializer;
+import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
-public class CounterColumnType extends AbstractCommutativeType
+public class CounterColumnType extends NumberType<Long>
 {
     public static final CounterColumnType instance = new CounterColumnType();
 
-    CounterColumnType() {} // singleton
+    private static final ByteBuffer MASKED_VALUE = instance.decompose(0L);
 
-    public int compare(ByteBuffer o1, ByteBuffer o2)
+    CounterColumnType() {super(ComparisonType.NOT_COMPARABLE);} // singleton
+
+    @Override
+    public boolean allowsEmpty()
     {
-        if (o1 == null)
-            return o2 == null ?  0 : -1;
-
-        return ByteBufferUtil.compareUnsigned(o1, o2);
+        return true;
     }
 
-    public String getString(ByteBuffer bytes)
+    @Override
+    public boolean isEmptyValueMeaningless()
     {
-        return ByteBufferUtil.bytesToHex(bytes);
+        return true;
     }
 
-    /**
-     * create commutative column
-     */
-    public Column createColumn(ByteBuffer name, ByteBuffer value, long timestamp)
+    public boolean isCounter()
     {
-        return new CounterUpdateColumn(name, value, timestamp);
+        return true;
+    }
+
+    public <V> Long compose(V value, ValueAccessor<V> accessor)
+    {
+        return CounterContext.instance().total(value, accessor);
+    }
+
+    @Override
+    public ByteBuffer decompose(Long value)
+    {
+        return ByteBufferUtil.bytes(value);
+    }
+
+    @Override
+    public <V> void validateCellValue(V cellValue, ValueAccessor<V> accessor) throws MarshalException
+    {
+        CounterContext.instance().validateContext(cellValue, accessor);
+    }
+
+    public <V> String getString(V value, ValueAccessor<V> accessor)
+    {
+        return accessor.toHex(value);
     }
 
     public ByteBuffer fromString(String source)
     {
         return ByteBufferUtil.hexToBytes(source);
+    }
+
+    @Override
+    public Term fromJSONObject(Object parsed)
+    {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public String toJSONString(ByteBuffer buffer, ProtocolVersion protocolVersion)
+    {
+        return CounterSerializer.instance.deserialize(buffer).toString();
     }
 
     public CQL3Type asCQL3Type()
@@ -65,5 +101,82 @@ public class CounterColumnType extends AbstractCommutativeType
     public TypeSerializer<Long> getSerializer()
     {
         return CounterSerializer.instance;
+    }
+
+    @Override
+    public ArgumentDeserializer getArgumentDeserializer()
+    {
+        return LongType.instance.getArgumentDeserializer();
+    }
+
+    @Override
+    public ByteBuffer add(Number left, Number right)
+    {
+        return ByteBufferUtil.bytes(left.longValue() + right.longValue());
+    }
+
+    @Override
+    public ByteBuffer substract(Number left, Number right)
+    {
+        return ByteBufferUtil.bytes(left.longValue() - right.longValue());
+    }
+
+    @Override
+    public ByteBuffer multiply(Number left, Number right)
+    {
+        return ByteBufferUtil.bytes(left.longValue() * right.longValue());
+    }
+
+    @Override
+    public ByteBuffer divide(Number left, Number right)
+    {
+        return ByteBufferUtil.bytes(left.longValue() / right.longValue());
+    }
+
+    @Override
+    public ByteBuffer mod(Number left, Number right)
+    {
+        return ByteBufferUtil.bytes(left.longValue() % right.longValue());
+    }
+
+    public ByteBuffer negate(Number input)
+    {
+        return ByteBufferUtil.bytes(-input.longValue());
+    }
+
+    @Override
+    public ByteBuffer abs(Number input)
+    {
+        return ByteBufferUtil.bytes(Math.abs(input.longValue()));
+    }
+
+    @Override
+    public ByteBuffer exp(Number input)
+    {
+        return ByteBufferUtil.bytes((long) Math.exp(input.longValue()));
+    }
+
+    @Override
+    public ByteBuffer log(Number input)
+    {
+        return ByteBufferUtil.bytes((long) Math.log(input.longValue()));
+    }
+
+    @Override
+    public ByteBuffer log10(Number input)
+    {
+        return ByteBufferUtil.bytes((long) Math.log10(input.longValue()));
+    }
+
+    @Override
+    public ByteBuffer round(Number input)
+    {
+        return decompose(input.longValue());
+    }
+
+    @Override
+    public ByteBuffer getMaskedValue()
+    {
+        return MASKED_VALUE;
     }
 }

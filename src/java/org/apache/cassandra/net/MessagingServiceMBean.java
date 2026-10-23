@@ -19,49 +19,95 @@ package org.apache.cassandra.net;
 
 
 
+import java.io.IOException;
 import java.net.UnknownHostException;
 import java.util.Map;
 
 /**
- * MBean exposing MessagingService metrics.
- * - OutboundConnectionPools - Command/Response - Pending/Completed Tasks
+ * MBean exposing MessagingService metrics plus allowing to enable/disable back-pressure.
  */
 public interface MessagingServiceMBean
 {
     /**
-     * Pending tasks for Command(Mutations, Read etc) TCP Connections
+     * Pending tasks for large message TCP Connections
+     * @deprecated See CASSANDRA-7544
      */
-    public Map<String, Integer> getCommandPendingTasks();
+    @Deprecated(since = "4.0")
+    public Map<String, Integer> getLargeMessagePendingTasks();
+    public Map<String, Integer> getLargeMessagePendingTasksWithPort();
 
     /**
-     * Completed tasks for Command(Mutations, Read etc) TCP Connections
+     * Completed tasks for large message) TCP Connections
+     * @deprecated See CASSANDRA-7544
      */
-    public Map<String, Long> getCommandCompletedTasks();
+    @Deprecated(since = "4.0")
+    public Map<String, Long> getLargeMessageCompletedTasks();
+    public Map<String, Long> getLargeMessageCompletedTasksWithPort();
 
     /**
-     * Dropped tasks for Command(Mutations, Read etc) TCP Connections
+     * Dropped tasks for large message TCP Connections
+     * @deprecated See CASSANDRA-7544
      */
-    public Map<String, Long> getCommandDroppedTasks();
+    @Deprecated(since = "4.0")
+    public Map<String, Long> getLargeMessageDroppedTasks();
+    public Map<String, Long> getLargeMessageDroppedTasksWithPort();
+
 
     /**
-     * Pending tasks for Response(GOSSIP & RESPONSE) TCP Connections
+     * Pending tasks for small message TCP Connections
+     * @deprecated See CASSANDRA-7544
      */
-    public Map<String, Integer> getResponsePendingTasks();
+    @Deprecated(since = "4.0")
+    public Map<String, Integer> getSmallMessagePendingTasks();
+    public Map<String, Integer> getSmallMessagePendingTasksWithPort();
+
 
     /**
-     * Completed tasks for Response(GOSSIP & RESPONSE) TCP Connections
+     * Completed tasks for small message TCP Connections
+     * @deprecated See CASSANDRA-7544
      */
-    public Map<String, Long> getResponseCompletedTasks();
+    @Deprecated(since = "4.0")
+    public Map<String, Long> getSmallMessageCompletedTasks();
+    public Map<String, Long> getSmallMessageCompletedTasksWithPort();
+
+
+    /**
+     * Dropped tasks for small message TCP Connections
+     * @deprecated See CASSANDRA-7544
+     */
+    @Deprecated(since = "4.0")
+    public Map<String, Long> getSmallMessageDroppedTasks();
+    public Map<String, Long> getSmallMessageDroppedTasksWithPort();
+
+
+    /**
+     * Pending tasks for gossip message TCP Connections
+     * @deprecated See CASSANDRA-7544
+     */
+    @Deprecated(since = "4.0")
+    public Map<String, Integer> getGossipMessagePendingTasks();
+    public Map<String, Integer> getGossipMessagePendingTasksWithPort();
+
+    /**
+     * Completed tasks for gossip message TCP Connections
+     * @deprecated See CASSANDRA-7544
+     */
+    @Deprecated(since = "4.0")
+    public Map<String, Long> getGossipMessageCompletedTasks();
+    public Map<String, Long> getGossipMessageCompletedTasksWithPort();
+
+    /**
+     * Dropped tasks for gossip message TCP Connections
+     * @deprecated See CASSANDRA-7544
+     */
+    @Deprecated(since = "4.0")
+    public Map<String, Long> getGossipMessageDroppedTasks();
+    public Map<String, Long> getGossipMessageDroppedTasksWithPort();
 
     /**
      * dropped message counts for server lifetime
      */
     public Map<String, Integer> getDroppedMessages();
-
-    /**
-     * dropped message counts since last called
-     */
-    public Map<String, Integer> getRecentlyDroppedMessages();
 
     /**
      * Total number of timeouts happened on this node
@@ -70,18 +116,34 @@ public interface MessagingServiceMBean
 
     /**
      * Number of timeouts per host
+     * @deprecated See CASSANDRA-7544
      */
+    @Deprecated(since = "4.0")
     public Map<String, Long> getTimeoutsPerHost();
+    public Map<String, Long> getTimeoutsPerHostWithPort();
 
     /**
-     * Number of timeouts since last check.
+     * Back-pressure rate limiting per host
+     * @deprecated See CASSANDRA-7544
      */
-    public long getRecentTotalTimouts();
+    @Deprecated(since = "4.0")
+    public Map<String, Double> getBackPressurePerHost();
 
     /**
-     * Number of timeouts since last check per host.
+     * Enable/Disable back-pressure
+     * @deprecated See CASSANDRA-15375
      */
-    public Map<String, Long> getRecentTimeoutsPerHost();
+    @Deprecated(since = "4.0")
+    public void setBackPressureEnabled(boolean enabled);
+
+    /**
+     * Get back-pressure enabled state
+     * @deprecated See CASSANDRA-15375
+     */
+    @Deprecated(since = "4.0")
+    public boolean isBackPressureEnabled();
 
     public int getVersion(String address) throws UnknownHostException;
+
+    void reloadSslCertificates() throws IOException;
 }

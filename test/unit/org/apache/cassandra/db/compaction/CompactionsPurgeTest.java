@@ -18,39 +18,121 @@
 */
 package org.apache.cassandra.db.compaction;
 
-import java.io.IOException;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.concurrent.ExecutionException;
 
-import org.junit.Assert;
+import com.google.common.collect.Iterables;
 
+import org.junit.After;
+import org.junit.Before;
+import org.junit.BeforeClass;
 import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.junit.runners.Parameterized;
 
 import org.apache.cassandra.SchemaLoader;
-import org.apache.cassandra.db.Column;
-import org.apache.cassandra.db.Keyspace;
-import org.apache.cassandra.db.DecoratedKey;
-import org.apache.cassandra.db.RowMutation;
-import org.apache.cassandra.db.ColumnFamily;
-import org.apache.cassandra.db.ColumnFamilyStore;
-import org.apache.cassandra.db.filter.QueryFilter;
-import org.apache.cassandra.io.sstable.SSTableReader;
 import org.apache.cassandra.Util;
-
-import static org.junit.Assert.assertEquals;
-import static org.apache.cassandra.db.KeyspaceTest.assertColumns;
-import static org.junit.Assert.assertFalse;
-
+import org.apache.cassandra.config.Config.DiskAccessMode;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.cql3.QueryProcessor;
+import org.apache.cassandra.cql3.UntypedResultSet;
+import org.apache.cassandra.cql3.statements.schema.CreateTableStatement;
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.Keyspace;
+import org.apache.cassandra.db.Mutation;
+import org.apache.cassandra.db.RowUpdateBuilder;
+import org.apache.cassandra.db.partitions.ImmutableBTreePartition;
+import org.apache.cassandra.db.partitions.PartitionUpdate;
+import org.apache.cassandra.db.rows.Row;
+import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.schema.CachingParams;
+import org.apache.cassandra.schema.KeyspaceParams;
 import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.FBUtilities;
 
+import static org.apache.cassandra.Util.dk;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
 
-public class CompactionsPurgeTest extends SchemaLoader
+@RunWith(Parameterized.class)
+public class CompactionsPurgeTest
 {
-    public static final String KEYSPACE1 = "Keyspace1";
-    public static final String KEYSPACE2 = "Keyspace2";
+    private static final String KEYSPACE1 = "CompactionsPurgeTest1";
+    private static final String CF_STANDARD1 = "Standard1";
+    private static final String CF_STANDARD2 = "Standard2";
+    private static final String KEYSPACE2 = "CompactionsPurgeTest2";
+    private static final String KEYSPACE_CACHED = "CompactionsPurgeTestCached";
+    private static final String CF_CACHED = "CachedCF";
+    private static final String KEYSPACE_CQL = "cql_keyspace";
+    private static final String CF_CQL = "table1";
+
+    @Parameterized.Parameter(0)
+    public DiskAccessMode compactionReadDiskAccessMode;
+
+    @Parameterized.Parameter(1)
+    public boolean cursorCompactionEnabled;
+
+    @Parameterized.Parameters(name = "diskAccessMode={0},cursor={1}")
+    public static Collection<Object[]> params()
+    {
+        return Arrays.asList(new Object[]{ DiskAccessMode.standard, true },
+                             new Object[]{ DiskAccessMode.standard, false },
+                             new Object[]{ DiskAccessMode.direct, true },
+                             new Object[]{ DiskAccessMode.direct, false });
+    }
+
+    private DiskAccessMode originalDiskAccessMode;
+    private boolean originalCursorCompactionEnabled;
+
+    @Before
+    public void setCompactionParams()
+    {
+        originalDiskAccessMode = DatabaseDescriptor.getCompactionReadDiskAccessMode();
+        originalCursorCompactionEnabled = DatabaseDescriptor.cursorCompactionEnabled();
+        DatabaseDescriptor.setCompactionReadDiskAccessMode(compactionReadDiskAccessMode);
+        DatabaseDescriptor.setCursorCompactionEnabled(cursorCompactionEnabled);
+    }
+
+    @After
+    public void restoreCompactionParams()
+    {
+        DatabaseDescriptor.setCompactionReadDiskAccessMode(originalDiskAccessMode);
+        DatabaseDescriptor.setCursorCompactionEnabled(originalCursorCompactionEnabled);
+    }
+
+    @BeforeClass
+    public static void defineSchema() throws ConfigurationException
+    {
+        SchemaLoader.prepareServer();
+
+        SchemaLoader.createKeyspace(KEYSPACE1,
+                                    KeyspaceParams.simple(1),
+                                    SchemaLoader.standardCFMD(KEYSPACE1, CF_STANDARD1),
+                                    SchemaLoader.standardCFMD(KEYSPACE1, CF_STANDARD2));
+
+        SchemaLoader.createKeyspace(KEYSPACE2,
+                                    KeyspaceParams.simple(1),
+                                    SchemaLoader.standardCFMD(KEYSPACE2, CF_STANDARD1));
+
+        SchemaLoader.createKeyspace(KEYSPACE_CACHED,
+                                    KeyspaceParams.simple(1),
+                                    SchemaLoader.standardCFMD(KEYSPACE_CACHED, CF_CACHED).caching(CachingParams.CACHE_EVERYTHING));
+
+        SchemaLoader.createKeyspace(KEYSPACE_CQL,
+                                    KeyspaceParams.simple(1),
+                                    CreateTableStatement.parse("CREATE TABLE " + CF_CQL + " ("
+                                                               + "k int PRIMARY KEY,"
+                                                               + "v1 text,"
+                                                               + "v2 int"
+                                                               + ")", KEYSPACE_CQL));
+    }
 
     @Test
-    public void testMajorCompactionPurge() throws IOException, ExecutionException, InterruptedException
+    public void testMajorCompactionPurge()
     {
         CompactionManager.instance.disableAutoCompaction();
 
@@ -58,43 +140,175 @@ public class CompactionsPurgeTest extends SchemaLoader
         String cfName = "Standard1";
         ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(cfName);
 
-        DecoratedKey key = Util.dk("key1");
-        RowMutation rm;
+        String key = "key1";
 
         // inserts
-        rm = new RowMutation(KEYSPACE1, key.key);
         for (int i = 0; i < 10; i++)
         {
-            rm.add(cfName, ByteBufferUtil.bytes(String.valueOf(i)), ByteBufferUtil.EMPTY_BYTE_BUFFER, 0);
+            RowUpdateBuilder builder = new RowUpdateBuilder(cfs.metadata(), 0, key);
+            builder.clustering(String.valueOf(i))
+                   .add("val", ByteBufferUtil.EMPTY_BYTE_BUFFER)
+                   .build().applyUnsafe();
         }
-        rm.apply();
-        cfs.forceBlockingFlush();
+
+        Util.flush(cfs);
 
         // deletes
         for (int i = 0; i < 10; i++)
         {
-            rm = new RowMutation(KEYSPACE1, key.key);
-            rm.delete(cfName, ByteBufferUtil.bytes(String.valueOf(i)), 1);
-            rm.apply();
+            RowUpdateBuilder.deleteRow(cfs.metadata(), 1, key, String.valueOf(i)).applyUnsafe();
         }
-        cfs.forceBlockingFlush();
+        Util.flush(cfs);
 
         // resurrect one column
-        rm = new RowMutation(KEYSPACE1, key.key);
-        rm.add(cfName, ByteBufferUtil.bytes(String.valueOf(5)), ByteBufferUtil.EMPTY_BYTE_BUFFER, 2);
-        rm.apply();
-        cfs.forceBlockingFlush();
+        RowUpdateBuilder builder = new RowUpdateBuilder(cfs.metadata(), 2, key);
+        builder.clustering(String.valueOf(5))
+               .add("val", ByteBufferUtil.EMPTY_BYTE_BUFFER)
+               .build().applyUnsafe();
+
+        Util.flush(cfs);
 
         // major compact and test that all columns but the resurrected one is completely gone
-        CompactionManager.instance.submitMaximal(cfs, Integer.MAX_VALUE).get();
-        cfs.invalidateCachedRow(key);
-        ColumnFamily cf = cfs.getColumnFamily(QueryFilter.getIdentityFilter(key, cfName, System.currentTimeMillis()));
-        assertColumns(cf, "5");
-        assert cf.getColumn(ByteBufferUtil.bytes(String.valueOf(5))) != null;
+        FBUtilities.waitOnFutures(CompactionManager.instance.submitMaximal(cfs, Long.MAX_VALUE, false, 0));
+        cfs.invalidateCachedPartition(dk(key));
+
+        ImmutableBTreePartition partition = Util.getOnlyPartitionUnfiltered(Util.cmd(cfs, key).build());
+        assertEquals(1, partition.rowCount());
     }
 
     @Test
-    public void testMinorCompactionPurge() throws IOException, ExecutionException, InterruptedException
+    public void testMajorCompactionPurgeTombstonesWithMaxTimestamp()
+    {
+        CompactionManager.instance.disableAutoCompaction();
+
+        Keyspace keyspace = Keyspace.open(KEYSPACE1);
+        String cfName = "Standard1";
+        ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(cfName);
+
+        String key = "key1";
+
+        // inserts
+        for (int i = 0; i < 10; i++)
+        {
+            RowUpdateBuilder builder = new RowUpdateBuilder(cfs.metadata(), 0, key);
+            builder.clustering(String.valueOf(i))
+                   .add("val", ByteBufferUtil.EMPTY_BYTE_BUFFER)
+                   .build().applyUnsafe();
+        }
+        Util.flush(cfs);
+
+        // deletes
+        for (int i = 0; i < 10; i++)
+        {
+            RowUpdateBuilder.deleteRow(cfs.metadata(), Long.MAX_VALUE, key, String.valueOf(i)).applyUnsafe();
+        }
+        Util.flush(cfs);
+
+        // major compact - tombstones should be purged
+        FBUtilities.waitOnFutures(CompactionManager.instance.submitMaximal(cfs, Long.MAX_VALUE, false, 0));
+
+        // resurrect one column
+        RowUpdateBuilder builder = new RowUpdateBuilder(cfs.metadata(), 2, key);
+        builder.clustering(String.valueOf(5))
+               .add("val", ByteBufferUtil.EMPTY_BYTE_BUFFER)
+               .build().applyUnsafe();
+
+        Util.flush(cfs);
+
+        cfs.invalidateCachedPartition(dk(key));
+
+        ImmutableBTreePartition partition = Util.getOnlyPartitionUnfiltered(Util.cmd(cfs, key).build());
+        assertEquals(1, partition.rowCount());
+    }
+
+    @Test
+    public void testMajorCompactionPurgeTopLevelTombstoneWithMaxTimestamp()
+    {
+        CompactionManager.instance.disableAutoCompaction();
+
+        Keyspace keyspace = Keyspace.open(KEYSPACE1);
+        String cfName = "Standard1";
+        ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(cfName);
+
+        String key = "key1";
+
+        // inserts
+        for (int i = 0; i < 10; i++)
+        {
+            RowUpdateBuilder builder = new RowUpdateBuilder(cfs.metadata(), 0, key);
+            builder.clustering(String.valueOf(i))
+                   .add("val", ByteBufferUtil.EMPTY_BYTE_BUFFER)
+                   .build().applyUnsafe();
+        }
+        Util.flush(cfs);
+
+        new Mutation.PartitionUpdateCollector(KEYSPACE1, dk(key))
+            .add(PartitionUpdate.fullPartitionDelete(cfs.metadata(), dk(key), Long.MAX_VALUE, FBUtilities.nowInSeconds()))
+            .build()
+            .applyUnsafe();
+        Util.flush(cfs);
+
+        // major compact - tombstones should be purged
+        FBUtilities.waitOnFutures(CompactionManager.instance.submitMaximal(cfs, Long.MAX_VALUE, false, 0));
+
+        // resurrect one column
+        RowUpdateBuilder builder = new RowUpdateBuilder(cfs.metadata(), 2, key);
+        builder.clustering(String.valueOf(5))
+               .add("val", ByteBufferUtil.EMPTY_BYTE_BUFFER)
+               .build().applyUnsafe();
+
+        Util.flush(cfs);
+
+        cfs.invalidateCachedPartition(dk(key));
+
+        ImmutableBTreePartition partition = Util.getOnlyPartitionUnfiltered(Util.cmd(cfs, key).build());
+        assertEquals(1, partition.rowCount());
+    }
+
+    @Test
+    public void testMajorCompactionPurgeRangeTombstoneWithMaxTimestamp()
+    {
+        CompactionManager.instance.disableAutoCompaction();
+
+        Keyspace keyspace = Keyspace.open(KEYSPACE1);
+        String cfName = "Standard1";
+        ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(cfName);
+
+        String key = "key1";
+
+        // inserts
+        for (int i = 0; i < 10; i++)
+        {
+            RowUpdateBuilder builder = new RowUpdateBuilder(cfs.metadata(), 0, key);
+            builder.clustering(String.valueOf(i))
+                   .add("val", ByteBufferUtil.EMPTY_BYTE_BUFFER)
+                   .build().applyUnsafe();
+        }
+        Util.flush(cfs);
+
+        new RowUpdateBuilder(cfs.metadata(), Long.MAX_VALUE, dk(key))
+            .addRangeTombstone(String.valueOf(0), String.valueOf(9)).build().applyUnsafe();
+        Util.flush(cfs);
+
+        // major compact - tombstones should be purged
+        FBUtilities.waitOnFutures(CompactionManager.instance.submitMaximal(cfs, Long.MAX_VALUE, false, 0));
+
+        // resurrect one column
+        RowUpdateBuilder builder = new RowUpdateBuilder(cfs.metadata(), 2, key);
+        builder.clustering(String.valueOf(5))
+               .add("val", ByteBufferUtil.EMPTY_BYTE_BUFFER)
+               .build().applyUnsafe();
+
+        Util.flush(cfs);
+
+        cfs.invalidateCachedPartition(dk(key));
+
+        ImmutableBTreePartition partition = Util.getOnlyPartitionUnfiltered(Util.cmd(cfs, key).build());
+        assertEquals(1, partition.rowCount());
+    }
+
+    @Test
+    public void testMinorCompactionPurge()
     {
         CompactionManager.instance.disableAutoCompaction();
 
@@ -102,27 +316,26 @@ public class CompactionsPurgeTest extends SchemaLoader
         String cfName = "Standard1";
         ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(cfName);
 
-        RowMutation rm;
         for (int k = 1; k <= 2; ++k) {
-            DecoratedKey key = Util.dk("key" + k);
+            String key = "key" + k;
 
             // inserts
-            rm = new RowMutation(KEYSPACE2, key.key);
             for (int i = 0; i < 10; i++)
             {
-                rm.add(cfName, ByteBufferUtil.bytes(String.valueOf(i)), ByteBufferUtil.EMPTY_BYTE_BUFFER, 0);
+                RowUpdateBuilder builder = new RowUpdateBuilder(cfs.metadata(), 0, key);
+                builder.clustering(String.valueOf(i))
+                        .add("val", ByteBufferUtil.EMPTY_BYTE_BUFFER)
+                        .build().applyUnsafe();
             }
-            rm.apply();
-            cfs.forceBlockingFlush();
+            Util.flush(cfs);
 
             // deletes
             for (int i = 0; i < 10; i++)
             {
-                rm = new RowMutation(KEYSPACE2, key.key);
-                rm.delete(cfName, ByteBufferUtil.bytes(String.valueOf(i)), 1);
-                rm.apply();
+                RowUpdateBuilder.deleteRow(cfs.metadata(), 1, key, String.valueOf(i)).applyUnsafe();
             }
-            cfs.forceBlockingFlush();
+
+            Util.flush(cfs);
         }
 
         DecoratedKey key1 = Util.dk("key1");
@@ -130,70 +343,82 @@ public class CompactionsPurgeTest extends SchemaLoader
 
         // flush, remember the current sstable and then resurrect one column
         // for first key. Then submit minor compaction on remembered sstables.
-        cfs.forceBlockingFlush();
-        Collection<SSTableReader> sstablesIncomplete = cfs.getSSTables();
-        rm = new RowMutation(KEYSPACE2, key1.key);
-        rm.add(cfName, ByteBufferUtil.bytes(String.valueOf(5)), ByteBufferUtil.EMPTY_BYTE_BUFFER, 2);
-        rm.apply();
-        cfs.forceBlockingFlush();
-        cfs.getCompactionStrategy().getUserDefinedTask(sstablesIncomplete, Integer.MAX_VALUE).execute(null);
+        Util.flush(cfs);
+        Collection<SSTableReader> sstablesIncomplete = cfs.getLiveSSTables();
+
+        RowUpdateBuilder builder = new RowUpdateBuilder(cfs.metadata(), 2, "key1");
+        builder.clustering(String.valueOf(5))
+                .add("val", ByteBufferUtil.EMPTY_BYTE_BUFFER)
+                .build().applyUnsafe();
+
+        Util.flush(cfs);
+        try (CompactionTasks tasks = cfs.getCompactionStrategyManager().getUserDefinedTasks(sstablesIncomplete, Integer.MAX_VALUE))
+        {
+            Iterables.getOnlyElement(tasks).execute(ActiveCompactionsTracker.NOOP);
+        }
 
         // verify that minor compaction does GC when key is provably not
         // present in a non-compacted sstable
-        ColumnFamily cf = cfs.getColumnFamily(QueryFilter.getIdentityFilter(key2, cfName, System.currentTimeMillis()));
-        assert cf == null;
+        Util.assertEmpty(Util.cmd(cfs, key2).build());
 
         // verify that minor compaction still GC when key is present
         // in a non-compacted sstable but the timestamp ensures we won't miss anything
-        cf = cfs.getColumnFamily(QueryFilter.getIdentityFilter(key1, cfName, System.currentTimeMillis()));
-        assertEquals(1, cf.getColumnCount());
+        ImmutableBTreePartition partition = Util.getOnlyPartitionUnfiltered(Util.cmd(cfs, key1).build());
+        assertEquals(1, partition.rowCount());
     }
 
     /**
      * verify that we don't drop tombstones during a minor compaction that might still be relevant
      */
     @Test
-    public void testMinTimestampPurge() throws IOException, ExecutionException, InterruptedException
+    public void testMinTimestampPurge()
     {
         CompactionManager.instance.disableAutoCompaction();
 
         Keyspace keyspace = Keyspace.open(KEYSPACE2);
         String cfName = "Standard1";
         ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(cfName);
-        RowMutation rm;
-        DecoratedKey key3 = Util.dk("key3");
+        final boolean enforceStrictLiveness = cfs.metadata().enforceStrictLiveness();
+        String key3 = "key3";
 
         // inserts
-        rm = new RowMutation(KEYSPACE2, key3.key);
-        rm.add(cfName, ByteBufferUtil.bytes("c1"), ByteBufferUtil.EMPTY_BYTE_BUFFER, 8);
-        rm.add(cfName, ByteBufferUtil.bytes("c2"), ByteBufferUtil.EMPTY_BYTE_BUFFER, 8);
-        rm.apply();
-        cfs.forceBlockingFlush();
+        new RowUpdateBuilder(cfs.metadata(), 8, key3)
+            .clustering("c1")
+            .add("val", ByteBufferUtil.EMPTY_BYTE_BUFFER)
+            .build().applyUnsafe();
+
+        new RowUpdateBuilder(cfs.metadata(), 8, key3)
+        .clustering("c2")
+        .add("val", ByteBufferUtil.EMPTY_BYTE_BUFFER)
+        .build().applyUnsafe();
+
+        Util.flush(cfs);
         // delete c1
-        rm = new RowMutation(KEYSPACE2, key3.key);
-        rm.delete(cfName, ByteBufferUtil.bytes("c1"), 10);
-        rm.apply();
-        cfs.forceBlockingFlush();
-        Collection<SSTableReader> sstablesIncomplete = cfs.getSSTables();
+        RowUpdateBuilder.deleteRow(cfs.metadata(), 10, key3, "c1").applyUnsafe();
+
+        Util.flush(cfs);
+        Collection<SSTableReader> sstablesIncomplete = cfs.getLiveSSTables();
 
         // delete c2 so we have new delete in a diffrent SSTable
-        rm = new RowMutation(KEYSPACE2, key3.key);
-        rm.delete(cfName, ByteBufferUtil.bytes("c2"), 9);
-        rm.apply();
-        cfs.forceBlockingFlush();
+        RowUpdateBuilder.deleteRow(cfs.metadata(), 9, key3, "c2").applyUnsafe();
+        Util.flush(cfs);
 
         // compact the sstables with the c1/c2 data and the c1 tombstone
-        cfs.getCompactionStrategy().getUserDefinedTask(sstablesIncomplete, Integer.MAX_VALUE).execute(null);
+        try (CompactionTasks tasks = cfs.getCompactionStrategyManager().getUserDefinedTasks(sstablesIncomplete, Integer.MAX_VALUE))
+        {
+            Iterables.getOnlyElement(tasks).execute(ActiveCompactionsTracker.NOOP);
+        }
 
         // We should have both the c1 and c2 tombstones still. Since the min timestamp in the c2 tombstone
         // sstable is older than the c1 tombstone, it is invalid to throw out the c1 tombstone.
-        ColumnFamily cf = cfs.getColumnFamily(QueryFilter.getIdentityFilter(key3, cfName, System.currentTimeMillis()));
-        assertFalse(cf.getColumn(ByteBufferUtil.bytes("c2")).isLive(System.currentTimeMillis()));
-        assertEquals(2, cf.getColumnCount());
+        ImmutableBTreePartition partition = Util.getOnlyPartitionUnfiltered(Util.cmd(cfs, key3).build());
+        assertEquals(2, partition.rowCount());
+        for (Row row : partition)
+            assertFalse(row.hasLiveData(FBUtilities.nowInSeconds(), enforceStrictLiveness));
     }
 
     @Test
-    public void testCompactionPurgeOneFile() throws IOException, ExecutionException, InterruptedException
+    public void testCompactionPurgeOneFile() throws ExecutionException, InterruptedException
     {
         CompactionManager.instance.disableAutoCompaction();
 
@@ -201,119 +426,173 @@ public class CompactionsPurgeTest extends SchemaLoader
         String cfName = "Standard2";
         ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(cfName);
 
-        DecoratedKey key = Util.dk("key1");
-        RowMutation rm;
+        String key = "key1";
 
         // inserts
-        rm = new RowMutation(KEYSPACE1, key.key);
         for (int i = 0; i < 5; i++)
         {
-            rm.add(cfName, ByteBufferUtil.bytes(String.valueOf(i)), ByteBufferUtil.EMPTY_BYTE_BUFFER, 0);
+            RowUpdateBuilder builder = new RowUpdateBuilder(cfs.metadata(), 0, key);
+            builder.clustering(String.valueOf(i))
+                   .add("val", ByteBufferUtil.EMPTY_BYTE_BUFFER)
+                   .build().applyUnsafe();
         }
-        rm.apply();
 
         // deletes
         for (int i = 0; i < 5; i++)
         {
-            rm = new RowMutation(KEYSPACE1, key.key);
-            rm.delete(cfName, ByteBufferUtil.bytes(String.valueOf(i)), 1);
-            rm.apply();
+            RowUpdateBuilder.deleteRow(cfs.metadata(), 1, key, String.valueOf(i)).applyUnsafe();
         }
-        cfs.forceBlockingFlush();
-        assert cfs.getSSTables().size() == 1 : cfs.getSSTables(); // inserts & deletes were in the same memtable -> only deletes in sstable
+        Util.flush(cfs);
+        assertEquals(String.valueOf(cfs.getLiveSSTables()), 1, cfs.getLiveSSTables().size()); // inserts & deletes were in the same memtable -> only deletes in sstable
 
         // compact and test that the row is completely gone
-        Util.compactAll(cfs).get();
-        assert cfs.getSSTables().isEmpty();
-        ColumnFamily cf = keyspace.getColumnFamilyStore(cfName).getColumnFamily(QueryFilter.getIdentityFilter(key, cfName, System.currentTimeMillis()));
-        assert cf == null : cf;
+        Util.compactAll(cfs, Integer.MAX_VALUE).get();
+        assertTrue(cfs.getLiveSSTables().isEmpty());
+
+        Util.assertEmpty(Util.cmd(cfs, key).build());
     }
 
+
     @Test
-    public void testCompactionPurgeCachedRow() throws IOException, ExecutionException, InterruptedException
+    public void testCompactionPurgeCachedRow() throws ExecutionException, InterruptedException
     {
         CompactionManager.instance.disableAutoCompaction();
 
-        String keyspaceName = "RowCacheSpace";
-        String cfName = "CachedCF";
+        String keyspaceName = KEYSPACE_CACHED;
+        String cfName = CF_CACHED;
         Keyspace keyspace = Keyspace.open(keyspaceName);
         ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(cfName);
 
-        DecoratedKey key = Util.dk("key3");
-        RowMutation rm;
+        String key = "key3";
 
         // inserts
-        rm = new RowMutation(keyspaceName, key.key);
         for (int i = 0; i < 10; i++)
         {
-            rm.add(cfName, ByteBufferUtil.bytes(String.valueOf(i)), ByteBufferUtil.EMPTY_BYTE_BUFFER, 0);
+            RowUpdateBuilder builder = new RowUpdateBuilder(cfs.metadata(), 0, key);
+            builder.clustering(String.valueOf(i))
+                   .add("val", ByteBufferUtil.EMPTY_BYTE_BUFFER)
+                   .build().applyUnsafe();
         }
-        rm.apply();
 
-        // move the key up in row cache
-        cfs.getColumnFamily(QueryFilter.getIdentityFilter(key, cfName, System.currentTimeMillis()));
+        // deletes partition
+        Mutation.PartitionUpdateCollector rm = new Mutation.PartitionUpdateCollector(KEYSPACE_CACHED, dk(key));
+        rm.add(PartitionUpdate.fullPartitionDelete(cfs.metadata(), dk(key), 1, FBUtilities.nowInSeconds()));
+        rm.build().applyUnsafe();
 
-        // deletes row
-        rm = new RowMutation(keyspaceName, key.key);
-        rm.delete(cfName, 1);
-        rm.apply();
+        // Adds another unrelated partition so that the sstable is not considered fully expired. We do not
+        // invalidate the row cache in that latter case.
+        new RowUpdateBuilder(cfs.metadata(), 0, "key4").clustering("c").add("val", ByteBufferUtil.EMPTY_BYTE_BUFFER).build().applyUnsafe();
+
+        // move the key up in row cache (it should not be empty since we have the partition deletion info)
+        assertFalse(Util.getOnlyPartitionUnfiltered(Util.cmd(cfs, key).build()).isEmpty());
 
         // flush and major compact
-        cfs.forceBlockingFlush();
-        Util.compactAll(cfs).get();
+        Util.flush(cfs);
+        Util.compactAll(cfs, Integer.MAX_VALUE).get();
 
-        // re-inserts with timestamp lower than delete
-        rm = new RowMutation(keyspaceName, key.key);
-        for (int i = 0; i < 10; i++)
-        {
-            rm.add(cfName, ByteBufferUtil.bytes(String.valueOf(i)), ByteBufferUtil.EMPTY_BYTE_BUFFER, 0);
-        }
-        rm.apply();
-
-        // Check that the second insert did went in
-        ColumnFamily cf = cfs.getColumnFamily(QueryFilter.getIdentityFilter(key, cfName, System.currentTimeMillis()));
-        assertEquals(10, cf.getColumnCount());
-        for (Column c : cf)
-            assert !c.isMarkedForDelete(System.currentTimeMillis());
+        // Since we've force purging (by passing MAX_VALUE for gc_before), the row should have been invalidated and we should have no deletion info anymore
+        Util.assertEmpty(Util.cmd(cfs, key).build());
     }
 
     @Test
-    public void testCompactionPurgeTombstonedRow() throws IOException, ExecutionException, InterruptedException
+    public void testCompactionPurgeTombstonedRow() throws ExecutionException, InterruptedException
     {
         CompactionManager.instance.disableAutoCompaction();
 
-        String keyspaceName = "Keyspace1";
+        String keyspaceName = KEYSPACE1;
         String cfName = "Standard1";
         Keyspace keyspace = Keyspace.open(keyspaceName);
         ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(cfName);
-        DecoratedKey key = Util.dk("key3");
-        RowMutation rm;
+        String key = "key3";
 
         // inserts
-        rm = new RowMutation(keyspaceName, key.key);
         for (int i = 0; i < 10; i++)
-            rm.add(cfName, ByteBufferUtil.bytes(String.valueOf(i)), ByteBufferUtil.EMPTY_BYTE_BUFFER, i);
-        rm.apply();
+        {
+            RowUpdateBuilder builder = new RowUpdateBuilder(cfs.metadata(), i, key);
+            builder.clustering(String.valueOf(i))
+                   .add("val", ByteBufferUtil.EMPTY_BYTE_BUFFER)
+                   .build().applyUnsafe();
+        }
 
-        // deletes row with timestamp such that not all columns are deleted
-        rm = new RowMutation(keyspaceName, key.key);
-        rm.delete(cfName, 4);
-        rm.apply();
+        // deletes partition with timestamp such that not all columns are deleted
+        Mutation.PartitionUpdateCollector rm = new Mutation.PartitionUpdateCollector(KEYSPACE1, dk(key));
+        rm.add(PartitionUpdate.fullPartitionDelete(cfs.metadata(), dk(key), 4, FBUtilities.nowInSeconds()));
+        rm.build().applyUnsafe();
+
+        ImmutableBTreePartition partition = Util.getOnlyPartitionUnfiltered(Util.cmd(cfs, key).build());
+        assertFalse(partition.partitionLevelDeletion().isLive());
 
         // flush and major compact (with tombstone purging)
-        cfs.forceBlockingFlush();
-        Util.compactAll(cfs).get();
+        Util.flush(cfs);
+        Util.compactAll(cfs, Integer.MAX_VALUE).get();
+        assertFalse(Util.getOnlyPartitionUnfiltered(Util.cmd(cfs, key).build()).isEmpty());
 
         // re-inserts with timestamp lower than delete
-        rm = new RowMutation(keyspaceName, key.key);
         for (int i = 0; i < 5; i++)
-            rm.add(cfName, ByteBufferUtil.bytes(String.valueOf(i)), ByteBufferUtil.EMPTY_BYTE_BUFFER, i);
-        rm.apply();
+        {
+            RowUpdateBuilder builder = new RowUpdateBuilder(cfs.metadata(), i, key);
+            builder.clustering(String.valueOf(i))
+                   .add("val", ByteBufferUtil.EMPTY_BYTE_BUFFER)
+                   .build().applyUnsafe();
+        }
 
         // Check that the second insert went in
-        ColumnFamily cf = cfs.getColumnFamily(QueryFilter.getIdentityFilter(key, cfName, System.currentTimeMillis()));
-        assertEquals(10, cf.getColumnCount());
-        for (Column c : cf)
-            assert !c.isMarkedForDelete(System.currentTimeMillis());
+        partition = Util.getOnlyPartitionUnfiltered(Util.cmd(cfs, key).build());
+        assertEquals(10, partition.rowCount());
+    }
+
+
+    @Test
+    public void testRowTombstoneObservedBeforePurging()
+    {
+        String keyspace = "cql_keyspace";
+        String table = "table1";
+        ColumnFamilyStore cfs = Keyspace.open(keyspace).getColumnFamilyStore(table);
+        cfs.disableAutoCompaction();
+
+        // write a row out to one sstable
+        QueryProcessor.executeInternal(String.format("INSERT INTO %s.%s (k, v1, v2) VALUES (%d, '%s', %d)",
+                                                     keyspace, table, 1, "foo", 1));
+        Util.flush(cfs);
+
+        UntypedResultSet result = QueryProcessor.executeInternal(String.format("SELECT * FROM %s.%s WHERE k = %d", keyspace, table, 1));
+        assertEquals(1, result.size());
+
+        // write a row tombstone out to a second sstable
+        QueryProcessor.executeInternal(String.format("DELETE FROM %s.%s WHERE k = %d", keyspace, table, 1));
+        Util.flush(cfs);
+
+        // basic check that the row is considered deleted
+        assertEquals(2, cfs.getLiveSSTables().size());
+        result = QueryProcessor.executeInternal(String.format("SELECT * FROM %s.%s WHERE k = %d", keyspace, table, 1));
+        assertEquals(0, result.size());
+
+        // compact the two sstables with a gcBefore that does *not* allow the row tombstone to be purged
+        FBUtilities.waitOnFutures(CompactionManager.instance.submitMaximal(cfs, (int) (System.currentTimeMillis() / 1000) - 10000, false, 0));
+
+        // the data should be gone, but the tombstone should still exist
+        assertEquals(1, cfs.getLiveSSTables().size());
+        result = QueryProcessor.executeInternal(String.format("SELECT * FROM %s.%s WHERE k = %d", keyspace, table, 1));
+        assertEquals(0, result.size());
+
+        // write a row out to one sstable
+        QueryProcessor.executeInternal(String.format("INSERT INTO %s.%s (k, v1, v2) VALUES (%d, '%s', %d)",
+                                                     keyspace, table, 1, "foo", 1));
+        Util.flush(cfs);
+        assertEquals(2, cfs.getLiveSSTables().size());
+        result = QueryProcessor.executeInternal(String.format("SELECT * FROM %s.%s WHERE k = %d", keyspace, table, 1));
+        assertEquals(1, result.size());
+
+        // write a row tombstone out to a different sstable
+        QueryProcessor.executeInternal(String.format("DELETE FROM %s.%s WHERE k = %d", keyspace, table, 1));
+        Util.flush(cfs);
+
+        // compact the two sstables with a gcBefore that *does* allow the row tombstone to be purged
+        FBUtilities.waitOnFutures(CompactionManager.instance.submitMaximal(cfs, (int) (System.currentTimeMillis() / 1000) + 10000, false, 0));
+
+        // both the data and the tombstone should be gone this time
+        assertEquals(0, cfs.getLiveSSTables().size());
+        result = QueryProcessor.executeInternal(String.format("SELECT * FROM %s.%s WHERE k = %d", keyspace, table, 1));
+        assertEquals(0, result.size());
     }
 }

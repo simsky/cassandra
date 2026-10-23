@@ -31,22 +31,35 @@ import java.util.Map;
 
 import com.google.common.base.Splitter;
 
-import org.apache.cassandra.auth.IAuthenticator;
+import org.apache.cassandra.auth.PasswordAuthenticator;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.config.EncryptionOptions;
 import org.apache.cassandra.cql3.QueryOptions;
 import org.apache.cassandra.db.ConsistencyLevel;
 import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.db.marshal.UTF8Type;
-import org.apache.cassandra.transport.messages.*;
+import org.apache.cassandra.transport.messages.AuthResponse;
+import org.apache.cassandra.transport.messages.ExecuteMessage;
+import org.apache.cassandra.transport.messages.OptionsMessage;
+import org.apache.cassandra.transport.messages.PrepareMessage;
+import org.apache.cassandra.transport.messages.QueryMessage;
+import org.apache.cassandra.transport.messages.RegisterMessage;
+import org.apache.cassandra.transport.messages.StartupMessage;
 import org.apache.cassandra.utils.Hex;
+import org.apache.cassandra.utils.JVMStabilityInspector;
 import org.apache.cassandra.utils.MD5Digest;
 
-import static org.apache.cassandra.config.EncryptionOptions.ClientEncryptionOptions;
+import static org.apache.cassandra.utils.LocalizeString.toLowerCaseLocalized;
+import static org.apache.cassandra.utils.LocalizeString.toUpperCaseLocalized;
 
 public class Client extends SimpleClient
 {
-    public Client(String host, int port, ClientEncryptionOptions encryptionOptions)
+    private final SimpleEventHandler eventHandler = new SimpleEventHandler();
+
+    public Client(String host, int port, ProtocolVersion version, EncryptionOptions.ClientEncryptionOptions encryptionOptions)
     {
-        super(host, port, encryptionOptions);
+        super(host, port, version, version.isBeta(), encryptionOptions.applyConfig());
+        setEventHandler(eventHandler);
     }
 
     public void run() throws IOException
@@ -60,10 +73,17 @@ public class Client extends SimpleClient
         BufferedReader in = new BufferedReader(new InputStreamReader(System.in));
         for (;;)
         {
+            Event event;
+            while ((event = eventHandler.queue.poll()) != null)
+            {
+                System.out.println("<< " + event);
+            }
+
             System.out.print(">> ");
             System.out.flush();
             String line = in.readLine();
-            if (line == null) {
+            if (line == null)
+            {
                 break;
             }
             Message.Request req = parseLine(line.trim());
@@ -80,6 +100,7 @@ public class Client extends SimpleClient
             }
             catch (Exception e)
             {
+                JVMStabilityInspector.inspectThrowable(e);
                 System.err.println("ERROR: " + e.getMessage());
             }
         }
@@ -93,7 +114,7 @@ public class Client extends SimpleClient
         Iterator<String> iter = splitter.split(line).iterator();
         if (!iter.hasNext())
             return null;
-        String msgType = iter.next().toUpperCase();
+        String msgType = toUpperCaseLocalized(iter.next());
         if (msgType.equals("STARTUP"))
         {
             Map<String, String> options = new HashMap<String, String>();
@@ -101,10 +122,20 @@ public class Client extends SimpleClient
             while (iter.hasNext())
             {
                String next = iter.next();
-               if (next.toLowerCase().equals("snappy"))
+               if (toLowerCaseLocalized(next).equals("snappy"))
                {
                    options.put(StartupMessage.COMPRESSION, "snappy");
-                   connection.setCompressor(FrameCompressor.SnappyCompressor.instance);
+                   connection.setCompressor(Compressor.SnappyCompressor.instance);
+               }
+               if (toLowerCaseLocalized(next).equals("lz4"))
+               {
+                   options.put(StartupMessage.COMPRESSION, "lz4");
+                   connection.setCompressor(Compressor.LZ4Compressor.instance);
+               }
+               if (toLowerCaseLocalized(next).equals("throw_on_overload"))
+               {
+                   options.put(StartupMessage.THROW_ON_OVERLOAD, "1");
+                   connection.setThrowOnOverload(true);
                }
             }
             return new StartupMessage(options);
@@ -128,18 +159,20 @@ public class Client extends SimpleClient
                     return null;
                 }
             }
-            return new QueryMessage(query, new QueryOptions(ConsistencyLevel.ONE, Collections.<ByteBuffer>emptyList(), false, pageSize, null, null));
+            return new QueryMessage(query, QueryOptions.create(ConsistencyLevel.ONE, Collections.<ByteBuffer>emptyList(), false, pageSize, null, null, version, null));
         }
         else if (msgType.equals("PREPARE"))
         {
             String query = line.substring(8);
-            return new PrepareMessage(query);
+            return new PrepareMessage(query, null);
         }
         else if (msgType.equals("EXECUTE"))
         {
             try
             {
-                byte[] id = Hex.hexToBytes(iter.next());
+                byte[] preparedStatementId = Hex.hexToBytes(iter.next());
+                byte[] resultMetadataId = Hex.hexToBytes(iter.next());
+
                 List<ByteBuffer> values = new ArrayList<ByteBuffer>();
                 while(iter.hasNext())
                 {
@@ -156,7 +189,7 @@ public class Client extends SimpleClient
                     }
                     values.add(bb);
                 }
-                return new ExecuteMessage(MD5Digest.wrap(id), new QueryOptions(ConsistencyLevel.ONE, values));
+                return new ExecuteMessage(MD5Digest.wrap(preparedStatementId), MD5Digest.wrap(resultMetadataId), QueryOptions.forInternalCalls(ConsistencyLevel.ONE, values));
             }
             catch (Exception e)
             {
@@ -167,17 +200,10 @@ public class Client extends SimpleClient
         {
             return new OptionsMessage();
         }
-        else if (msgType.equals("CREDENTIALS"))
-        {
-            System.err.println("[WARN] CREDENTIALS command is deprecated, use AUTHENTICATE instead");
-            CredentialsMessage msg = new CredentialsMessage();
-            msg.credentials.putAll(readCredentials(iter));
-            return msg;
-        }
         else if (msgType.equals("AUTHENTICATE"))
         {
             Map<String, String> credentials = readCredentials(iter);
-            if(!credentials.containsKey(IAuthenticator.USERNAME_KEY) || !credentials.containsKey(IAuthenticator.PASSWORD_KEY))
+            if(!credentials.containsKey(PasswordAuthenticator.USERNAME_KEY) || !credentials.containsKey(PasswordAuthenticator.PASSWORD_KEY))
             {
                 System.err.println("[ERROR] Authentication requires both 'username' and 'password'");
                 return null;
@@ -186,7 +212,7 @@ public class Client extends SimpleClient
         }
         else if (msgType.equals("REGISTER"))
         {
-            String type = line.substring(9).toUpperCase();
+            String type = toUpperCaseLocalized(line.substring(9));
             try
             {
                 return new RegisterMessage(Collections.singletonList(Enum.valueOf(Event.Type.class, type)));
@@ -219,8 +245,8 @@ public class Client extends SimpleClient
 
     private byte[] encodeCredentialsForSasl(Map<String, String> credentials)
     {
-        byte[] username = credentials.get(IAuthenticator.USERNAME_KEY).getBytes(StandardCharsets.UTF_8);
-        byte[] password = credentials.get(IAuthenticator.PASSWORD_KEY).getBytes(StandardCharsets.UTF_8);
+        byte[] username = credentials.get(PasswordAuthenticator.USERNAME_KEY).getBytes(StandardCharsets.UTF_8);
+        byte[] password = credentials.get(PasswordAuthenticator.PASSWORD_KEY).getBytes(StandardCharsets.UTF_8);
         byte[] initialResponse = new byte[username.length + password.length + 2];
         initialResponse[0] = 0;
         System.arraycopy(username, 0, initialResponse, 1, username.length);
@@ -231,21 +257,27 @@ public class Client extends SimpleClient
 
     public static void main(String[] args) throws Exception
     {
+        DatabaseDescriptor.clientInitialization();
+
         // Print usage if no argument is specified.
-        if (args.length != 2)
+        if (args.length < 2 || args.length > 3)
         {
-            System.err.println("Usage: " + Client.class.getSimpleName() + " <host> <port>");
+            System.err.println("Usage: " + Client.class.getSimpleName() + " <host> <port> [<version>]");
             return;
         }
 
         // Parse options.
         String host = args[0];
         int port = Integer.parseInt(args[1]);
+        ProtocolVersion version = args.length == 3 ? ProtocolVersion.decode(Integer.parseInt(args[2]), DatabaseDescriptor.getNativeTransportAllowOlderProtocols()) : ProtocolVersion.CURRENT;
 
-        ClientEncryptionOptions encryptionOptions = new ClientEncryptionOptions();
-        System.out.println("CQL binary protocol console " + host + "@" + port);
+        EncryptionOptions.ClientEncryptionOptions encryptionOptions = new EncryptionOptions.ClientEncryptionOptions().applyConfig();
+        System.out.println("CQL binary protocol console " + host + "@" + port + " using native protocol version " + version);
 
-        new Client(host, port, encryptionOptions).run();
+        try (Client client = new Client(host, port, version, encryptionOptions))
+        {
+            client.run();
+        }
         System.exit(0);
     }
 }

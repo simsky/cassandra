@@ -17,19 +17,19 @@
  */
 package org.apache.cassandra.utils;
 
-import java.io.File;
 import java.util.concurrent.TimeUnit;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.concurrent.ScheduledExecutors;
+import org.apache.cassandra.io.util.File;
 
 public class ResourceWatcher
 {
     public static void watch(String resource, Runnable callback, int period)
     {
-        StorageService.scheduledTasks.scheduleWithFixedDelay(new WatchedResource(resource, callback), period, period, TimeUnit.MILLISECONDS);
+        ScheduledExecutors.scheduledTasks.scheduleWithFixedDelay(new WatchedResource(resource, callback), period, period, TimeUnit.MILLISECONDS);
     }
 
     public static class WatchedResource implements Runnable
@@ -60,6 +60,7 @@ public class ResourceWatcher
             }
             catch (Throwable t)
             {
+                JVMStabilityInspector.inspectThrowable(t);
                 logger.error(String.format("Timed run of %s failed.", callback.getClass()), t);
             }
         }

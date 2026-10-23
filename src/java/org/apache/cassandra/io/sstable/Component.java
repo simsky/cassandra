@@ -17,12 +17,18 @@
  */
 package org.apache.cassandra.io.sstable;
 
-import java.io.File;
-import java.util.EnumSet;
+import java.util.Collections;
+import java.util.List;
+import java.util.Objects;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.regex.Pattern;
 
-import com.google.common.base.Objects;
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Preconditions;
+import com.google.common.collect.Iterables;
 
-import org.apache.cassandra.utils.Pair;
+import org.apache.cassandra.io.sstable.format.SSTableFormat;
+import org.apache.cassandra.io.sstable.format.SSTableFormat.Components.Types;
 
 /**
  * SSTables are made up of multiple components in separate files. Components are
@@ -33,73 +39,153 @@ public class Component
 {
     public static final char separator = '-';
 
-    final static EnumSet<Type> TYPES = EnumSet.allOf(Type.class);
-    public enum Type
+    /**
+     * WARNING: Be careful while changing the names or string representation of the enum
+     * members. Streaming code depends on the names during streaming (Ref: CASSANDRA-14556).
+     */
+    public final static class Type
     {
-        // the base data for an sstable: the remaining components can be regenerated
-        // based on the data component
-        DATA("Data.db"),
-        // index of the row keys with pointers to their positions in the data file
-        PRIMARY_INDEX("Index.db"),
-        // serialized bloom filter for the row keys in the sstable
-        FILTER("Filter.db"),
-        // file to hold information about uncompressed data length, chunk offsets etc.
-        COMPRESSION_INFO("CompressionInfo.db"),
-        // statistical metadata about the content of the sstable
-        STATS("Statistics.db"),
-        // holds sha1 sum of the data file (to be checked by sha1sum)
-        DIGEST("Digest.sha1"),
-        // holds the CRC32 for chunks in an a uncompressed file.
-        CRC("CRC.db"),
-        // holds SSTable Index Summary and Boundaries
-        SUMMARY("Summary.db"),
-        // table of contents, stores the list of all components for the sstable
-        TOC("TOC.txt"),
-        // custom component, used by e.g. custom compaction strategy
-        CUSTOM(null);
+        private final static CopyOnWriteArrayList<Type> typesCollector = new CopyOnWriteArrayList<>();
 
-        final String repr;
-        Type(String repr)
+        public static final List<Type> all = Collections.unmodifiableList(typesCollector);
+
+        public final int id;
+        public final String name;
+        public final String repr;
+        public final boolean streamable;
+        private final Component singleton;
+
+        @SuppressWarnings("rawtypes")
+        public final Class<? extends SSTableFormat> formatClass;
+
+        /**
+         * Creates a new non-singleton type and registers it a global type registry - see {@link #registerType(Type)}.
+         *
+         * @param name         type name, must be unique for this and all parent formats
+         * @param repr         the regular expression to be used to recognize a name represents this type
+         * @param streamable   whether components of this type should be streamed to other nodes
+         * @param formatClass  format class for which this type is defined for
+         */
+        public static Type create(String name, String repr, boolean streamable, Class<? extends SSTableFormat<?, ?>> formatClass)
         {
-            this.repr = repr;
+            return new Type(name, repr, false, streamable, formatClass);
         }
 
-        static Type fromRepresentation(String repr)
+        /**
+         * Creates a new singleton type and registers it in a global type registry - see {@link #registerType(Type)}.
+         *
+         * @param name         type name, must be unique for this and all parent formats
+         * @param repr         the regular expression to be used to recognize a name represents this type
+         * @param streamable   whether components of this type should be streamed to other nodes
+         * @param formatClass  format class for which this type is defined for
+         */
+        public static Type createSingleton(String name, String repr, boolean streamable, Class<? extends SSTableFormat<?, ?>> formatClass)
         {
-            for (Type type : TYPES)
-                if (repr.equals(type.repr))
+            return new Type(name, repr, true, streamable, formatClass);
+        }
+
+        private Type(String name, String repr, boolean isSingleton, boolean streamable, Class<? extends SSTableFormat<?, ?>> formatClass)
+        {
+            this.name = Objects.requireNonNull(name);
+            this.repr = repr;
+            this.streamable = streamable;
+            this.id = typesCollector.size();
+            this.formatClass = formatClass == null ? SSTableFormat.class : formatClass;
+            this.singleton = isSingleton ? new Component(this) : null;
+
+            registerType(this);
+        }
+
+        /**
+         * If you have two formats registered, they may both define a type say `INDEX`. It is allowed even though
+         * they have the same name because they are not in the same branch. Though, we cannot let a custom type
+         * define a type `TOC` which is declared on the top level.
+         * So, e.g. given we have `TOC@SSTableFormat`, and `BigFormat` tries to define `TOC@BigFormat`, we should
+         * forbid that; but, given we have `INDEX@BigFormat`, we should allow to define `INDEX@TrieFormat` as those
+         * types are be distinguishable via format type.
+         *
+         * @param type a type to be registered
+         */
+        private static void registerType(Type type)
+        {
+            synchronized (typesCollector)
+            {
+                if (typesCollector.stream().anyMatch(t -> (Objects.equals(t.name, type.name) || Objects.equals(t.repr, type.repr)) && (t.formatClass.isAssignableFrom(type.formatClass))))
+                    throw new AssertionError("Type named " + type.name + " is already registered");
+
+                typesCollector.add(type);
+            }
+        }
+
+        @VisibleForTesting
+        public static Type fromRepresentation(String repr, SSTableFormat<?, ?> format)
+        {
+            for (Type type : Type.all)
+            {
+                if (type.repr != null && Pattern.matches(type.repr, repr) && type.formatClass.isAssignableFrom(format.getClass()))
                     return type;
-            return CUSTOM;
+            }
+            return Types.CUSTOM;
+        }
+
+        public static Component createComponent(String repr, SSTableFormat<?, ?> format)
+        {
+            Type type = fromRepresentation(repr, format);
+            if (type.singleton != null)
+                return type.singleton;
+            else
+                return new Component(type, repr);
+        }
+
+        @Override
+        public boolean equals(Object o)
+        {
+            if (this == o) return true;
+            if (o == null || getClass() != o.getClass()) return false;
+            Type type = (Type) o;
+            return id == type.id;
+        }
+
+        @Override
+        public int hashCode()
+        {
+            return id;
+        }
+
+        @Override
+        public String toString()
+        {
+            return name;
+        }
+
+        public Component getSingleton()
+        {
+            return Objects.requireNonNull(singleton);
+        }
+
+        public Component createComponent(String repr)
+        {
+            Preconditions.checkArgument(singleton == null);
+            return new Component(this, repr);
         }
     }
-
-    // singleton components for types that don't need ids
-    public final static Component DATA = new Component(Type.DATA);
-    public final static Component PRIMARY_INDEX = new Component(Type.PRIMARY_INDEX);
-    public final static Component FILTER = new Component(Type.FILTER);
-    public final static Component COMPRESSION_INFO = new Component(Type.COMPRESSION_INFO);
-    public final static Component STATS = new Component(Type.STATS);
-    public final static Component DIGEST = new Component(Type.DIGEST);
-    public final static Component CRC = new Component(Type.CRC);
-    public final static Component SUMMARY = new Component(Type.SUMMARY);
-    public final static Component TOC = new Component(Type.TOC);
 
     public final Type type;
     public final String name;
     public final int hashCode;
 
-    public Component(Type type)
+    private Component(Type type)
     {
         this(type, type.repr);
-        assert type != Type.CUSTOM;
     }
 
-    public Component(Type type, String name)
+    private Component(Type type, String name)
     {
         assert name != null : "Component name cannot be null";
+
         this.type = type;
         this.name = name;
-        this.hashCode = Objects.hashCode(type, name);
+        this.hashCode = Objects.hash(type, name);
     }
 
     /**
@@ -111,35 +197,30 @@ public class Component
     }
 
     /**
-     * Filename of the form "<ksname>/<cfname>-[tmp-][<version>-]<gen>-<component>",
-     * @return A Descriptor for the SSTable, and a Component for this particular file.
-     * TODO move descriptor into Component field
+     * Parse the component part of a sstable filename into a {@code Component} object.
+     *
+     * @param name a string representing a sstable component.
+     * @return the component corresponding to {@code name}. Note that this always return a component as an unrecognized
+     * name is parsed into a CUSTOM component.
      */
-    public static Pair<Descriptor,Component> fromFilename(File directory, String name)
+    public static Component parse(String name, SSTableFormat<?, ?> format)
     {
-        Pair<Descriptor,String> path = Descriptor.fromFilename(directory, name);
+        return Type.createComponent(name, format);
+    }
 
-        // parse the component suffix
-        Type type = Type.fromRepresentation(path.right);
-        // build (or retrieve singleton for) the component object
-        Component component;
-        switch(type)
-        {
-            case DATA:              component = Component.DATA;                         break;
-            case PRIMARY_INDEX:     component = Component.PRIMARY_INDEX;                break;
-            case FILTER:            component = Component.FILTER;                       break;
-            case COMPRESSION_INFO:  component = Component.COMPRESSION_INFO;             break;
-            case STATS:             component = Component.STATS;                        break;
-            case DIGEST:            component = Component.DIGEST;                       break;
-            case CRC:               component = Component.CRC;                          break;
-            case SUMMARY:           component = Component.SUMMARY;                      break;
-            case TOC:               component = Component.TOC;                          break;
-            case CUSTOM:            component = new Component(Type.CUSTOM, path.right); break;
-            default:
-                 throw new IllegalStateException();
-        }
+    public static Iterable<Component> getSingletonsFor(SSTableFormat<?, ?> format)
+    {
+        return Iterables.transform(Iterables.filter(Type.all, t -> t.singleton != null && t.formatClass.isAssignableFrom(format.getClass())), t -> t.singleton);
+    }
 
-        return Pair.create(path.left, component);
+    public static Iterable<Component> getSingletonsFor(Class<? extends SSTableFormat<?, ?>> formatClass)
+    {
+        return Iterables.transform(Iterables.filter(Type.all, t -> t.singleton != null && t.formatClass.isAssignableFrom(formatClass)), t -> t.singleton);
+    }
+
+    public boolean isValidFor(Descriptor descriptor)
+    {
+        return type.formatClass.isAssignableFrom(descriptor.version.format.getClass());
     }
 
     @Override
@@ -155,8 +236,8 @@ public class Component
             return true;
         if (!(o instanceof Component))
             return false;
-        Component that = (Component)o;
-        return this.type == that.type && this.name.equals(that.name);
+        Component that = (Component) o;
+        return this.hashCode == that.hashCode && this.type == that.type && this.name.equals(that.name);
     }
 
     @Override

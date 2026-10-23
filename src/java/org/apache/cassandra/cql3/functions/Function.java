@@ -19,27 +19,71 @@ package org.apache.cassandra.cql3.functions;
 
 import java.nio.ByteBuffer;
 import java.util.List;
+import java.util.Optional;
 
+import org.github.jamm.Unmetered;
+
+import org.apache.cassandra.cql3.AssignmentTestable;
+import org.apache.cassandra.cql3.FunctionContext;
 import org.apache.cassandra.db.marshal.AbstractType;
-import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.schema.Difference;
 
-public interface Function
+@Unmetered
+public interface Function extends AssignmentTestable
 {
-    public String name();
-    public List<AbstractType<?>> argsType();
+    /**
+     * A marker buffer used to represent function parameters that cannot be resolved at some stage of CQL processing.
+     * This is used for partial function application in particular.
+     */
+    public static final ByteBuffer UNRESOLVED = ByteBuffer.allocate(0);
+
+    public FunctionName name();
+    public List<AbstractType<?>> argTypes();
     public AbstractType<?> returnType();
 
-    public ByteBuffer execute(List<ByteBuffer> parameters) throws InvalidRequestException;
+    /**
+     * Checks whether the function is a native/hard coded one or not.
+     *
+     * @return {@code true} if the function is a native/hard coded one, {@code false} otherwise.
+     */
+    public boolean isNative();
 
-    // Whether the function is a pure function (as in doesn't depend on, nor produce side effects).
+    /**
+     * Checks whether the function is a pure function (as in doesn't depend on, nor produces side effects) or not.
+     *
+     * @return {@code true} if the function is a pure function, {@code false} otherwise.
+     */
     public boolean isPure();
 
-    public interface Factory
+    /**
+     * Checks whether the function is an aggregate function or not.
+     *
+     * @return {@code true} if the function is an aggregate function, {@code false} otherwise.
+     */
+    public boolean isAggregate();
+
+    public void addFunctionsTo(List<Function> functions);
+
+    public boolean referencesUserType(ByteBuffer name);
+
+    /**
+     * Returns the name of the function to use within a ResultSet.
+     *
+     * @param columnNames the names of the columns used to call the function
+     * @return the name of the function to use within a ResultSet
+     */
+    public String columnName(List<String> columnNames);
+
+    /**
+     * Creates some new input arguments for this function.
+     *
+     * @param context
+     * @return some new input arguments for this function
+     */
+    Arguments newArguments(FunctionContext context);
+
+    public default Optional<Difference> compare(Function other)
     {
-        // We allow the function to be parametered by the keyspace it is part of because the
-        // "token" function needs it (the argument depends on the keyValidator). However,
-        // for most function, the factory will just always the same function object (see
-        // AbstractFunction).
-        public Function create(String ksName, String cfName);
+        throw new UnsupportedOperationException();
     }
 }

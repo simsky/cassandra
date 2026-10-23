@@ -17,42 +17,43 @@
  */
 package org.apache.cassandra.locator;
 
-
-import java.lang.management.ManagementFactory;
-import java.net.InetAddress;
 import java.net.UnknownHostException;
-import javax.management.MBeanServer;
-import javax.management.ObjectName;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.utils.MBeanWrapper;
 
+@Deprecated(since = "CEP-21")
 public class EndpointSnitchInfo implements EndpointSnitchInfoMBean
 {
     public static void create()
     {
-        MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
-        try
-        {
-            mbs.registerMBean(new EndpointSnitchInfo(), new ObjectName("org.apache.cassandra.db:type=EndpointSnitchInfo"));
-        }
-        catch (Exception e)
-        {
-            throw new RuntimeException(e);
-        }
+        MBeanWrapper.instance.registerMBean(new EndpointSnitchInfo(), "org.apache.cassandra.db:type=EndpointSnitchInfo");
     }
 
     public String getDatacenter(String host) throws UnknownHostException
     {
-        return DatabaseDescriptor.getEndpointSnitch().getDatacenter(InetAddress.getByName(host));
+        return DatabaseDescriptor.getLocator().location(InetAddressAndPort.getByName(host)).datacenter;
     }
 
     public String getRack(String host) throws UnknownHostException
     {
-        return DatabaseDescriptor.getEndpointSnitch().getRack(InetAddress.getByName(host));
+        return DatabaseDescriptor.getLocator().location(InetAddressAndPort.getByName(host)).rack;
+    }
+
+    public String getDatacenter()
+    {
+        return DatabaseDescriptor.getLocator().local().datacenter;
+    }
+
+    public String getRack()
+    {
+        return DatabaseDescriptor.getLocator().local().rack;
     }
 
     public String getSnitchName()
     {
-        return DatabaseDescriptor.getEndpointSnitch().getClass().getName();
+        NodeProximity proximity = DatabaseDescriptor.getNodeProximity();
+        Class<?> clazz = proximity instanceof SnitchAdapter ? ((SnitchAdapter)proximity).snitch.getClass() : proximity.getClass();
+        return clazz.getName();
     }
 }

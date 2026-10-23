@@ -1,6 +1,6 @@
 package org.apache.cassandra.triggers;
 /*
- * 
+ *
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -8,44 +8,46 @@ package org.apache.cassandra.triggers;
  * to you under the Apache License, Version 2.0 (the
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
- * 
+ *
  *   http://www.apache.org/licenses/LICENSE-2.0
- * 
+ *
  * Unless required by applicable law or agreed to in writing,
  * software distributed under the License is distributed on an
  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
  * KIND, either express or implied.  See the License for the
  * specific language governing permissions and limitations
  * under the License.
- * 
+ *
  */
 
-
-import java.io.File;
-import java.io.FilenameFilter;
-import java.io.IOError;
 import java.io.IOException;
 import java.net.URL;
 import java.net.URLClassLoader;
+import java.nio.file.StandardCopyOption;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.BiPredicate;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import com.google.common.io.Files;
+import org.apache.cassandra.io.FSWriteError;
+import org.apache.cassandra.io.util.File;
+import org.apache.cassandra.io.util.FileUtils;
+
+import static java.nio.file.Files.copy;
 
 /**
  * Custom class loader will load the classes from the class path, CCL will load
- * the classes from the the URL first, if it cannot find the required class it
- * will let the parent class loader do the its job.
+ * the classes from the URL first, if it cannot find the required class it
+ * will let the parent class loader do its job.
  *
  * Note: If the CCL is GC'ed then the associated classes will be unloaded.
  */
 public class CustomClassLoader extends URLClassLoader
 {
     private static final Logger logger = LoggerFactory.getLogger(CustomClassLoader.class);
-    private final Map<String, Class<?>> cache = new ConcurrentHashMap<String, Class<?>>();
+    private final Map<String, Class<?>> cache = new ConcurrentHashMap<>();
     private final ClassLoader parent;
 
     public CustomClassLoader(ClassLoader parent)
@@ -67,30 +69,26 @@ public class CustomClassLoader extends URLClassLoader
     {
         if (dir == null || !dir.exists())
             return;
-        FilenameFilter filter = new FilenameFilter() {
-            public boolean accept(File dir, String name) {
-                return name.endsWith(".jar");
-            }
-        };
-        for (File inputJar : dir.listFiles(filter))
+        BiPredicate<File, String> filter = (ignore, name) -> name.endsWith(".jar");
+        for (File inputJar : dir.tryList(filter))
         {
-            File lib = new File(System.getProperty("java.io.tmpdir"), "lib");
+            File lib = new File(FileUtils.getTempDir(), "lib");
             if (!lib.exists())
             {
-                lib.mkdir();
+                lib.tryCreateDirectory();
                 lib.deleteOnExit();
             }
+            File out = FileUtils.createTempFile("cassandra-", ".jar", lib);
+            out.deleteOnExit();
+            logger.info("Loading new jar {}", inputJar.absolutePath());
             try
             {
-                File out = File.createTempFile("cassandra-", ".jar", lib);
-                out.deleteOnExit();
-                logger.info("Loading new jar {}", inputJar.getAbsolutePath());
-                Files.copy(inputJar, out);
-                addURL(out.toURI().toURL());
+                copy(inputJar.toPath(), out.toPath(), StandardCopyOption.REPLACE_EXISTING);
+                addURL(out.toPath().toUri().toURL());
             }
             catch (IOException ex)
             {
-                throw new IOError(ex);
+                throw new FSWriteError(ex, out);
             }
         }
     }
@@ -112,7 +110,7 @@ public class CustomClassLoader extends URLClassLoader
         }
         catch (ClassNotFoundException ex)
         {
-            logger.debug("Class not found using parent class loader,", ex);
+            logger.trace("Class not found using parent class loader,", ex);
             // Don't throw the exception here, try triggers directory.
         }
         Class<?> clazz = this.findClass(name);

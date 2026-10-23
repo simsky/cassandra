@@ -21,7 +21,10 @@ import java.net.UnknownHostException;
 
 /**
  * MBean exposing standard Snitch info
+ *
+ * @deprecated see CASSANDRA-19488
  */
+@Deprecated(since = "CEP-21")
 public interface EndpointSnitchInfoMBean
 {
     /**
@@ -38,11 +41,19 @@ public interface EndpointSnitchInfoMBean
      */
     public String getDatacenter(String host) throws UnknownHostException;
 
+    /**
+     * Provides the Rack name depending on the respective snitch used for this node
+     */
+    public String getRack();
+
+    /**
+     * Provides the Datacenter name depending on the respective snitch used for this node
+     */
+    public String getDatacenter();
 
     /**
      * Provides the snitch name of the cluster
      * @return Snitch name
      */
     public String getSnitchName();
-
 }

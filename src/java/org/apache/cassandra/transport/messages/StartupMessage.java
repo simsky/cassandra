@@ -20,15 +20,24 @@ package org.apache.cassandra.transport.messages;
 import java.util.HashMap;
 import java.util.Map;
 
-import org.jboss.netty.buffer.ChannelBuffer;
-import org.jboss.netty.buffer.ChannelBuffers;
-
+import org.apache.cassandra.auth.IAuthenticator;
 import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.db.guardrails.Guardrails;
 import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.service.QueryState;
-import org.apache.cassandra.transport.*;
-import org.apache.cassandra.utils.SemanticVersion;
+import org.apache.cassandra.transport.CBUtil;
+import org.apache.cassandra.transport.Compressor;
+import org.apache.cassandra.transport.Dispatcher;
+import org.apache.cassandra.transport.Message;
+import org.apache.cassandra.transport.ProtocolException;
+import org.apache.cassandra.transport.ProtocolVersion;
+import org.apache.cassandra.transport.ServerConnection;
+import org.apache.cassandra.utils.CassandraVersion;
+
+import io.netty.buffer.ByteBuf;
+
+import static org.apache.cassandra.utils.LocalizeString.toLowerCaseLocalized;
+import static org.apache.cassandra.utils.LocalizeString.toUpperCaseLocalized;
 
 /**
  * The initial message of the protocol.
@@ -38,24 +47,30 @@ public class StartupMessage extends Message.Request
 {
     public static final String CQL_VERSION = "CQL_VERSION";
     public static final String COMPRESSION = "COMPRESSION";
+    public static final String PROTOCOL_VERSIONS = "PROTOCOL_VERSIONS";
+    public static final String DRIVER_NAME = "DRIVER_NAME";
+    public static final String DRIVER_VERSION = "DRIVER_VERSION";
+    public static final String THROW_ON_OVERLOAD = "THROW_ON_OVERLOAD";
 
     public static final Message.Codec<StartupMessage> codec = new Message.Codec<StartupMessage>()
     {
-        public StartupMessage decode(ChannelBuffer body, int version)
+        public StartupMessage decode(ByteBuf body, ProtocolVersion version)
         {
             return new StartupMessage(upperCaseKeys(CBUtil.readStringMap(body)));
         }
 
-        public void encode(StartupMessage msg, ChannelBuffer dest, int version)
+        public void encode(StartupMessage msg, ByteBuf dest, ProtocolVersion version)
         {
             CBUtil.writeStringMap(msg.options, dest);
         }
 
-        public int encodedSize(StartupMessage msg, int version)
+        public int encodedSize(StartupMessage msg, ProtocolVersion version)
         {
             return CBUtil.sizeOfStringMap(msg.options);
         }
     };
+
+    private static final byte[] EMPTY_CLIENT_RESPONSE = new byte[0];
 
     public final Map<String, String> options;
 
@@ -65,37 +80,39 @@ public class StartupMessage extends Message.Request
         this.options = options;
     }
 
-    public Message.Response execute(QueryState state)
+    @Override
+    protected Message.Response execute(QueryState state, Dispatcher.RequestTime requestTime, boolean traceRequest)
     {
-        ClientState cState = state.getClientState();
         String cqlVersion = options.get(CQL_VERSION);
         if (cqlVersion == null)
             throw new ProtocolException("Missing value CQL_VERSION in STARTUP message");
 
-        try 
+        try
         {
-            cState.setCQLVersion(cqlVersion);
+            if (new CassandraVersion(cqlVersion).compareTo(new CassandraVersion("2.99.0")) < 0)
+                throw new ProtocolException(String.format("CQL version %s is not supported by the binary protocol (supported version are >= 3.0.0)", cqlVersion));
         }
-        catch (InvalidRequestException e)
+        catch (IllegalArgumentException e)
         {
             throw new ProtocolException(e.getMessage());
         }
 
-        if (cState.getCQLVersion().compareTo(new SemanticVersion("2.99.0")) < 0)
-            throw new ProtocolException(String.format("CQL version %s is not supported by the binary protocol (supported version are >= 3.0.0)", cqlVersion));
-
         if (options.containsKey(COMPRESSION))
         {
-            String compression = options.get(COMPRESSION).toLowerCase();
+            String compression = toLowerCaseLocalized(options.get(COMPRESSION));
             if (compression.equals("snappy"))
             {
-                if (FrameCompressor.SnappyCompressor.instance == null)
+                if (Compressor.SnappyCompressor.instance == null)
                     throw new ProtocolException("This instance does not support Snappy compression");
-                connection.setCompressor(FrameCompressor.SnappyCompressor.instance);
+
+                if (getSource().header.version.isGreaterOrEqualTo(ProtocolVersion.V5))
+                    throw new ProtocolException("Snappy compression is not supported in protocol V5");
+
+                connection.setCompressor(Compressor.SnappyCompressor.instance);
             }
             else if (compression.equals("lz4"))
             {
-                connection.setCompressor(FrameCompressor.LZ4Compressor.instance);
+                connection.setCompressor(Compressor.LZ4Compressor.instance);
             }
             else
             {
@@ -103,8 +120,49 @@ public class StartupMessage extends Message.Request
             }
         }
 
-        if (DatabaseDescriptor.getAuthenticator().requireAuthentication())
-            return new AuthenticateMessage(DatabaseDescriptor.getAuthenticator().getClass().getName());
+        connection.setThrowOnOverload("1".equals(options.get(THROW_ON_OVERLOAD)));
+
+        ClientState clientState = state.getClientState();
+        clientState.setClientOptions(options);
+        String driverName = options.get(DRIVER_NAME);
+        String driverVersion = options.get(DRIVER_VERSION);
+        if (null != driverName)
+        {
+            clientState.setDriverName(driverName);
+            clientState.setDriverVersion(driverVersion);
+        }
+
+        Guardrails.minimumClientDriverVersion.guard(driverName, driverVersion, clientState);
+
+        IAuthenticator authenticator = DatabaseDescriptor.getAuthenticator();
+        if (authenticator.requireAuthentication())
+        {
+            // If the authenticator supports early authentication, attempt to authenticate.
+            if (authenticator.supportsEarlyAuthentication())
+            {
+                IAuthenticator.SaslNegotiator negotiator = ((ServerConnection) connection).getSaslNegotiator(state);
+                // If the negotiator determines that sending an authenticate message is not necessary, attempt to authenticate here,
+                // otherwise, send an Authenticate message to begin the traditional authentication flow.
+                if (!negotiator.shouldSendAuthenticateMessage())
+                {
+                    // Attempt to authenticate the user.
+                    return AuthUtil.handleLogin(connection, state, EMPTY_CLIENT_RESPONSE, (negotiationComplete, challenge) ->
+                    {
+                        if (negotiationComplete)
+                        {
+                            // Authentication was successful, proceed.
+                            return new ReadyMessage();
+                        } else
+                        {
+                            // It's expected that any negotiator that requires a challenge will likely not support early
+                            // authentication, in this case we can just go through the traditional auth flow.
+                            return authenticator.getAuthenticateMessage(clientState);
+                        }
+                    });
+                }
+            }
+            return authenticator.getAuthenticateMessage(clientState);
+        }
         else
             return new ReadyMessage();
     }
@@ -113,7 +171,7 @@ public class StartupMessage extends Message.Request
     {
         Map<String, String> newMap = new HashMap<String, String>(options.size());
         for (Map.Entry<String, String> entry : options.entrySet())
-            newMap.put(entry.getKey().toUpperCase(), entry.getValue());
+            newMap.put(toUpperCaseLocalized(entry.getKey()), entry.getValue());
         return newMap;
     }
 

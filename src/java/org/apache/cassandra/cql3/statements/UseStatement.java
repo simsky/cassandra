@@ -17,15 +17,25 @@
  */
 package org.apache.cassandra.cql3.statements;
 
+import org.apache.commons.lang3.builder.ToStringBuilder;
+import org.apache.commons.lang3.builder.ToStringStyle;
+
+import org.apache.cassandra.audit.AuditLogContext;
+import org.apache.cassandra.audit.AuditLogEntryType;
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.CQLStatement;
 import org.apache.cassandra.cql3.QueryOptions;
+import org.apache.cassandra.cql3.QueryProcessor;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.exceptions.UnauthorizedException;
-import org.apache.cassandra.transport.messages.ResultMessage;
 import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.service.QueryState;
+import org.apache.cassandra.transport.Dispatcher;
+import org.apache.cassandra.transport.messages.ResultMessage;
 
-public class UseStatement extends ParsedStatement implements CQLStatement
+import static org.apache.cassandra.cql3.statements.RequestValidations.checkTrue;
+
+public class UseStatement extends CQLStatement.Raw implements CQLStatement
 {
     private final String keyspace;
 
@@ -34,34 +44,51 @@ public class UseStatement extends ParsedStatement implements CQLStatement
         this.keyspace = keyspace;
     }
 
-    public int getBoundsTerms()
+    public UseStatement prepare(ClientState state)
     {
-        return 0;
+        return this;
     }
 
-    public Prepared prepare() throws InvalidRequestException
-    {
-        return new Prepared(this);
-    }
-
-    public void checkAccess(ClientState state) throws UnauthorizedException
+    public void authorize(ClientState state) throws UnauthorizedException
     {
         state.validateLogin();
     }
 
+    @Override
     public void validate(ClientState state) throws InvalidRequestException
     {
+        checkTrue(DatabaseDescriptor.getUseStatementsEnabled(), "USE statements prohibited. (see use_statements_enabled in cassandra.yaml)");
     }
 
-    public ResultMessage execute(QueryState state, QueryOptions options) throws InvalidRequestException
+    @Override
+    public ResultMessage execute(QueryState state, QueryOptions options, Dispatcher.RequestTime requestTime) throws InvalidRequestException
     {
+        QueryProcessor.metrics.useStatementsExecuted.inc();
         state.getClientState().setKeyspace(keyspace);
         return new ResultMessage.SetKeyspace(keyspace);
     }
 
-    public ResultMessage executeInternal(QueryState state)
+    public ResultMessage executeLocally(QueryState state, QueryOptions options) throws InvalidRequestException
     {
-        // Internal queries are exclusively on the system keyspace and 'use' is thus useless
-        throw new UnsupportedOperationException();
+        // In production, internal queries are exclusively on the system keyspace and 'use' is thus useless
+        // but for some unit tests we need to set the keyspace (e.g. for tests with DROP INDEX)
+        return execute(state, options, Dispatcher.RequestTime.forImmediateExecution());
+    }
+    
+    @Override
+    public String toString()
+    {
+        return ToStringBuilder.reflectionToString(this, ToStringStyle.SHORT_PREFIX_STYLE);
+    }
+
+    @Override
+    public AuditLogContext getAuditLogContext()
+    {
+        return new AuditLogContext(AuditLogEntryType.USE_KEYSPACE, keyspace);
+    }
+
+    public String keyspace()
+    {
+        return keyspace;
     }
 }

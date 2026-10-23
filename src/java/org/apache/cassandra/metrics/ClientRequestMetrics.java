@@ -20,34 +20,73 @@
  */
 package org.apache.cassandra.metrics;
 
-import java.util.concurrent.TimeUnit;
 
-import com.yammer.metrics.Metrics;
-import com.yammer.metrics.core.Counter;
-import com.yammer.metrics.core.Meter;
+import com.codahale.metrics.Meter;
+
+import org.apache.cassandra.exceptions.ReadAbortException;
+import org.apache.cassandra.exceptions.ReadSizeAbortException;
+import org.apache.cassandra.exceptions.TombstoneAbortException;
+
+import static org.apache.cassandra.metrics.CassandraMetricsRegistry.Metrics;
+
 
 public class ClientRequestMetrics extends LatencyMetrics
 {
-    @Deprecated public static final Counter readTimeouts = Metrics.newCounter(DefaultNameFactory.createMetricName("ClientRequestMetrics", "ReadTimeouts", null));
-    @Deprecated public static final Counter writeTimeouts = Metrics.newCounter(DefaultNameFactory.createMetricName("ClientRequestMetrics", "WriteTimeouts", null));
-    @Deprecated public static final Counter readUnavailables = Metrics.newCounter(DefaultNameFactory.createMetricName("ClientRequestMetrics", "ReadUnavailables", null));
-    @Deprecated public static final Counter writeUnavailables = Metrics.newCounter(DefaultNameFactory.createMetricName("ClientRequestMetrics", "WriteUnavailables", null));
-
+    public static final String TYPE_NAME = "ClientRequest";
     public final Meter timeouts;
     public final Meter unavailables;
+    public final Meter failures;
+    public final Meter aborts;
+    public final Meter tombstoneAborts;
+    public final Meter readSizeAborts;
+    public final Meter localRequests;
+    public final Meter remoteRequests;
+    public final Meter retryDifferentSystem;
+    public final Meter retryCoordinatorBehind;
 
     public ClientRequestMetrics(String scope)
     {
-        super("ClientRequest", scope);
+        super(TYPE_NAME, scope);
 
-        timeouts = Metrics.newMeter(factory.createMetricName("Timeouts"), "timeouts", TimeUnit.SECONDS);
-        unavailables = Metrics.newMeter(factory.createMetricName("Unavailables"), "unavailables", TimeUnit.SECONDS);
+        timeouts = Metrics.meter(factory.createMetricName("Timeouts"));
+        unavailables = Metrics.meter(factory.createMetricName("Unavailables"));
+        failures = Metrics.meter(factory.createMetricName("Failures"));
+        aborts = Metrics.meter(factory.createMetricName("Aborts"));
+        tombstoneAborts = Metrics.meter(factory.createMetricName("TombstoneAborts"));
+        readSizeAborts = Metrics.meter(factory.createMetricName("ReadSizeAborts"));
+        localRequests = Metrics.meter(factory.createMetricName("LocalRequests"));
+        remoteRequests = Metrics.meter(factory.createMetricName("RemoteRequests"));
+        retryDifferentSystem = Metrics.meter(factory.createMetricName("RetryDifferentSystem"));
+        retryCoordinatorBehind = Metrics.meter(factory.createMetricName("RetryCoordinatorBehind"));
+    }
+
+    public void markAbort(Throwable cause)
+    {
+        aborts.mark();
+        if (!(cause instanceof ReadAbortException))
+            return;
+        if (cause instanceof TombstoneAbortException)
+        {
+            tombstoneAborts.mark();
+        }
+        else if (cause instanceof ReadSizeAbortException)
+        {
+            readSizeAborts.mark();
+        }
     }
 
     public void release()
     {
         super.release();
-        Metrics.defaultRegistry().removeMetric(factory.createMetricName("Timeouts"));
-        Metrics.defaultRegistry().removeMetric(factory.createMetricName("Unavailables"));
+        Metrics.remove(factory.createMetricName("Timeouts"));
+        Metrics.remove(factory.createMetricName("Unavailables"));
+        Metrics.remove(factory.createMetricName("Failures"));
+        Metrics.remove(factory.createMetricName("Aborts"));
+        Metrics.remove(factory.createMetricName("TombstoneAborts"));
+        Metrics.remove(factory.createMetricName("ReadSizeAborts"));
+        Metrics.remove(factory.createMetricName("LocalRequests"));
+        Metrics.remove(factory.createMetricName("RemoteRequests"));
+        Metrics.remove(factory.createMetricName("RetryDifferentSystem"));
+        Metrics.remove(factory.createMetricName("RetryCoordinatorBehind"));
     }
 }

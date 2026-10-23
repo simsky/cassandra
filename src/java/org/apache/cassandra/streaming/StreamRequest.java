@@ -17,8 +17,6 @@
  */
 package org.apache.cassandra.streaming;
 
-import java.io.DataInput;
-import java.io.DataOutput;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -26,72 +24,135 @@ import java.util.HashSet;
 import java.util.List;
 
 import org.apache.cassandra.db.TypeSizes;
+import org.apache.cassandra.dht.IPartitioner;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.io.IVersionedSerializer;
+import org.apache.cassandra.io.util.DataInputPlus;
+import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.locator.MetaStrategy;
+import org.apache.cassandra.locator.RangesAtEndpoint;
+import org.apache.cassandra.locator.Replica;
+import org.apache.cassandra.schema.SchemaConstants;
+
+import static org.apache.cassandra.locator.InetAddressAndPort.Serializer.inetAddressAndPortSerializer;
 
 public class StreamRequest
 {
     public static final IVersionedSerializer<StreamRequest> serializer = new StreamRequestSerializer();
 
     public final String keyspace;
-    public final Collection<Range<Token>> ranges;
+    //Full replicas and transient replicas are split based on the transient status of the remote we are fetching
+    //from. We preserve this distinction so on completion we can log to a system table whether we got the data transiently
+    //or fully from some remote. This is an important distinction for resumable bootstrap. The Replicas in these collections
+    //are local replicas (or dummy if this is triggered by repair) and don't encode the necessary information about
+    //what the remote provided.
+    public final RangesAtEndpoint full;
+    public final RangesAtEndpoint transientReplicas;
     public final Collection<String> columnFamilies = new HashSet<>();
 
-    public StreamRequest(String keyspace, Collection<Range<Token>> ranges, Collection<String> columnFamilies)
+    public StreamRequest(String keyspace, RangesAtEndpoint full, RangesAtEndpoint transientReplicas, Collection<String> columnFamilies)
     {
         this.keyspace = keyspace;
-        this.ranges = ranges;
+        if (!full.endpoint().equals(transientReplicas.endpoint()))
+            throw new IllegalStateException("Mismatching endpoints: " + full + ", " + transientReplicas);
+
+        this.full = full;
+        this.transientReplicas = transientReplicas;
         this.columnFamilies.addAll(columnFamilies);
     }
 
     public static class StreamRequestSerializer implements IVersionedSerializer<StreamRequest>
     {
-        public void serialize(StreamRequest request, DataOutput out, int version) throws IOException
+        @Override
+        public void serialize(StreamRequest request, DataOutputPlus out, int version) throws IOException
         {
             out.writeUTF(request.keyspace);
-            out.writeInt(request.ranges.size());
-            for (Range<Token> range : request.ranges)
-            {
-                Token.serializer.serialize(range.left, out);
-                Token.serializer.serialize(range.right, out);
-            }
             out.writeInt(request.columnFamilies.size());
+
+            inetAddressAndPortSerializer.serialize(request.full.endpoint(), out, version);
+
+            serializeReplicas(request.full, out, version);
+            serializeReplicas(request.transientReplicas, out, version);
             for (String cf : request.columnFamilies)
                 out.writeUTF(cf);
         }
 
-        public StreamRequest deserialize(DataInput in, int version) throws IOException
+        private void serializeReplicas(RangesAtEndpoint replicas, DataOutputPlus out, int version) throws IOException
+        {
+            out.writeInt(replicas.size());
+
+            for (Replica replica : replicas)
+            {
+                Token.serializer.serialize(replica.range().left, out, version);
+                Token.serializer.serialize(replica.range().right, out, version);
+            }
+        }
+
+        @Override
+        public StreamRequest deserialize(DataInputPlus in, int version) throws IOException
         {
             String keyspace = in.readUTF();
-            int rangeCount = in.readInt();
-            List<Range<Token>> ranges = new ArrayList<>(rangeCount);
-            for (int i = 0; i < rangeCount; i++)
-            {
-                Token left = Token.serializer.deserialize(in);
-                Token right = Token.serializer.deserialize(in);
-                ranges.add(new Range<>(left, right));
-            }
             int cfCount = in.readInt();
+            InetAddressAndPort endpoint = inetAddressAndPortSerializer.deserialize(in, version);
+
+            // TODO: It would be nicer to actually serialize the partitioner rather than infer it from the keyspace
+            //  but at the moment that would require us to get it from the tokens of the full/transient replicas or
+            //  looking up the KeyspaceMetadata. This way is not pleasant but it is cheap and easy.
+            IPartitioner partitioner = keyspace.equals(SchemaConstants.METADATA_KEYSPACE_NAME)
+                                       ? MetaStrategy.partitioner
+                                       : IPartitioner.global();
+            RangesAtEndpoint full = deserializeReplicas(in, version, endpoint, true, partitioner);
+            RangesAtEndpoint transientReplicas = deserializeReplicas(in, version, endpoint, false, partitioner);
             List<String> columnFamilies = new ArrayList<>(cfCount);
             for (int i = 0; i < cfCount; i++)
                 columnFamilies.add(in.readUTF());
-            return new StreamRequest(keyspace, ranges, columnFamilies);
+            return new StreamRequest(keyspace, full, transientReplicas, columnFamilies);
         }
 
+        RangesAtEndpoint deserializeReplicas(DataInputPlus in, int version, InetAddressAndPort endpoint, boolean isFull, IPartitioner partitioner) throws IOException
+        {
+            int replicaCount = in.readInt();
+
+            RangesAtEndpoint.Builder replicas = RangesAtEndpoint.builder(endpoint, replicaCount);
+            for (int i = 0; i < replicaCount; i++)
+            {
+                //TODO, super need to review the usage of streaming vs not streaming endpoint serialization helper
+                //to make sure I'm not using the wrong one some of the time, like do repair messages use the
+                //streaming version?
+                Token left = Token.serializer.deserialize(in, partitioner, version);
+                Token right = Token.serializer.deserialize(in, partitioner, version);
+                replicas.add(new Replica(endpoint, new Range<>(left, right), isFull));
+            }
+            return replicas.build();
+        }
+
+        @Override
         public long serializedSize(StreamRequest request, int version)
         {
-            int size = TypeSizes.NATIVE.sizeof(request.keyspace);
-            size += TypeSizes.NATIVE.sizeof(request.ranges.size());
-            for (Range<Token> range : request.ranges)
-            {
-                size += Token.serializer.serializedSize(range.left, TypeSizes.NATIVE);
-                size += Token.serializer.serializedSize(range.right, TypeSizes.NATIVE);
-            }
-            size += TypeSizes.NATIVE.sizeof(request.columnFamilies.size());
+            long size = TypeSizes.sizeof(request.keyspace);
+            size += TypeSizes.sizeof(request.columnFamilies.size());
+            size += inetAddressAndPortSerializer.serializedSize(request.full.endpoint(), version);
+            size += replicasSerializedSize(request.full, version);
+            size += replicasSerializedSize(request.transientReplicas, version);
             for (String cf : request.columnFamilies)
-                size += TypeSizes.NATIVE.sizeof(cf);
+                size += TypeSizes.sizeof(cf);
             return size;
         }
+
+        private long replicasSerializedSize(RangesAtEndpoint replicas, int version)
+        {
+            long size = 0;
+            size += TypeSizes.sizeof(replicas.size());
+
+            for (Replica replica : replicas)
+            {
+                size += Token.serializer.serializedSize(replica.range().left, version);
+                size += Token.serializer.serializedSize(replica.range().right, version);
+            }
+            return size;
+        }
+
     }
 }

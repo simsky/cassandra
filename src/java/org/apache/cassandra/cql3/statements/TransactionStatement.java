@@ -1,0 +1,946 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.cql3.statements;
+
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.TimeUnit;
+import java.util.function.BiConsumer;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+import javax.annotation.Nullable;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Preconditions;
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.Iterables;
+
+import org.agrona.collections.Int2ObjectHashMap;
+import org.slf4j.LoggerFactory;
+
+import accord.api.Key;
+import accord.primitives.Keys;
+import accord.primitives.Routable.Domain;
+import accord.primitives.Txn;
+import accord.utils.Invariants;
+import accord.utils.TriConsumer;
+
+import org.apache.cassandra.audit.AuditLogContext;
+import org.apache.cassandra.audit.AuditLogEntryType;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.cql3.CQLStatement;
+import org.apache.cassandra.cql3.ColumnSpecification;
+import org.apache.cassandra.cql3.FunctionContext;
+import org.apache.cassandra.cql3.QueryOptions;
+import org.apache.cassandra.cql3.ResultSet;
+import org.apache.cassandra.cql3.VariableSpecifications;
+import org.apache.cassandra.cql3.selection.ResultSetBuilder;
+import org.apache.cassandra.cql3.selection.Selection;
+import org.apache.cassandra.cql3.transactions.ConditionStatement;
+import org.apache.cassandra.cql3.transactions.ReferenceOperation;
+import org.apache.cassandra.cql3.transactions.RowDataReference;
+import org.apache.cassandra.cql3.transactions.SelectReferenceSource;
+import org.apache.cassandra.db.Columns;
+import org.apache.cassandra.db.ConsistencyLevel;
+import org.apache.cassandra.db.SinglePartitionReadCommand;
+import org.apache.cassandra.db.SinglePartitionReadQuery;
+import org.apache.cassandra.db.filter.DataLimits;
+import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.schema.ColumnMetadata;
+import org.apache.cassandra.schema.TableId;
+import org.apache.cassandra.schema.TableParams;
+import org.apache.cassandra.service.ClientState;
+import org.apache.cassandra.service.PreserveTimestamp;
+import org.apache.cassandra.service.QueryState;
+import org.apache.cassandra.service.accord.AccordService;
+import org.apache.cassandra.service.accord.api.PartitionKey;
+import org.apache.cassandra.service.accord.serializers.TableMetadatas;
+import org.apache.cassandra.service.accord.serializers.TableMetadatasAndKeys;
+import org.apache.cassandra.service.accord.txn.AccordUpdate;
+import org.apache.cassandra.service.accord.txn.TxnCondition;
+import org.apache.cassandra.service.accord.txn.TxnDataKeyValue;
+import org.apache.cassandra.service.accord.txn.TxnDataResult;
+import org.apache.cassandra.service.accord.txn.TxnNamedRead;
+import org.apache.cassandra.service.accord.txn.TxnQuery;
+import org.apache.cassandra.service.accord.txn.TxnRead;
+import org.apache.cassandra.service.accord.txn.TxnReference;
+import org.apache.cassandra.service.accord.txn.TxnResult;
+import org.apache.cassandra.service.accord.txn.TxnUpdate;
+import org.apache.cassandra.service.accord.txn.TxnValidationRejection;
+import org.apache.cassandra.service.accord.txn.TxnWrite;
+import org.apache.cassandra.service.consensus.TransactionalMode;
+import org.apache.cassandra.service.consensus.migration.TransactionalMigrationFromMode;
+import org.apache.cassandra.tcm.ClusterMetadata;
+import org.apache.cassandra.tcm.Epoch;
+import org.apache.cassandra.transport.Dispatcher;
+import org.apache.cassandra.transport.messages.ResultMessage;
+import org.apache.cassandra.utils.NoSpamLogger;
+
+import static accord.primitives.Txn.Kind.Read;
+import static com.google.common.base.Preconditions.checkArgument;
+import static org.apache.cassandra.cql3.statements.RequestValidations.checkFalse;
+import static org.apache.cassandra.cql3.statements.RequestValidations.checkNotNull;
+import static org.apache.cassandra.cql3.statements.RequestValidations.checkTrue;
+import static org.apache.cassandra.cql3.statements.RequestValidations.invalidRequest;
+import static org.apache.cassandra.service.accord.txn.TxnData.TxnDataNameKind.AUTO_READ;
+import static org.apache.cassandra.service.accord.txn.TxnData.TxnDataNameKind.RETURNING;
+import static org.apache.cassandra.service.accord.txn.TxnData.TxnDataNameKind.USER;
+import static org.apache.cassandra.service.accord.txn.TxnData.txnDataName;
+import static org.apache.cassandra.service.accord.txn.TxnRead.createTxnRead;
+import static org.apache.cassandra.service.accord.txn.TxnResult.Kind.retry_new_protocol;
+import static org.apache.cassandra.service.consensus.migration.ConsensusRequestRouter.shouldReadEphemerally;
+
+public class TransactionStatement implements CQLStatement.CompositeCQLStatement, CQLStatement.ReturningCQLStatement
+{
+    public static final String DUPLICATE_TUPLE_NAME_MESSAGE = "The name '%s' has already been used by a LET assignment.";
+    public static final String INCOMPLETE_PARTITION_KEY_SELECT_MESSAGE = "SELECT must specify either all partition key elements. Partition key elements must be always specified with equality operators; %s %s";
+    public static final String INCOMPLETE_PRIMARY_KEY_SELECT_MESSAGE = "SELECT must specify either all primary key elements or all partition key elements and LIMIT 1. In both cases partition key elements must be always specified with equality operators; %s %s";
+    public static final String NO_CONDITIONS_IN_UPDATES_MESSAGE = "Updates within transactions may not specify their own conditions; %s statement %s";
+    public static final String NO_TIMESTAMPS_IN_UPDATES_MESSAGE = "Updates within transactions may not specify custom timestamps; %s statement %s";
+    public static final String NO_TTLS_IN_UPDATES_MESSAGE = "Updates within transactions may not specify custom ttls; %s statement %s";
+    public static final String TRANSACTIONS_DISABLED_ON_TABLE_MESSAGE = "Accord transactions are disabled on table (See transactional_mode in table options); %s statement %s";
+    public static final String TRANSACTIONS_DISABLED_ON_TABLE_BEING_DROPPED_MESSAGE = "Accord transactions are disabled on table (table is being dropped); %s statement %s";
+    public static final String NO_COUNTERS_IN_TXNS_MESSAGE = "Counter columns cannot be accessed within a transaction; %s statement %s";
+    public static final String NO_AGGREGATION_IN_TXNS_MESSAGE = "No aggregation functions allowed within a transaction; %s statement %s";
+    public static final String NO_ORDER_BY_IN_TXNS_MESSAGE = "No ORDER BY clause allowed within a transaction; %s statement %s";
+    public static final String NO_GROUP_BY_IN_TXNS_MESSAGE = "No GROUP BY clause allowed within a transaction; %s statement %s";
+    public static final String EMPTY_TRANSACTION_MESSAGE = "Transaction contains no reads or writes";
+    public static final String SELECT_REFS_NEED_COLUMN_MESSAGE = "SELECT references must specify a column.";
+    public static final String TRANSACTIONS_DISABLED_MESSAGE = "Accord transactions are disabled. (See accord.enabled in cassandra.yaml)";
+    public static final String ILLEGAL_RANGE_QUERY_MESSAGE = "Range queries are not allowed for reads within a transaction; %s %s";
+    public static final String DUPLICATE_KEYS_IN_SAME_TRANSACTION_MESSAGE = "Transaction contains multiple updates to the same key and fields";
+    public static final String UNSUPPORTED_MIGRATION = "Transaction Statement is unsupported when migrating away from Accord or before migration to Accord is complete for a range";
+    public static final String NO_PARTITION_IN_CLAUSE_WITH_LIMIT = "Partition key is present in IN clause and there is a LIMIT... this is currently not supported; %s statement %s";
+    public static final String WRITE_TXN_EMPTY_WITH_IGNORED_READS = "Write txn produced no mutation, and its reads do not return to the caller; ignoring...";
+    public static final String WRITE_TXN_EMPTY_WITH_NO_READS = "Write txn produced no mutation, and had no reads; ignoring...";
+    public static final String MISSING_BODY_BLOCK_MESSAGE = "IF/ELSE branch body must contain at least one modification statement";
+
+    private static final NoSpamLogger noSpamLogger = NoSpamLogger.getLogger(LoggerFactory.getLogger(TransactionStatement.class), 1, TimeUnit.MINUTES);
+
+    static class NamedSelect
+    {
+        final int name;
+        final SelectStatement select;
+
+        public NamedSelect(int name, SelectStatement select)
+        {
+            this.name = name;
+            this.select = select;
+        }
+    }
+
+    private final List<NamedSelect> assignments;
+    private final NamedSelect returningSelect;
+    private final List<RowDataReference> returningReferences;
+    // groupedUpdates.get(i) applies if groupedConditions.get(i) holds;
+    // any unconditional update trails, without a matching condition index
+    private final List<List<ModificationStatement>> groupedUpdates;
+    private final List<List<ConditionStatement>> groupedConditions;
+
+    private final VariableSpecifications bindVariables;
+    private final ResultSet.ResultMetadata resultMetadata;
+
+    private long minEpoch = Epoch.EMPTY.getEpoch();
+
+    public TransactionStatement(List<NamedSelect> assignments,
+                                NamedSelect returningSelect,
+                                List<RowDataReference> returningReferences,
+                                List<List<ModificationStatement>> groupedUpdates,
+                                List<List<ConditionStatement>> groupedConditions,
+                                VariableSpecifications bindVariables)
+    {
+        this.assignments = assignments;
+        this.returningSelect = returningSelect;
+        this.returningReferences = returningReferences;
+        this.groupedUpdates = groupedUpdates;
+        this.groupedConditions = groupedConditions;
+        this.bindVariables = bindVariables;
+
+        if (returningSelect != null)
+        {
+            resultMetadata = returningSelect.select.getResultMetadata();
+        }
+        else if (returningReferences != null && !returningReferences.isEmpty())
+        {
+            List<ColumnSpecification> names = new ArrayList<>(returningReferences.size());
+            for (RowDataReference reference : returningReferences)
+                names.add(reference.toResultMetadata());
+            resultMetadata = new ResultSet.ResultMetadata(names);
+        }
+        else
+        {
+            resultMetadata =  ResultSet.ResultMetadata.EMPTY;
+        }
+    }
+
+    public Iterable<ModificationStatement> getUpdates()
+    {
+        return Iterables.concat(groupedUpdates);
+    }
+
+    public boolean hasUpdates()
+    {
+        for (int i = 0, maxi = groupedUpdates.size() ; i < maxi ; i++)
+        {
+            if (!groupedUpdates.get(i).isEmpty())
+                return true;
+        }
+        return false;
+    }
+
+    public <P> void forEachUpdate(BiConsumer<ModificationStatement, P> forEach, P param)
+    {
+        for (int i = 0, maxi = groupedUpdates.size() ; i < maxi ; i++)
+        {
+            List<ModificationStatement> updates = groupedUpdates.get(i);
+            for (int j = 0, maxj = updates.size() ; j < maxj ; ++j)
+                forEach.accept(updates.get(j), param);
+        }
+    }
+
+    public <P1, P2> void forEachUpdate(TriConsumer<ModificationStatement, P1, P2> forEach, P1 param1, P2 param2)
+    {
+        for (int i = 0, maxi = groupedUpdates.size() ; i < maxi ; i++)
+        {
+            List<ModificationStatement> updates = groupedUpdates.get(i);
+            for (int j = 0, maxj = updates.size() ; j < maxj ; ++j)
+                forEach.accept(updates.get(j), param1, param2);
+        }
+    }
+
+    @Override
+    public ImmutableList<ColumnSpecification> getBindVariables()
+    {
+        return bindVariables.getImmutableBindVariables();
+    }
+
+    @Override
+    public short[] getPartitionKeyBindVariableIndexes()
+    {
+        if (returningSelect != null)
+        {
+            short[] result = returningSelect.select.getPartitionKeyBindVariableIndexes();
+            if (result != null)
+                return result;
+        }
+
+        for (List<ModificationStatement> updates : groupedUpdates)
+        {
+            for (ModificationStatement stmt : updates)
+            {
+                short[] result = stmt.getPartitionKeyBindVariableIndexes();
+                if (result != null)
+                    return result;
+            }
+        }
+        return null;
+    }
+
+    @Override
+    public void authorize(ClientState state)
+    {
+        // Assess read permissions for all data from both explicit LET statements and generated reads.
+        for (NamedSelect let : assignments)
+            let.select.authorize(state);
+
+        if (returningSelect != null)
+            returningSelect.select.authorize(state);
+
+        ModificationStatement.TableAuthorizationState authorizationState = new ModificationStatement.TableAuthorizationState();
+        forEachUpdate(ModificationStatement::authorize, state, authorizationState);
+    }
+
+    @Override
+    public void validate(ClientState state)
+    {
+        for (NamedSelect statement : assignments)
+            statement.select.validate(state);
+        if (returningSelect != null)
+            returningSelect.select.validate(state);
+
+        forEachUpdate(ModificationStatement::validate, state);
+    }
+
+    @Override
+    public Iterable<CQLStatement> getStatements()
+    {
+        return () -> {
+            Stream<CQLStatement> stream = assignments.stream().map(n -> n.select);
+            if (returningSelect != null)
+                stream = Stream.concat(stream, Stream.of(returningSelect.select));
+            stream = Stream.concat(stream, groupedUpdates.stream().flatMap(Collection::stream));
+            return stream.iterator();
+        };
+    }
+
+    @Override
+    public ResultSet.ResultMetadata getResultMetadata()
+    {
+        return resultMetadata;
+    }
+
+    TxnNamedRead createNamedRead(NamedSelect namedSelect, QueryOptions options, TableMetadatasAndKeys.KeyCollector keyCollector)
+    {
+        SelectStatement select = namedSelect.select;
+        // We reject reads from both LET and SELECT that do not specify a single row.
+        @SuppressWarnings("unchecked")
+        SinglePartitionReadQuery.Group<SinglePartitionReadCommand> selectQuery = (SinglePartitionReadQuery.Group<SinglePartitionReadCommand>) select.getQuery(options, 0);
+
+        if (selectQuery.queries.size() != 1)
+            throw invalidRequest("Within a transaction, SELECT statements must select a single partition; found " + selectQuery.queries.size() + " partitions");
+
+        SinglePartitionReadCommand command = Iterables.getOnlyElement(selectQuery.queries);
+        return new TxnNamedRead(namedSelect.name, keyCollector.collect(command.metadata(), command.partitionKey()), command, keyCollector.tables);
+    }
+
+    List<TxnNamedRead> createNamedReads(NamedSelect namedSelect, QueryOptions options, TableMetadatasAndKeys.KeyCollector keyCollector)
+    {
+        SelectStatement select = namedSelect.select;
+        // We reject reads from both LET and SELECT that do not specify a single row.
+        @SuppressWarnings("unchecked")
+        SinglePartitionReadQuery.Group<SinglePartitionReadCommand> selectQuery = (SinglePartitionReadQuery.Group<SinglePartitionReadCommand>) select.getQuery(options, 0);
+
+        if (selectQuery.queries.size() == 1)
+            return Collections.singletonList(new TxnNamedRead(namedSelect.name, keyCollector.collect(select.table, selectQuery.queries.get(0).partitionKey()), selectQuery.queries.get(0), keyCollector.tables));
+
+        List<TxnNamedRead> list = new ArrayList<>(selectQuery.queries.size());
+        for (int i = 0; i < selectQuery.queries.size(); i++)
+        {
+            SinglePartitionReadCommand readCommand = selectQuery.queries.get(i);
+            list.add(new TxnNamedRead(txnDataName(RETURNING, i), keyCollector.collect(readCommand.metadata(), readCommand.partitionKey()), readCommand, keyCollector.tables));
+        }
+        return list;
+    }
+
+    private List<TxnNamedRead> createNamedReads(QueryOptions options, @Nullable Int2ObjectHashMap<NamedSelect> autoReads, TableMetadatasAndKeys.KeyCollector keyCollector)
+    {
+        List<TxnNamedRead> reads = new ArrayList<>(assignments.size() + 1);
+
+        for (NamedSelect select : assignments)
+        {
+            TxnNamedRead read = createNamedRead(select, options, keyCollector);
+            minEpoch = Math.max(minEpoch, select.select.table.epoch.getEpoch());
+            reads.add(read);
+        }
+
+        if (returningSelect != null)
+        {
+            for (TxnNamedRead read : createNamedReads(returningSelect, options, keyCollector))
+            {
+                minEpoch = Math.max(minEpoch, returningSelect.select.table.epoch.getEpoch());
+                reads.add(read);
+            }
+        }
+
+        if (autoReads != null)
+        {
+            for (NamedSelect select : autoReads.values())
+            {
+                TxnNamedRead read = createNamedRead(select, options, keyCollector);
+                reads.add(read);
+            }
+        }
+
+        return reads;
+    }
+
+    TxnCondition createCondition(List<ConditionStatement> conditions, QueryOptions options)
+    {
+        if (conditions.isEmpty())
+            return TxnCondition.none();
+        if (conditions.size() == 1)
+            return conditions.get(0).createCondition(options);
+
+        List<TxnCondition> result = new ArrayList<>(conditions.size());
+        for (ConditionStatement condition : conditions)
+            result.add(condition.createCondition(options));
+
+        // TODO: OR support
+        return new TxnCondition.BooleanGroup(TxnCondition.Kind.AND, result);
+    }
+
+    TableMetadatas.Complete collectTables()
+    {
+        TableMetadatas.Collector collector = new TableMetadatas.Collector();
+        if (groupedUpdates != null)
+        {
+            forEachUpdate((stmt, c) -> c.add(stmt.metadata), collector);
+        }
+        if (assignments != null)
+        {
+            for (NamedSelect select : assignments)
+                collector.add(select.select.table);
+        }
+        if (returningSelect != null)
+        {
+            collector.add(returningSelect.select.table);
+        }
+        if (returningReferences != null)
+        {
+            for (RowDataReference ref : returningReferences)
+                collector.add(ref.table());
+        }
+        return collector.build();
+    }
+
+    List<List<TxnWrite.Fragment>> createWriteFragments(ClientState state, QueryOptions options, Map<Integer, NamedSelect> autoReads, TableMetadatasAndKeys.KeyCollector keyCollector)
+    {
+        List<List<TxnWrite.Fragment>> groupedWriteFragments = new ArrayList<>(groupedUpdates.size());
+
+        // If we have a trailing update, refuse updates that occur in both a branch and the trailing update
+        HashMap<Object, Columns> totalSeenColumns = groupedUpdates.size() > groupedConditions.size() ? new HashMap<>() : null;
+        HashMap<Object, Columns> groupSeenColumns = new HashMap<>();
+
+        int idx = 0;
+        for (int groupedUpdatesIdx = 0; groupedUpdatesIdx < groupedUpdates.size(); groupedUpdatesIdx++)
+        {
+            List<ModificationStatement> updates = groupedUpdates.get(groupedUpdatesIdx);
+            List<TxnWrite.Fragment> fragments = new ArrayList<>(updates.size());
+            HashMap<Object, Columns> validateSeenColumns = groupedUpdatesIdx == groupedConditions.size() ? totalSeenColumns : groupSeenColumns;
+            groupSeenColumns.clear();
+
+            for (ModificationStatement modification : updates)
+            {
+                minEpoch = Math.max(minEpoch, modification.metadata().epoch.getEpoch());
+                List<TxnWrite.Fragment> writeFragments = modification.getTxnWriteFragment(idx, state, options, keyCollector);
+                fragments.addAll(writeFragments);
+
+                // TODO: When adding support for consecutive IF statements, we need to revisit CASSANDRA-21136, currently we perform this check per branch since only one branch can be executed
+                validateOnlyModifyPrimaryKeyColumnPairOnce(validateSeenColumns, modification, writeFragments);
+
+                if (modification.anyReferenceOperationMatches(ReferenceOperation::requiresRead))
+                {
+                    // Reads are not merged by partition here due to potentially differing columns retrieved, etc.
+                    int partitionName = txnDataName(AUTO_READ, idx);
+                    if (!autoReads.containsKey(partitionName))
+                        autoReads.put(partitionName, new NamedSelect(partitionName, modification.createSelectForTxn()));
+                }
+
+                idx++;
+            }
+
+            // When groupSeenColumns == validateSeenColumns, we are in the trailing update case
+            // and don't need to run this block
+            if (totalSeenColumns != null && groupSeenColumns == validateSeenColumns)
+            {
+                for (Map.Entry<Object, Columns> entry : groupSeenColumns.entrySet())
+                    totalSeenColumns.merge(entry.getKey(), entry.getValue(), Columns::mergeTo);
+            }
+
+            groupedWriteFragments.add(fragments);
+        }
+
+        return groupedWriteFragments;
+    }
+
+    private static void validateOnlyModifyPrimaryKeyColumnPairOnce(HashMap<Object, Columns> seenColumns,
+                                                                   ModificationStatement statement, List<TxnWrite.Fragment> writeFragments)
+    {
+        Columns regularColumns = statement.updatedColumns().columns(false);
+        statement.forEachRowKey(writeFragments, seenColumns, regularColumns, TransactionStatement::mergeColumnsIfNoDuplicates);
+        Columns staticColumns = statement.updatedColumns().columns(true);
+        statement.forEachPartitionKey(writeFragments, seenColumns, staticColumns, TransactionStatement::mergeColumnsIfNoDuplicates);
+    }
+
+    private static Columns mergeColumnsIfNoDuplicates(Columns existing, Columns add)
+    {
+        Columns merged = existing.mergeTo(add);
+        if (merged.size() != existing.size() + add.size())
+            throw invalidRequest(DUPLICATE_KEYS_IN_SAME_TRANSACTION_MESSAGE);
+        return merged;
+    }
+
+    private ConsistencyLevel consistencyLevelForAccordRead(ClusterMetadata cm, TableMetadatas.Complete tables, Keys keys, @Nullable ConsistencyLevel consistencyLevel)
+    {
+        // Write transactions are read/write so it creates a read and ends up needing a consistency level
+        // which is fine to leave null
+        if (keys.isEmpty())
+            return null;
+
+        // Null means no specific consistency behavior is required from Accord, it's functionally similar to
+        // reading at ONE if you are reading data that wasn't written via Accord
+        if (consistencyLevel == null)
+            return null;
+
+        for (Key key : keys)
+        {
+            // readCLForMode should return either null or the supplied consistency level
+            // in which case we will read everything at that CL since Accord doesn't support per table
+            // read consistency
+            ConsistencyLevel readCL = consistencyLevelForAccordRead(cm, tables, key, consistencyLevel);
+            if (readCL != null)
+                return readCL;
+        }
+        return null;
+    }
+
+    private ConsistencyLevel consistencyLevelForAccordRead(ClusterMetadata cm, TableMetadatas.Complete tables, Key key, ConsistencyLevel consistencyLevel)
+    {
+        // Null means no specific consistency behavior is required from Accord, it's functionally similar to
+        // reading at ONE if you are reading data that wasn't written via Accord
+        if (consistencyLevel == null)
+            return null;
+
+        PartitionKey pk = (PartitionKey)key;
+        TableId tableId = pk.table();
+        Token token = pk.token();
+        TableParams tableParams = tables.getMetadata(tableId).params;
+        TransactionalMode mode = tableParams.transactionalMode;
+        TransactionalMigrationFromMode migrationFromMode = tableParams.transactionalMigrationFrom;
+        return mode.readCLForMode(migrationFromMode, consistencyLevel, cm, tableId, token);
+    }
+
+    private static ConsistencyLevel consistencyLevelForAccordCommit(ClusterMetadata cm, TableMetadatas.Complete tables, TableMetadatasAndKeys.KeyCollector keys, @Nullable ConsistencyLevel consistencyLevel)
+    {
+        checkArgument(!keys.isEmpty(), "keys should not be empty");
+        // Null means no specific consistency behavior is required from Accord, it's functionally similar to ANY
+        // if you aren't reading the result back via Accord
+        if (consistencyLevel == null)
+            return null;
+
+        for (Key key : keys)
+        {
+            // commitCLForMode should return either null or the supplied consistency level
+            // in which case we will commit everything at that CL since Accord doesn't support per table
+            // commit consistency
+            ConsistencyLevel commitCL = consistencyLevelForAccordCommit(cm, tables, key, consistencyLevel);
+            if (commitCL != null)
+                return commitCL;
+        }
+        return null;
+    }
+
+    private static ConsistencyLevel consistencyLevelForAccordCommit(ClusterMetadata cm, TableMetadatas.Complete tables, Key key, @Nullable ConsistencyLevel consistencyLevel)
+    {
+        // Null means no specific consistency behavior is required from Accord, it's functionally similar to ANY
+        // if you aren't reading the result back via Accord
+        if (consistencyLevel == null)
+            return null;
+
+        PartitionKey pk = (PartitionKey)key;
+        TableId tableId = pk.table();
+        Token token = pk.token();
+        TableParams tableParams = tables.getMetadata(tableId).params;
+        TransactionalMode mode = tableParams.transactionalMode;
+        TransactionalMigrationFromMode migrationFromMode = tableParams.transactionalMigrationFrom;
+        // commitCLForMode should return either null or the supplied consistency level
+        // in which case we will commit everything at that CL since Accord doesn't support per table
+        // commit consistency
+        return mode.commitCLForMode(migrationFromMode, consistencyLevel, cm, tableId, token);
+    }
+
+    @VisibleForTesting
+    @Nullable
+    public Txn createTxn(ClientState state, QueryOptions options)
+    {
+        ClusterMetadata cm = ClusterMetadata.current();
+        TableMetadatas.Complete tables = collectTables();
+        TableMetadatasAndKeys.KeyCollector keyCollector = new TableMetadatasAndKeys.KeyCollector(tables);
+
+        if (!hasUpdates())
+        {
+            boolean hasNoConditions = true;
+            for (int i = 0, maxi = groupedConditions.size(); i < maxi && hasNoConditions; i++)
+                hasNoConditions = groupedConditions.get(i).isEmpty();
+            // TODO: Test case around this...
+            Preconditions.checkState(hasNoConditions, "No condition should exist without updates present");
+            List<TxnNamedRead> reads = createNamedReads(options, null, keyCollector);
+            Keys keys = keyCollector.build();
+            TxnRead read = createTxnRead(tables, reads, consistencyLevelForAccordRead(cm, tables, keys, options.getSerialConsistency()), Domain.Key);
+            Txn.Kind kind = shouldReadEphemerally(keys, tables.getMetadata((TableId)keys.get(0).prefix()).params, Read, read);
+            return new Txn.InMemory(kind, keys, read, TxnQuery.ALL, null, new TableMetadatasAndKeys(tables, keys));
+        }
+        else
+        {
+            Int2ObjectHashMap<NamedSelect> autoReads = new Int2ObjectHashMap<>();
+            List<List<TxnWrite.Fragment>> groupedFragments = createWriteFragments(state, options, autoReads, keyCollector);
+
+            int conditionals = groupedConditions.size();
+            int conditionalFragments = 0;
+            for (int i = 0 ; i < conditionals ; i++)
+                conditionalFragments += groupedFragments.get(i).size();
+
+            TxnUpdate.BlocksBuilder builder = new TxnUpdate.BlocksBuilder(conditionals, conditionalFragments);
+            int conditionIdx = 0;
+            for (; conditionIdx < conditionals ; conditionIdx++)
+            {
+                TxnCondition condition = createCondition(groupedConditions.get(conditionIdx), options);
+                builder.addConditional(condition, groupedFragments.get(conditionIdx), tables);
+            }
+
+            // Even though groupedUpdates.get(idx) can't be empty, groupedFragments.get(idx) can.
+            // This is because (DELETE WHERE pk=0 AND c < 0 AND c > 0) can produce no fragments.
+            // In this case, we have an empty fragment for the trailing update, and we skip including it.
+            if (conditionIdx < groupedFragments.size() && !groupedFragments.get(conditionIdx).isEmpty())
+                builder.addUnconditional(groupedFragments.get(conditionIdx), tables);
+
+            Keys writeKeys = keyCollector.snapshot();
+
+            List<TxnNamedRead> reads = createNamedReads(options, autoReads, keyCollector);
+            if (builder.isEmpty()) // ModificationStatement yield no Mutation (DELETE WHERE pk=0 AND c < 0 AND c > 0 -- matches no keys; so has no mutation)
+            {
+                // cleanup memory
+                keyCollector.clear();
+                autoReads.clear();
+                return maybeCreateTxnFromEmptyWrites(cm, options, tables);
+            }
+            ConsistencyLevel commitCL = consistencyLevelForAccordCommit(cm, tables, keyCollector, options.getConsistency());
+            Keys keys = keyCollector.build();
+
+            AccordUpdate update = TxnUpdate.create(tables, writeKeys, builder.build(), commitCL, PreserveTimestamp.no);
+            TxnRead read = createTxnRead(tables, reads, null, Domain.Key);
+            return new Txn.InMemory(keys, read, TxnQuery.ALL, update, new TableMetadatasAndKeys(tables, keys));
+        }
+    }
+
+    @Nullable
+    private Txn.InMemory maybeCreateTxnFromEmptyWrites(ClusterMetadata cm, QueryOptions options, TableMetadatas.Complete tables)
+    {
+        TableMetadatasAndKeys.KeyCollector keyCollector = new TableMetadatasAndKeys.KeyCollector(tables);
+        List<TxnNamedRead> reads = createNamedReads(options, null, keyCollector);
+        if (reads.isEmpty())
+        {
+            // no reads, this is a no-op
+            noSpamLogger.info(WRITE_TXN_EMPTY_WITH_NO_READS);
+            return null;
+        }
+        if (returningSelect == null && returningReferences == null)
+        {
+            // the reads were for the mutation, and since the mutation doesn't exist the reads are not needed
+            noSpamLogger.info(WRITE_TXN_EMPTY_WITH_IGNORED_READS);
+            return null;
+        }
+
+        // Return a read only txn
+        Keys keys = keyCollector.build();
+        TxnRead read = createTxnRead(tables, reads, consistencyLevelForAccordRead(cm, tables, keys, options.getSerialConsistency()), Domain.Key);
+        Txn.Kind kind = shouldReadEphemerally(keys, tables.getMetadata((TableId)keys.get(0).prefix()).params, Read, read);
+        return new Txn.InMemory(kind, keys, read, TxnQuery.ALL, null, new TableMetadatasAndKeys(tables, keys));
+    }
+
+    /**
+     * Returns {@code true} only if the statement selects multiple clusterings in a partition
+     */
+    private static boolean isSelectingMultipleClusterings(SelectStatement select, @Nullable QueryOptions options)
+    {
+        if (select.getRestrictions().hasAllPrimaryKeyColumnsRestrictedByEqualities())
+            return false;
+
+        if (options == null)
+        {
+            // if the limit is a non-terminal marker (because we're preparing), defer validation until execution (when options != null)
+            if (select.isLimitMarker())
+                return false;
+
+            options = QueryOptions.DEFAULT;
+        }
+
+        return select.getLimit(options) != 1;
+    }
+
+    @Override
+    public ResultMessage execute(QueryState state, QueryOptions options, Dispatcher.RequestTime requestTime)
+    {
+        checkTrue(DatabaseDescriptor.getAccordTransactionsEnabled(), TRANSACTIONS_DISABLED_MESSAGE);
+
+        // check again since now we have query options; note that statements are quaranted to be single partition reads at this point
+        for (NamedSelect assignment : assignments)
+        {
+            checkFalse(isSelectingMultipleClusterings(assignment.select, options), INCOMPLETE_PRIMARY_KEY_SELECT_MESSAGE, "LET assignment", assignment.select.source);
+            if (assignment.select.getRestrictions().keyIsInRelation())
+                checkTrue(assignment.select.getLimit(options) == DataLimits.NO_LIMIT, NO_PARTITION_IN_CLAUSE_WITH_LIMIT, "SELECT", assignment.select.source);
+        }
+        if (returningSelect != null && returningSelect.select.getRestrictions().keyIsInRelation())
+        {
+            checkTrue(returningSelect.select.getLimit(options) == DataLimits.NO_LIMIT, NO_PARTITION_IN_CLAUSE_WITH_LIMIT, "SELECT", returningSelect.select.source);
+        }
+
+        Txn txn = createTxn(state.getClientState(), options);
+        if (txn == null)
+            return new ResultMessage.Void();
+
+        TxnResult txnResult = AccordService.instance().coordinate(minEpoch, txn, options.getConsistency(), requestTime);
+        if (txnResult.kind() == retry_new_protocol)
+            throw new InvalidRequestException(UNSUPPORTED_MIGRATION);
+        TxnValidationRejection.maybeThrow(txnResult);
+        TxnDataResult data = (TxnDataResult)txnResult;
+
+        if (returningSelect != null)
+        {
+            @SuppressWarnings("unchecked")
+            SinglePartitionReadQuery.Group<SinglePartitionReadCommand> selectQuery = (SinglePartitionReadQuery.Group<SinglePartitionReadCommand>) returningSelect.select.getQuery(options, 0);
+            Selection.Selectors selectors = returningSelect.select.getSelection().newSelectors(options);
+            long atMicros = data.atMicros;
+            FunctionContext context = new FunctionContext.MicrosFunctionContext(atMicros)
+            {
+                @Override public QueryOptions options() { return options; }
+            };
+            ResultSetBuilder result = new ResultSetBuilder(resultMetadata, context, selectors, false);
+            long atSeconds = atMicros / 1000_000;
+            if (selectQuery.queries.size() == 1)
+            {
+                TxnDataKeyValue partition = (TxnDataKeyValue)data.get(txnDataName(RETURNING));
+                boolean reversed = selectQuery.queries.get(0).isReversed();
+                if (partition != null)
+                    returningSelect.select.processPartition(partition.rowIterator(reversed), options, result, atSeconds);
+            }
+            else
+            {
+                for (int i = 0; i < selectQuery.queries.size(); i++)
+                {
+                    TxnDataKeyValue partition = (TxnDataKeyValue)data.get(txnDataName(RETURNING, i));
+                    boolean reversed = selectQuery.queries.get(i).isReversed();
+                    if (partition != null)
+                        returningSelect.select.processPartition(partition.rowIterator(reversed), options, result, atSeconds);
+                }
+            }
+            return new ResultMessage.Rows(result.build());
+        }
+
+        if (returningReferences != null)
+        {
+            List<AbstractType<?>> resultType = new ArrayList<>(returningReferences.size());
+            List<ColumnMetadata> columns = new ArrayList<>(returningReferences.size());
+
+            for (RowDataReference reference : returningReferences)
+            {
+                ColumnMetadata forMetadata = reference.toResultMetadata();
+                resultType.add(forMetadata.type);
+                columns.add(reference.column());
+            }
+
+            ResultSetBuilder result = new ResultSetBuilder(resultMetadata, FunctionContext.NONE, Selection.noopSelector(), false);
+            result.newRow(options.getProtocolVersion(), null, null, columns);
+
+            for (int i = 0; i < returningReferences.size(); i++)
+            {
+                RowDataReference reference = returningReferences.get(i);
+                TxnReference txnReference = reference.toTxnReference(options);
+                ByteBuffer buffer = txnReference.asColumn().toByteBuffer(data, resultType.get(i));
+                result.add(buffer);
+            }
+
+            return new ResultMessage.Rows(result.build());
+        }
+
+        // In the case of a write-only transaction, just return and empty result.
+        // TODO: This could be modified to return an indication of whether a condition (if present) succeeds.
+        return new ResultMessage.Void();
+    }
+
+    @Override
+    public ResultMessage executeLocally(QueryState state, QueryOptions options)
+    {
+        return execute(state, options, Dispatcher.RequestTime.forImmediateExecution());
+    }
+
+    @Override
+    public AuditLogContext getAuditLogContext()
+    {
+        return new AuditLogContext(AuditLogEntryType.TRANSACTION);
+    }
+
+    @Override
+    public boolean eligibleAsPreparedStatement()
+    {
+        // false is the default, but still best to be explicit.
+        return false;
+    }
+
+    private static void validate(SelectStatement.RawStatement select)
+    {
+        if (select.parameters.orderings != null && !select.parameters.orderings.isEmpty())
+            throw invalidRequest(NO_ORDER_BY_IN_TXNS_MESSAGE, "SELECT", select.source);
+        if (select.parameters.groups != null && !select.parameters.groups.isEmpty())
+            throw invalidRequest(NO_GROUP_BY_IN_TXNS_MESSAGE, "SELECT", select.source);
+    }
+
+    private static void validate(SelectStatement prepared)
+    {
+        if (!prepared.table.isAccordEnabled())
+            throw invalidRequest(TRANSACTIONS_DISABLED_ON_TABLE_MESSAGE, "SELECT", prepared.source);
+        if (prepared.table.params.pendingDrop)
+            throw invalidRequest(TRANSACTIONS_DISABLED_ON_TABLE_BEING_DROPPED_MESSAGE, "SELECT", prepared.source);
+        if (prepared.table.isCounter())
+            throw invalidRequest(NO_COUNTERS_IN_TXNS_MESSAGE, "SELECT", prepared.source);
+        if (prepared.hasAggregation())
+            throw invalidRequest(NO_AGGREGATION_IN_TXNS_MESSAGE, "SELECT", prepared.source);
+
+        // when "LIMIT ?" this check can't be performed, so need to do again once the options are known
+        if (prepared.getRestrictions().keyIsInRelation())
+            checkTrue(prepared.isLimitMarker() || prepared.getLimit(null) == DataLimits.NO_LIMIT, NO_PARTITION_IN_CLAUSE_WITH_LIMIT, "SELECT", prepared.source);
+    }
+
+    public static class Parsed extends QualifiedStatement.Composite
+    {
+        private final List<SelectStatement.RawStatement> assignments;
+        private final SelectStatement.RawStatement select;
+        private final List<RowDataReference.Raw> returning;
+        private final List<List<ModificationStatement.Parsed>> groupedUpdates;
+        private final List<List<ConditionStatement.Raw>> groupedConditions;
+        private final List<RowDataReference.Raw> dataReferences;
+
+        public Parsed(List<SelectStatement.RawStatement> assignments,
+                      SelectStatement.RawStatement select,
+                      List<RowDataReference.Raw> returning,
+                      List<List<ModificationStatement.Parsed>> groupedUpdates,
+                      List<List<ConditionStatement.Raw>> groupedConditions,
+                      List<RowDataReference.Raw> dataReferences)
+        {
+            this.assignments = assignments;
+            this.select = select;
+            this.returning = returning;
+            this.groupedUpdates = groupedUpdates;
+            this.groupedConditions = groupedConditions;
+            this.dataReferences = dataReferences;
+        }
+
+        @Override
+        protected Iterable<? extends QualifiedStatement> getStatements()
+        {
+            Iterable<QualifiedStatement> group = Iterables.concat(assignments, Iterables.concat(groupedUpdates));
+            if (select != null)
+                group = Iterables.concat(group, Collections.singleton(select));
+            return group;
+        }
+
+        @Override
+        public CQLStatement prepare(ClientState state)
+        {
+            checkFalse(groupedUpdates.isEmpty() && returning == null && select == null, EMPTY_TRANSACTION_MESSAGE);
+            Invariants.require(groupedUpdates.size() == groupedConditions.size() + 1 || groupedUpdates.size() == groupedConditions.size());
+            if (select != null || returning != null)
+                checkTrue(select != null ^ returning != null, "Cannot specify both a full SELECT and a SELECT w/ LET references.");
+
+            bindVariables.setSaveTargetOwners(true);
+            List<NamedSelect> preparedAssignments = new ArrayList<>(assignments.size());
+            Map<Integer, RowDataReference.ReferenceSource> refSources = new HashMap<>();
+            Set<String> selectNames = new HashSet<>();
+
+            int userReadIndex = 0;
+            Map<String, Integer> nameToTxnDataName = new HashMap<>();
+            for (SelectStatement.RawStatement select : assignments)
+            {
+                checkNotNull(select.parameters.refName, "Assignments must be named");
+                int name = txnDataName(USER, userReadIndex++);
+                nameToTxnDataName.put(select.parameters.refName, name);
+                checkTrue(selectNames.add(select.parameters.refName), DUPLICATE_TUPLE_NAME_MESSAGE, select.parameters.refName);
+                validate(select);
+
+                SelectStatement prepared = select.prepare(bindVariables);
+                validate(prepared);
+
+                NamedSelect namedSelect = new NamedSelect(name, prepared);
+                checkAtMostOneRowSpecified(namedSelect.select, "LET assignment " + select.parameters.refName);
+                preparedAssignments.add(namedSelect);
+                refSources.put(name, new SelectReferenceSource(prepared));
+            }
+
+            if (dataReferences != null)
+                for (RowDataReference.Raw reference : dataReferences)
+                    reference.resolveReference(refSources, nameToTxnDataName, userReadIndex++);
+
+            NamedSelect returningSelect = null;
+            if (select != null)
+            {
+                validate(select);
+                SelectStatement prepared = select.prepare(bindVariables);
+                validate(prepared);
+                returningSelect = new NamedSelect(txnDataName(RETURNING), prepared);
+                checkAtMostOnePartitionSpecified(returningSelect.select, "returning select");
+            }
+
+            List<RowDataReference> returningReferences = null;
+
+            if (returning != null)
+            {
+                // TODO: Eliminate/modify this check if we allow full tuple selections.
+                returningReferences = returning.stream().peek(raw -> checkTrue(raw.column() != null, SELECT_REFS_NEED_COLUMN_MESSAGE))
+                                                        .map(RowDataReference.Raw::prepareAsReceiver)
+                                                        .collect(Collectors.toList());
+            }
+
+            List<List<ModificationStatement>> preparedUpdates = new ArrayList<>(groupedUpdates.size());
+            for (List<ModificationStatement.Parsed> update : groupedUpdates)
+            {
+                List<ModificationStatement> preparedUpdate = new ArrayList<>(update.size());
+
+                // check for any read-before-write updates
+                for (ModificationStatement.Parsed parsed : update)
+                {
+                    ModificationStatement prepared = parsed.prepare(state, bindVariables);
+                    checkTrue(prepared.metadata().isAccordEnabled(), TRANSACTIONS_DISABLED_ON_TABLE_MESSAGE, prepared.type, prepared.source);
+                    checkFalse(prepared.metadata().params.pendingDrop, TRANSACTIONS_DISABLED_ON_TABLE_BEING_DROPPED_MESSAGE, prepared.type, prepared.source);
+                    checkFalse(prepared.hasConditions(), NO_CONDITIONS_IN_UPDATES_MESSAGE, prepared.type, prepared.source);
+                    checkFalse(prepared.isTimestampSet(), NO_TIMESTAMPS_IN_UPDATES_MESSAGE, prepared.type, prepared.source);
+                    checkFalse(prepared.attrs.isTimeToLiveSet(), NO_TTLS_IN_UPDATES_MESSAGE, prepared.type, prepared.source);
+
+                    if (prepared.metadata().isCounter())
+                        throw invalidRequest(NO_COUNTERS_IN_TXNS_MESSAGE, prepared.type, prepared.source);
+
+                    preparedUpdate.add(prepared);
+                }
+
+                preparedUpdates.add(preparedUpdate);
+            }
+
+            List<List<ConditionStatement>> preparedConditions = new ArrayList<>(groupedConditions.size());
+            for (List<ConditionStatement.Raw> condition : groupedConditions)
+            {
+                List<ConditionStatement> preparedCondition = new ArrayList<>(condition.size());
+                for (ConditionStatement.Raw raw : condition)
+                    // TODO: If we eventually support IF ks.function(ref) THEN, the keyspace will have to be provided here
+                    preparedCondition.add(raw.prepare("[txn]", bindVariables));
+
+                preparedConditions.add(preparedCondition);
+            }
+
+            return new TransactionStatement(preparedAssignments, returningSelect, returningReferences, preparedUpdates, preparedConditions, bindVariables);
+        }
+
+        /**
+         * Do not use this method in execution!!! It is only allowed during prepare because it outputs a query raw text.
+         * We don't want it print it for a user who provided an identifier of someone's else prepared statement.
+         */
+        private static void checkAtMostOnePartitionSpecified(SelectStatement select, String name)
+        {
+            checkTrue(select.getRestrictions().hasPartitionKeyRestrictions(), INCOMPLETE_PARTITION_KEY_SELECT_MESSAGE, name, select.source);
+        }
+
+        /**
+         * Do not use this method in execution!!! It is only allowed during prepare because it outputs a query raw text.
+         * We don't want it print it for a user who provided an identifier of someone's else prepared statement.
+         */
+        private static void checkAtMostOneRowSpecified(SelectStatement select, String name)
+        {
+            checkFalse(select.isPartitionRangeQuery(), ILLEGAL_RANGE_QUERY_MESSAGE, name, select.source);
+            checkFalse(isSelectingMultipleClusterings(select, null), INCOMPLETE_PRIMARY_KEY_SELECT_MESSAGE, name, select.source);
+        }
+    }
+}

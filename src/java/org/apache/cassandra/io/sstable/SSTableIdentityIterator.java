@@ -17,191 +17,302 @@
  */
 package org.apache.cassandra.io.sstable;
 
-import java.io.*;
-import java.util.Iterator;
+import java.io.IOError;
+import java.io.IOException;
 
-import org.apache.cassandra.serializers.MarshalException;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.db.*;
-import org.apache.cassandra.db.columniterator.OnDiskAtomIterator;
+import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.DeletionTime;
+import org.apache.cassandra.db.RegularAndStaticColumns;
+import org.apache.cassandra.db.UnfilteredValidation;
+import org.apache.cassandra.db.rows.DeserializationHelper;
+import org.apache.cassandra.db.rows.EncodingStats;
+import org.apache.cassandra.db.rows.Row;
+import org.apache.cassandra.db.rows.Unfiltered;
+import org.apache.cassandra.db.rows.UnfilteredRowIterator;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.io.util.FileDataInput;
 import org.apache.cassandra.io.util.RandomAccessReader;
+import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.utils.ByteBufferUtil;
 
-public class SSTableIdentityIterator implements Comparable<SSTableIdentityIterator>, OnDiskAtomIterator
+import static org.apache.cassandra.utils.vint.VIntCoding.VIntOutOfRangeException;
+
+public class SSTableIdentityIterator implements Comparable<SSTableIdentityIterator>, UnfilteredRowIterator
 {
-    private static final Logger logger = LoggerFactory.getLogger(SSTableIdentityIterator.class);
-
+    private final SSTableReader sstable;
     private final DecoratedKey key;
-    private final DataInput in;
-    public final long dataSize; // we [still] require this so compaction can tell if it's safe to read the row into memory
-    public final ColumnSerializer.Flag flag;
-
-    private final ColumnFamily columnFamily;
-    private final int columnCount;
-
-    private final Iterator<OnDiskAtom> atomIterator;
-    private final Descriptor.Version dataVersion;
-
-    // Used by lazilyCompactedRow, so that we see the same things when deserializing the first and second time
-    private final int expireBefore;
-
-    private final boolean validateColumns;
+    private final DeletionTime partitionLevelDeletion;
     private final String filename;
 
-    /**
-     * Used to iterate through the columns of a row.
-     * @param sstable SSTable we are reading ffrom.
-     * @param file Reading using this file.
-     * @param key Key of this row.
-     * @param dataSize length of row data
-     * @throws IOException
-     */
-    public SSTableIdentityIterator(SSTableReader sstable, RandomAccessReader file, DecoratedKey key, long dataSize)
-    {
-        this(sstable, file, key, dataSize, false);
-    }
+    protected final SSTableSimpleIterator iterator;
+    private final Row staticRow;
+    boolean isClosed = false;
 
-    /**
-     * Used to iterate through the columns of a row.
-     * @param sstable SSTable we are reading ffrom.
-     * @param file Reading using this file.
-     * @param key Key of this row.
-     * @param dataSize length of row data
-     * @param checkData if true, do its best to deserialize and check the coherence of row data
-     */
-    public SSTableIdentityIterator(SSTableReader sstable, RandomAccessReader file, DecoratedKey key, long dataSize, boolean checkData)
+    public SSTableIdentityIterator(SSTableReader sstable, DecoratedKey key, DeletionTime partitionLevelDeletion,
+            String filename, SSTableSimpleIterator iterator) throws IOException
     {
-        this(sstable.metadata, file, file.getPath(), key, dataSize, checkData, sstable, ColumnSerializer.Flag.LOCAL);
-    }
-
-    // sstable may be null *if* checkData is false
-    // If it is null, we assume the data is in the current file format
-    private SSTableIdentityIterator(CFMetaData metadata,
-                                    DataInput in,
-                                    String filename,
-                                    DecoratedKey key,
-                                    long dataSize,
-                                    boolean checkData,
-                                    SSTableReader sstable,
-                                    ColumnSerializer.Flag flag)
-    {
-        assert !checkData || (sstable != null);
-        this.in = in;
-        this.filename = filename;
+        super();
+        this.sstable = sstable;
         this.key = key;
-        this.dataSize = dataSize;
-        this.expireBefore = (int)(System.currentTimeMillis() / 1000);
-        this.flag = flag;
-        this.validateColumns = checkData;
-        this.dataVersion = sstable == null ? Descriptor.Version.CURRENT : sstable.descriptor.version;
+        this.partitionLevelDeletion = partitionLevelDeletion;
+        this.filename = filename;
+        this.iterator = iterator;
+        this.staticRow = iterator.readStaticRow();
+    }
 
+    public static SSTableIdentityIterator create(SSTableReader sstable, RandomAccessReader file, DecoratedKey key)
+    {
+        return create(sstable, sstable.metadata(), file, key);
+    }
+
+    public static SSTableIdentityIterator create(SSTableReader sstable, TableMetadata tableMetadata, RandomAccessReader file, DecoratedKey key)
+    {
         try
         {
-            columnFamily = EmptyColumns.factory.create(metadata);
-            columnFamily.delete(DeletionTime.serializer.deserialize(in));
-            columnCount = dataVersion.hasRowSizeAndColumnCount ? in.readInt() : Integer.MAX_VALUE;
-            atomIterator = columnFamily.metadata().getOnDiskIterator(in, columnCount, dataVersion);
+            DeletionTime partitionLevelDeletion = DeletionTime.getSerializer(sstable.descriptor.version).deserialize(file);
+            if (!partitionLevelDeletion.validate())
+                UnfilteredValidation.handleInvalid(tableMetadata, key, sstable, "partitionLevelDeletion="+partitionLevelDeletion.toString());
+            DeserializationHelper helper = new DeserializationHelper(tableMetadata, sstable.descriptor.version.correspondingMessagingVersion(), DeserializationHelper.Flag.LOCAL);
+            SSTableSimpleIterator iterator = SSTableSimpleIterator.create(tableMetadata, file, sstable.header, helper, partitionLevelDeletion);
+            return new SSTableIdentityIterator(sstable, key, partitionLevelDeletion, file.getPath(), iterator);
         }
         catch (IOException e)
         {
-            if (sstable != null)
-                sstable.markSuspect();
-            throw new CorruptSSTableException(e, filename);
+            sstable.markSuspect();
+            throw new CorruptSSTableException(e, file.getPath());
+        }
+        catch (CorruptSSTableException e) // to ensure that we marked the sstable as suspected if CorruptSSTableException is thrown from lower levels
+        {
+            sstable.markSuspect();
+            throw e;
         }
     }
 
-    public DecoratedKey getKey()
+    public static SSTableIdentityIterator create(SSTableReader sstable, FileDataInput dfile, long dataPosition, DecoratedKey key, boolean tombstoneOnly)
+    {
+        return create(sstable, sstable.metadata(), dfile, dataPosition, key, tombstoneOnly);
+    }
+
+    public static SSTableIdentityIterator create(SSTableReader sstable, TableMetadata tableMetadata, FileDataInput dfile, long dataPosition, DecoratedKey key, boolean tombstoneOnly)
+    {
+        try
+        {
+            dfile.seek(dataPosition);
+            ByteBufferUtil.skipShortLength(dfile); // Skip partition key
+            DeletionTime partitionLevelDeletion = DeletionTime.getSerializer(sstable.descriptor.version).deserialize(dfile);
+            if (!partitionLevelDeletion.validate())
+                UnfilteredValidation.handleInvalid(tableMetadata, key, sstable, "partitionLevelDeletion="+partitionLevelDeletion.toString());
+
+            DeserializationHelper helper = new DeserializationHelper(tableMetadata, sstable.descriptor.version.correspondingMessagingVersion(), DeserializationHelper.Flag.LOCAL);
+            SSTableSimpleIterator iterator = tombstoneOnly
+                    ? SSTableSimpleIterator.createTombstoneOnly(tableMetadata, dfile, sstable.header, helper, partitionLevelDeletion)
+                    : SSTableSimpleIterator.create(tableMetadata, dfile, sstable.header, helper, partitionLevelDeletion);
+            return new SSTableIdentityIterator(sstable, key, partitionLevelDeletion, dfile.getPath(), iterator);
+        }
+        catch (IOException e)
+        {
+            sstable.markSuspect();
+            throw new CorruptSSTableException(e, dfile.getPath());
+        }
+        catch (CorruptSSTableException e) // to ensure that we marked the sstable as suspected if CorruptSSTableException is thrown from lower levels
+        {
+            sstable.markSuspect();
+            throw e;
+        }
+    }
+
+    public static SSTableIdentityIterator create(SSTableReader sstable, FileDataInput dfile, boolean tombstoneOnly)
+    {
+        return create(sstable, sstable.metadata(), dfile, tombstoneOnly);
+    }
+
+    public static SSTableIdentityIterator create(SSTableReader sstable, TableMetadata tableMetadata, FileDataInput dfile, boolean tombstoneOnly)
+    {
+        try
+        {
+            DecoratedKey key = sstable.decorateKey(ByteBufferUtil.readWithShortLength(dfile));
+            DeletionTime partitionLevelDeletion = DeletionTime.getSerializer(sstable.descriptor.version).deserialize(dfile);
+            if (!partitionLevelDeletion.validate())
+                UnfilteredValidation.handleInvalid(tableMetadata, key, sstable, "partitionLevelDeletion="+partitionLevelDeletion.toString());
+
+            DeserializationHelper helper = new DeserializationHelper(tableMetadata, sstable.descriptor.version.correspondingMessagingVersion(), DeserializationHelper.Flag.LOCAL);
+            SSTableSimpleIterator iterator = tombstoneOnly
+                                             ? SSTableSimpleIterator.createTombstoneOnly(tableMetadata, dfile, sstable.header, helper, partitionLevelDeletion)
+                                             : SSTableSimpleIterator.create(tableMetadata, dfile, sstable.header, helper, partitionLevelDeletion);
+            return new SSTableIdentityIterator(sstable, key, partitionLevelDeletion, dfile.getPath(), iterator);
+        }
+        catch (IOException e)
+        {
+            sstable.markSuspect();
+            throw new CorruptSSTableException(e, dfile.getPath());
+        }
+        catch (CorruptSSTableException e) // to ensure that we marked the sstable as suspected if CorruptSSTableException is thrown from lower levels
+        {
+            sstable.markSuspect();
+            throw e;
+        }
+    }
+
+    public TableMetadata metadata()
+    {
+        return iterator.metadata;
+    }
+
+    public RegularAndStaticColumns columns()
+    {
+        return metadata().regularAndStaticColumns();
+    }
+
+    public boolean isReverseOrder()
+    {
+        return false;
+    }
+
+    public DecoratedKey partitionKey()
     {
         return key;
     }
 
-    public ColumnFamily getColumnFamily()
+    public DeletionTime partitionLevelDeletion()
     {
-        return columnFamily;
+        return partitionLevelDeletion;
+    }
+
+    public Row staticRow()
+    {
+        return staticRow;
     }
 
     public boolean hasNext()
     {
         try
         {
-            return atomIterator.hasNext();
+            return iterator.hasNext();
+        }
+        catch (IndexOutOfBoundsException | VIntOutOfRangeException | AssertionError e)
+        {
+            sstable.markSuspect();
+            throw new CorruptSSTableException(e, filename);
+        }
+        catch (CorruptSSTableException e) // to ensure that we marked the sstable as suspected if CorruptSSTableException is thrown from lower levels
+        {
+            sstable.markSuspect();
+            throw e;
         }
         catch (IOError e)
         {
-            // catch here b/c atomIterator is an AbstractIterator; hasNext reads the value
             if (e.getCause() instanceof IOException)
-                throw new CorruptSSTableException((IOException)e.getCause(), filename);
+            {
+                sstable.markSuspect();
+                throw new CorruptSSTableException((Exception)e.getCause(), filename);
+            }
             else
+            {
                 throw e;
+            }
         }
     }
 
-    public OnDiskAtom next()
+    public Unfiltered next()
     {
         try
         {
-            OnDiskAtom atom = atomIterator.next();
-            if (validateColumns)
-                atom.validateFields(columnFamily.metadata());
-            return atom;
+            if (isClosed)
+                throw new IllegalStateException("Iterator used after closing.");
+
+            return doCompute();
         }
-        catch (MarshalException me)
+        catch (IndexOutOfBoundsException | VIntOutOfRangeException | AssertionError e)
         {
-            throw new CorruptSSTableException(me, filename);
+            sstable.markSuspect();
+            throw new CorruptSSTableException(e, filename);
+        }
+        catch (CorruptSSTableException e) // to ensure that we marked the sstable as suspected if CorruptSSTableException is thrown from lower levels
+        {
+            sstable.markSuspect();
+            throw e;
+        }
+        catch (IOError e)
+        {
+            if (e.getCause() instanceof IOException)
+            {
+                sstable.markSuspect();
+                throw new CorruptSSTableException((Exception)e.getCause(), filename);
+            }
+            else
+            {
+                throw e;
+            }
         }
     }
 
-    public void remove()
+    protected Unfiltered doCompute()
     {
-        throw new UnsupportedOperationException();
+        Unfiltered unfiltered = iterator.next();
+        UnfilteredValidation.maybeValidateUnfiltered(unfiltered, metadata(), key, sstable);
+        return unfiltered;
     }
 
     public void close()
     {
         // creator is responsible for closing file when finished
+        isClosed = true;
+    }
+
+    public boolean isClosed()
+    {
+        return isClosed;
+    }
+
+    /**
+     * Called to advance to the next partition and make sure that we process all outstanding rows if user did not
+     * do so. Unlike next() and hasNext(), this can and will be called after the iterator is closed.
+     */
+    public void exhaust()
+    {
+        try
+        {
+            while (iterator.hasNext())
+                iterator.next();
+        }
+        catch (IndexOutOfBoundsException | VIntOutOfRangeException | AssertionError e)
+        {
+            sstable.markSuspect();
+            throw new CorruptSSTableException(e, filename);
+        }
+        catch (CorruptSSTableException e) // to ensure that we marked the sstable as suspected if CorruptSSTableException is thrown from lower levels
+        {
+            sstable.markSuspect();
+            throw e;
+        }
+        catch (IOError e)
+        {
+            if (e.getCause() instanceof IOException)
+            {
+                sstable.markSuspect();
+                throw new CorruptSSTableException((Exception)e.getCause(), filename);
+            }
+            else
+            {
+                throw e;
+            }
+        }
     }
 
     public String getPath()
     {
-        // if input is from file, then return that path, otherwise it's from streaming
-        if (in instanceof RandomAccessReader)
-        {
-            RandomAccessReader file = (RandomAccessReader) in;
-            return file.getPath();
-        }
-        else
-        {
-            throw new UnsupportedOperationException();
-        }
+        return filename;
     }
 
-    public ColumnFamily getColumnFamilyWithColumns(ColumnFamily.Factory containerFactory)
+    public EncodingStats stats()
     {
-        ColumnFamily cf = columnFamily.cloneMeShallow(containerFactory, false);
-        // since we already read column count, just pass that value and continue deserialization
-        Iterator<OnDiskAtom> iter = cf.metadata().getOnDiskIterator(in, columnCount, flag, expireBefore, dataVersion);
-        while (iter.hasNext())
-            cf.addAtom(iter.next());
-
-        if (validateColumns)
-        {
-            try
-            {
-                cf.metadata().validateColumns(cf);
-            }
-            catch (MarshalException e)
-            {
-                throw new RuntimeException("Error validating row " + key, e);
-            }
-        }
-        return cf;
+        // We could return sstable.header.stats(), but this may not be as accurate than the actual sstable stats (see
+        // SerializationHeader.make() for details) so we use the latter instead.
+        return sstable.stats();
     }
 
     public int compareTo(SSTableIdentityIterator o)
     {
         return key.compareTo(o.key);
     }
-
 }

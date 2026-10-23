@@ -17,10 +17,51 @@
  */
 package org.apache.cassandra.utils;
 
-import java.io.Closeable;
 import java.util.Iterator;
+import java.util.NoSuchElementException;
 
 // so we can instantiate anonymous classes implementing both interfaces
 public interface CloseableIterator<T> extends Iterator<T>, Closeable
 {
+    public static <T> CloseableIterator<T> wrap(Iterator<T> iter)
+    {
+        return new CloseableIterator<T>()
+        {
+            public void close()
+            {
+                // noop
+            }
+
+            public boolean hasNext()
+            {
+                return iter.hasNext();
+            }
+
+            public T next()
+            {
+                return iter.next();
+            }
+        };
+    }
+
+    public static <T> CloseableIterator<T> empty()
+    {
+        return new CloseableIterator<T>()
+        {
+            public void close()
+            {
+                // noop
+            }
+
+            public boolean hasNext()
+            {
+                return false;
+            }
+
+            public T next()
+            {
+                throw new NoSuchElementException();
+            }
+        };
+    }
 }

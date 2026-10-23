@@ -17,59 +17,121 @@
  */
 package org.apache.cassandra.db.compaction;
 
+import java.util.Iterator;
 import java.util.Set;
 
-import org.apache.cassandra.db.ColumnFamilyStore;
-import org.apache.cassandra.db.Directories;
-import org.apache.cassandra.db.compaction.CompactionManager.CompactionExecutorStatsCollector;
-import org.apache.cassandra.io.sstable.SSTableReader;
-import org.apache.cassandra.io.util.DiskAwareRunnable;
+import com.google.common.base.Preconditions;
 
-public abstract class AbstractCompactionTask extends DiskAwareRunnable
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.lifecycle.ILifecycleTransaction;
+import org.apache.cassandra.io.FSDiskFullWriteError;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.utils.TimeUUID;
+import org.apache.cassandra.utils.WrappedRunnable;
+
+public abstract class AbstractCompactionTask extends WrappedRunnable
 {
     protected final ColumnFamilyStore cfs;
-    protected Iterable<SSTableReader> sstables;
+    protected ILifecycleTransaction transaction;
     protected boolean isUserDefined;
     protected OperationType compactionType;
 
     /**
      * @param cfs
-     * @param sstables must be marked compacting
+     * @param transaction the modifying managing the status of the sstables we're replacing
      */
-    public AbstractCompactionTask(ColumnFamilyStore cfs, Iterable<SSTableReader> sstables)
+    public AbstractCompactionTask(ColumnFamilyStore cfs, ILifecycleTransaction transaction)
     {
         this.cfs = cfs;
-        this.sstables = sstables;
+        this.transaction = transaction;
         this.isUserDefined = false;
         this.compactionType = OperationType.COMPACTION;
 
-        // enforce contract that caller should mark sstables compacting
-        Set<SSTableReader> compacting = cfs.getDataTracker().getCompacting();
-        for (SSTableReader sstable : sstables)
-            assert compacting.contains(sstable) : sstable.getFilename() + " is not correctly marked compacting";
+        try
+        {
+            if (!transaction.isOffline())
+            {
+                // enforce contract that caller should mark sstables compacting
+                Set<SSTableReader> compacting = cfs.getTracker().getCompacting();
+                for (SSTableReader sstable : transaction.originals())
+                    assert compacting.contains(sstable) : sstable.getFilename() + " is not correctly marked compacting";
+            }
+
+            validateSSTables(transaction.originals());
+        }
+        catch (Throwable err)
+        {
+            rejected();
+            throw err;
+        }
+    }
+
+    /**
+     * Confirm that we're not attempting to compact repaired/unrepaired/pending repair sstables together
+     */
+    private void validateSSTables(Set<SSTableReader> sstables)
+    {
+        // do not allow sstables in different repair states to be compacted together
+        if (!sstables.isEmpty())
+        {
+            Iterator<SSTableReader> iter = sstables.iterator();
+            SSTableReader first = iter.next();
+            boolean isRepaired = first.isRepaired();
+            TimeUUID pendingRepair = first.getPendingRepair();
+            while (iter.hasNext())
+            {
+                SSTableReader next = iter.next();
+                Preconditions.checkArgument(isRepaired == next.isRepaired(),
+                                            "Cannot compact repaired and unrepaired sstables");
+
+                if (pendingRepair == null)
+                {
+                    Preconditions.checkArgument(!next.isPendingRepair(),
+                                                "Cannot compact pending repair and non-pending repair sstables");
+                }
+                else
+                {
+                    Preconditions.checkArgument(next.isPendingRepair(),
+                                                "Cannot compact pending repair and non-pending repair sstables");
+                    Preconditions.checkArgument(pendingRepair.equals(next.getPendingRepair()),
+                                                "Cannot compact sstables from different pending repairs");
+                }
+            }
+        }
     }
 
     /**
      * executes the task and unmarks sstables compacting
      */
-    public int execute(CompactionExecutorStatsCollector collector)
+    public void execute(ActiveCompactionsTracker activeCompactions)
     {
         try
         {
-            return executeInternal(collector);
+            executeInternal(activeCompactions);
+        }
+        catch(FSDiskFullWriteError e)
+        {
+            RuntimeException cause = new RuntimeException("Converted from FSDiskFullWriteError: " + e.getMessage());
+            cause.setStackTrace(e.getStackTrace());
+            throw new RuntimeException("Throwing new Runtime to bypass exception handler when disk is full", cause);
         }
         finally
         {
-            cfs.getDataTracker().unmarkCompacting(sstables);
+            cleanup();
         }
     }
 
-    protected abstract int executeInternal(CompactionExecutorStatsCollector collector);
-
-    protected Directories getDirectories()
+    protected void cleanup()
     {
-        return cfs.directories;
+        transaction.close();
     }
+
+    public void rejected()
+    {
+        cleanup();
+    }
+
+    protected abstract void executeInternal(ActiveCompactionsTracker activeCompactions);
 
     public AbstractCompactionTask setUserDefined(boolean isUserDefined)
     {
@@ -85,6 +147,6 @@ public abstract class AbstractCompactionTask extends DiskAwareRunnable
 
     public String toString()
     {
-        return "CompactionTask(" + sstables + ")";
+        return "CompactionTask(" + transaction + ")";
     }
 }

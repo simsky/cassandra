@@ -24,6 +24,7 @@
 	<property name="cassandra.classes" value="${cassandra.dir}/build/classes/main" />
 	<property name="build.src" value="${basedir}/src" />
 	<property name="build.dir" value="${basedir}/build" />
+	<property name="conf.dir" value="${basedir}/conf" />
 	<property name="build.classes" value="${build.dir}/classes" />
 	<property name="final.name" value="trigger-example" />
 
@@ -50,10 +51,18 @@
 	<target name="jar" depends="build">
 		<jar jarfile="${build.dir}/${final.name}.jar">
 			<fileset dir="${build.classes}" />
+			<fileset dir="${conf.dir}">
+				<include name="**/*.properties" />
+			</fileset>
 		</jar>
+	</target>
+
+	<target name="install" depends="jar">
+		<copy verbose="true" file="${build.dir}/${final.name}.jar" todir="${cassandra.dir}/conf/triggers" overwrite="true"/>
 	</target>
 
 	<target name="clean">
 		<delete dir="${build.dir}" />
+		<delete file="${cassandra.dir}/conf/triggers/${final.name}.jar"/>
 	</target>
 </project>

@@ -21,6 +21,7 @@ import java.util.EnumSet;
 import java.util.Set;
 
 import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.Sets;
 
 /**
  * An enum encapsulating the set of possible permissions that an authenticated user can have on a resource.
@@ -30,28 +31,45 @@ import com.google.common.collect.ImmutableSet;
  */
 public enum Permission
 {
-    @Deprecated
-    READ,
-    @Deprecated
-    WRITE,
-
-    // schema management
-    CREATE, // required for CREATE KEYSPACE and CREATE TABLE.
-    ALTER,  // required for ALTER KEYSPACE, ALTER TABLE, CREATE INDEX, DROP INDEX.
-    DROP,   // required for DROP KEYSPACE and DROP TABLE.
+    // schema and role management
+    // CREATE, ALTER and DROP permissions granted on an appropriate DataResource are required for
+    // CREATE KEYSPACE and CREATE TABLE.
+    // ALTER KEYSPACE, ALTER TABLE, CREATE INDEX and DROP INDEX require ALTER permission on the
+    // relevant DataResource.
+    // DROP KEYSPACE and DROP TABLE require DROP permission.
+    //
+    // In the context of Role management, these permissions may also be granted on a RoleResource.
+    // CREATE is only granted on the root-level role resource, and is required to create new roles.
+    // ALTER & DROP may be granted on either the root-level role resource, giving permissions on
+    // all roles, or on specific role-level resources.
+    CREATE,
+    ALTER,
+    DROP,
 
     // data access
-    SELECT, // required for SELECT.
-    MODIFY, // required for INSERT, UPDATE, DELETE, TRUNCATE.
+    SELECT, // required for SELECT on a table
+    MODIFY, // required for INSERT, UPDATE, DELETE, TRUNCATE on a DataResource.
 
     // permission management
-    AUTHORIZE; // required for GRANT and REVOKE.
+    AUTHORIZE, // required for GRANT and REVOKE of permissions or roles.
 
+    DESCRIBE, // required on the root-level RoleResource to list all Roles
 
-    public static final Set<Permission> ALL_DATA =
-            ImmutableSet.copyOf(EnumSet.range(Permission.CREATE, Permission.AUTHORIZE));
+    // UDF permissions
+    EXECUTE,  // required to invoke any user defined function or aggregate
+
+    UNMASK, // required to see masked data
+
+    SELECT_MASKED; // required for SELECT on a table with restictions on masked columns
 
     public static final Set<Permission> ALL =
-            ImmutableSet.copyOf(EnumSet.range(Permission.CREATE, Permission.AUTHORIZE));
+            Sets.immutableEnumSet(EnumSet.range(Permission.CREATE, Permission.SELECT_MASKED));
     public static final Set<Permission> NONE = ImmutableSet.of();
+
+    /**
+     * Set of Permissions which may never be granted on any system keyspace, or table in a system keyspace, to any role.
+     * (Only SELECT, DESCRIBE and ALTER may ever be granted).
+     */
+    public static final Set<Permission> INVALID_FOR_SYSTEM_KEYSPACES =
+            Sets.immutableEnumSet(EnumSet.complementOf(EnumSet.of(Permission.SELECT, Permission.DESCRIBE, Permission.ALTER)));
 }

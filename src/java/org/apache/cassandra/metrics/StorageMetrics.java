@@ -17,18 +17,50 @@
  */
 package org.apache.cassandra.metrics;
 
-import com.yammer.metrics.Metrics;
-import com.yammer.metrics.core.Counter;
+import java.util.function.ToLongFunction;
+import java.util.stream.StreamSupport;
+
+import com.codahale.metrics.Counter;
+import com.codahale.metrics.Gauge;
+import com.codahale.metrics.Meter;
+
+import org.apache.cassandra.db.Keyspace;
+
+import static org.apache.cassandra.metrics.CassandraMetricsRegistry.Metrics;
 
 /**
  * Metrics related to Storage.
  */
 public class StorageMetrics
 {
-    private static final MetricNameFactory factory = new DefaultNameFactory("Storage");
+    public static final String TYPE_NAME = "Storage";
+    public static final MetricNameFactory factory = new DefaultNameFactory("Storage");
 
-    public static final Counter load = Metrics.newCounter(factory.createMetricName("Load"));
-    public static final Counter exceptions = Metrics.newCounter(factory.createMetricName("Exceptions"));
-    public static final Counter totalHintsInProgress  = Metrics.newCounter(factory.createMetricName("TotalHintsInProgress"));
-    public static final Counter totalHints = Metrics.newCounter(factory.createMetricName("TotalHints"));
+    public static final Counter load = Metrics.counter(factory.createMetricName("Load"));
+    public static final Counter uncompressedLoad = Metrics.counter(factory.createMetricName("UncompressedLoad"));
+
+    public static final Gauge<Long> unreplicatedLoad =
+        createSummingGauge("UnreplicatedLoad", metric -> metric.unreplicatedLiveDiskSpaceUsed.getValue());
+    public static final Gauge<Long> unreplicatedUncompressedLoad =
+        createSummingGauge("UnreplicatedUncompressedLoad", metric -> metric.unreplicatedUncompressedLiveDiskSpaceUsed.getValue());
+
+    public static final Counter uncaughtExceptions = Metrics.counter(factory.createMetricName("Exceptions"));
+    // NOTE: we read totalHintsInProgress counter value as a part of write hot path, so an alternative implementation is used here
+    public static final Counter totalHintsInProgress  = Metrics.atomicLongCounter(factory.createMetricName("TotalHintsInProgress"));
+    public static final Counter totalHints = Metrics.counter(factory.createMetricName("TotalHints"));
+    public static final Counter repairExceptions = Metrics.counter(factory.createMetricName("RepairExceptions"));
+    public static final Counter totalOpsForInvalidToken = Metrics.counter(factory.createMetricName("TotalOpsForInvalidToken"));
+    public static final Counter startupOpsForInvalidToken = Metrics.counter(factory.createMetricName("StartupOpsForInvalidToken"));
+    public static final Meter bootstrapFilesThroughputMetric = Metrics.meter(factory.createMetricName("BootstrapFilesThroughput"));
+
+    public static final Counter directWriteBufferBytes = Metrics.counter(factory.createMetricName("DirectWriteBufferBytes"));
+    public static final Meter directWriteBuffersAllocated = Metrics.meter(factory.createMetricName("DirectWriteBuffersAllocated"));
+
+    private static Gauge<Long> createSummingGauge(String name, ToLongFunction<KeyspaceMetrics> extractor)
+    {
+        return Metrics.register(factory.createMetricName(name),
+                                () -> StreamSupport.stream(Keyspace.all().spliterator(), false)
+                                                   .mapToLong(keyspace -> extractor.applyAsLong(keyspace.metric))
+                                                   .sum());
+    }
 }

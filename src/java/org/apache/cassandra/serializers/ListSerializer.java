@@ -20,23 +20,35 @@ package org.apache.cassandra.serializers;
 
 import java.nio.BufferUnderflowException;
 import java.nio.ByteBuffer;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.function.Predicate;
+
+import com.google.common.base.Preconditions;
+import com.google.common.collect.Range;
+
+import org.apache.cassandra.db.TypeSizes;
+import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.db.marshal.ByteBufferAccessor;
+import org.apache.cassandra.db.marshal.ValueAccessor;
+import org.apache.cassandra.utils.ByteBufferUtil;
 
 public class ListSerializer<T> extends CollectionSerializer<List<T>>
 {
     // interning instances
-    private static final Map<TypeSerializer<?>, ListSerializer> instances = new HashMap<TypeSerializer<?>, ListSerializer>();
+    @SuppressWarnings("rawtypes")
+    private static final ConcurrentMap<TypeSerializer<?>, ListSerializer> instances = new ConcurrentHashMap<>();
 
     public final TypeSerializer<T> elements;
 
-    public static synchronized <T> ListSerializer<T> getInstance(TypeSerializer<T> elements)
+    @SuppressWarnings("unchecked")
+    public static <T> ListSerializer<T> getInstance(TypeSerializer<T> elements)
     {
         ListSerializer<T> t = instances.get(elements);
         if (t == null)
-        {
-            t = new ListSerializer<T>(elements);
-            instances.put(elements, t);
-        }
+            t = instances.computeIfAbsent(elements, ListSerializer::new);
         return t;
     }
 
@@ -45,23 +57,109 @@ public class ListSerializer<T> extends CollectionSerializer<List<T>>
         this.elements = elements;
     }
 
-    public List<T> deserialize(ByteBuffer bytes)
+    @Override
+    protected List<ByteBuffer> serializeValues(List<T> values)
+    {
+        List<ByteBuffer> output = new ArrayList<>(values.size());
+        for (T value: values)
+            output.add(elements.serialize(value));
+        return output;
+    }
+
+    @Override
+    public <V> void validate(V input, ValueAccessor<V> accessor)
+    {
+        if (accessor.isEmpty(input))
+            throw new MarshalException("Not enough bytes to read a list");
+        try
+        {
+            int n = readCollectionSize(input, accessor);
+            int offset = sizeOfCollectionSize();
+            for (int i = 0; i < n; i++)
+            {
+                V value = readNonNullValue(input, accessor, offset);
+                offset += sizeOfValue(value, accessor);
+                elements.validate(value, accessor);
+            }
+
+            if (!accessor.isEmptyFromOffset(input, offset))
+                throw new MarshalException("Unexpected extraneous bytes after list value");
+        }
+        catch (BufferUnderflowException | IndexOutOfBoundsException e)
+        {
+            throw new MarshalException("Not enough bytes to read a list");
+        }
+    }
+
+    @Override
+    public <V> List<T> deserialize(V input, ValueAccessor<V> accessor)
     {
         try
         {
-            ByteBuffer input = bytes.duplicate();
-            int n = getUnsignedShort(input);
-            List<T> l = new ArrayList<T>(n);
+            int n = readCollectionSize(input, accessor);
+            int offset = sizeOfCollectionSize();
+
+            if (n < 0)
+                throw new MarshalException("The data cannot be deserialized as a list");
+
+            // If the received bytes are not corresponding to a list, n might be a huge number.
+            // In such a case we do not want to initialize the list with that size as it can result
+            // in an OOM (see CASSANDRA-12618). On the other hand we do not want to have to resize the list
+            // if we can avoid it, so we put a reasonable limit on the initialCapacity.
+            List<T> l = new ArrayList<>(Math.min(n, 256));
             for (int i = 0; i < n; i++)
             {
-                int s = getUnsignedShort(input);
-                byte[] data = new byte[s];
-                input.get(data);
-                ByteBuffer databb = ByteBuffer.wrap(data);
-                elements.validate(databb);
-                l.add(elements.deserialize(databb));
+                // CASSANDRA-6839: "We can have nulls in lists that are used for IN values"
+                // CASSANDRA-8613 checks IN clauses and throws an exception if null is in the list.
+                // Leaving for this as-is for now in case there is some unknown use
+                // for it, but should likely be changed to readNonNull. Validate has been
+                // changed to throw on null elements as otherwise it would NPE, and it's unclear
+                // if callers could handle null elements.
+                V databb = readValue(input, accessor, offset);
+                offset += sizeOfValue(databb, accessor);
+                if (databb != null)
+                {
+                    elements.validate(databb, accessor);
+                    l.add(elements.deserialize(databb, accessor));
+                }
+                else
+                {
+                    l.add(null);
+                }
             }
+
+            if (!accessor.isEmptyFromOffset(input, offset))
+                throw new MarshalException("Unexpected extraneous bytes after list value");
+
             return l;
+        }
+        catch (BufferUnderflowException | IndexOutOfBoundsException e)
+        {
+            throw new MarshalException("Not enough bytes to read a list");
+        }
+    }
+
+    public boolean anyMatch(ByteBuffer serializedList, Predicate<ByteBuffer> predicate)
+    {
+        return anyMatch(serializedList, ByteBufferAccessor.instance, predicate);
+    }
+
+    public <V> boolean anyMatch(V input, ValueAccessor<V> accessor, Predicate<V> predicate)
+    {
+        try
+        {
+            int s = readCollectionSize(input, accessor);
+            int offset = sizeOfCollectionSize();
+
+            for (int i = 0; i < s; i++)
+            {
+                V value = readValue(input, accessor, offset);
+                offset += sizeOfValue(value, accessor);
+
+                if (predicate.test(value))
+                    return true;
+            }
+            return false;
         }
         catch (BufferUnderflowException e)
         {
@@ -70,46 +168,112 @@ public class ListSerializer<T> extends CollectionSerializer<List<T>>
     }
 
     /**
-     * Layout is: {@code <n><s_1><b_1>...<s_n><b_n> }
-     * where:
-     *   n is the number of elements
-     *   s_i is the number of bytes composing the ith element
-     *   b_i is the s_i bytes composing the ith element
+     * Returns the element at the given index in a list.
+     * @param input a serialized list
+     * @param index the index to get
+     * @return the serialized element at the given index, or null if the index exceeds the list size
      */
-    public ByteBuffer serialize(List<T> value)
+    public <V> V getElement(V input, ValueAccessor<V> accessor, int index)
     {
-        List<ByteBuffer> bbs = new ArrayList<ByteBuffer>(value.size());
-        int size = 0;
-        for (T elt : value)
+        try
         {
-            ByteBuffer bb = elements.serialize(elt);
-            bbs.add(bb);
-            size += 2 + bb.remaining();
+            int n = readCollectionSize(input, accessor);
+            int offset = sizeOfCollectionSize();
+            if (n <= index)
+                return null;
+
+            for (int i = 0; i < index; i++)
+            {
+                int length = accessor.getInt(input, offset);
+                offset += TypeSizes.INT_SIZE + length;
+            }
+            return readValue(input, accessor, offset);
         }
-        return pack(bbs, value.size(), size);
+        catch (BufferUnderflowException | IndexOutOfBoundsException e)
+        {
+            throw new MarshalException("Not enough bytes to read a list");
+        }
     }
 
+    public ByteBuffer getElement(ByteBuffer input, int index)
+    {
+        return getElement(input, ByteBufferAccessor.instance, index);
+    }
+
+    @Override
     public String toString(List<T> value)
     {
         StringBuilder sb = new StringBuilder();
         boolean isFirst = true;
+        sb.append('[');
         for (T element : value)
         {
             if (isFirst)
-            {
                 isFirst = false;
-            }
             else
-            {
-                sb.append("; ");
-            }
+                sb.append(", ");
             sb.append(elements.toString(element));
         }
+        sb.append(']');
         return sb.toString();
     }
 
+    @Override
+    @SuppressWarnings({ "rawtypes", "unchecked" })
     public Class<List<T>> getType()
     {
         return (Class) List.class;
+    }
+
+    @Override
+    public ByteBuffer getSerializedValue(ByteBuffer collection, ByteBuffer index, AbstractType<?> comparator)
+    {
+        try
+        {
+            int n = readCollectionSize(collection, ByteBufferAccessor.instance);
+            // Start the offset after the (size of) the collection size we just read
+            int offset = sizeOfCollectionSize();
+            int idx = ByteBufferUtil.toInt(index);
+
+            Preconditions.checkElementIndex(idx, n);
+
+            for (int i = 0; i <= idx; i++)
+            {
+                if (i == idx)
+                    return readValue(collection, ByteBufferAccessor.instance, offset);
+                offset += skipValue(collection, ByteBufferAccessor.instance, offset);
+            }
+            throw new AssertionError("Asked to read index " + idx + " but never read the index");
+        }
+        catch (BufferUnderflowException | IndexOutOfBoundsException e)
+        {
+            throw new MarshalException("Not enough bytes to read a list");
+        }
+    }
+
+    @Override
+    public ByteBuffer getSliceFromSerialized(ByteBuffer collection,
+                                             ByteBuffer from,
+                                             ByteBuffer to,
+                                             AbstractType<?> comparator,
+                                             boolean frozen)
+    {
+        // We don't allow slicing of lists, so we don't need this.
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public int getIndexFromSerialized(ByteBuffer collection, ByteBuffer key, AbstractType<?> comparator)
+    {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public Range<Integer> getIndexesRangeFromSerialized(ByteBuffer collection,
+                                                        ByteBuffer from,
+                                                        ByteBuffer to,
+                                                        AbstractType<?> comparator)
+    {
+        throw new UnsupportedOperationException();
     }
 }

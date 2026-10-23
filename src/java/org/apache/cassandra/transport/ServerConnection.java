@@ -17,61 +17,77 @@
  */
 package org.apache.cassandra.transport;
 
-import java.util.concurrent.ConcurrentMap;
+import java.security.cert.Certificate;
+import java.util.concurrent.atomic.AtomicLongFieldUpdater;
 
-import org.jboss.netty.channel.Channel;
+import javax.net.ssl.SSLPeerUnverifiedException;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.auth.IAuthenticator;
-import org.apache.cassandra.auth.ISaslAwareAuthenticator;
-import org.apache.cassandra.auth.ISaslAwareAuthenticator.SaslAuthenticator;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.service.QueryState;
 
-import org.cliffc.high_scale_lib.NonBlockingHashMap;
+import io.netty.channel.Channel;
+import io.netty.handler.ssl.SslHandler;
 
 public class ServerConnection extends Connection
 {
-    private enum State { UNINITIALIZED, AUTHENTICATION, READY }
+    private static final Logger logger = LoggerFactory.getLogger(ServerConnection.class);
 
-    private volatile SaslAuthenticator saslAuthenticator;
+    private volatile IAuthenticator.SaslNegotiator saslNegotiator;
     private final ClientState clientState;
-    private volatile State state;
+    private volatile ConnectionStage stage;
+    // Incremented only on this connection's Netty event loop (single writer, see Dispatcher#dispatch);
+    // read from arbitrary threads via requestCount(). lazySet is a release store without a full fence,
+    // the volatile read on the other side is the acquire. See CASSANDRA-21569 / CASSANDRA-21400.
+    private volatile long requests;
+    private static final AtomicLongFieldUpdater<ServerConnection> requestsUpdater =
+    AtomicLongFieldUpdater.newUpdater(ServerConnection.class, "requests");
 
-    private final ConcurrentMap<Integer, QueryState> queryStates = new NonBlockingHashMap<Integer, QueryState>();
-
-    public ServerConnection(Channel channel, int version, Connection.Tracker tracker)
+    ServerConnection(Channel channel, ProtocolVersion version, Connection.Tracker tracker)
     {
         super(channel, version, tracker);
-        this.clientState = ClientState.forExternalCalls(channel.getRemoteAddress());
-        this.state = State.UNINITIALIZED;
+
+        clientState = ClientState.forExternalCalls(channel.remoteAddress());
+        stage = ConnectionStage.ESTABLISHED;
     }
 
-    private QueryState getQueryState(int streamId)
+    public ClientState getClientState()
     {
-        QueryState qState = queryStates.get(streamId);
-        if (qState == null)
-        {
-            // In theory we shouldn't get any race here, but it never hurts to be careful
-            QueryState newState = new QueryState(clientState);
-            if ((qState = queryStates.putIfAbsent(streamId, newState)) == null)
-                qState = newState;
-        }
-        return qState;
+        return clientState;
     }
 
-    public QueryState validateNewMessage(Message.Type type, int version, int streamId)
+    /** Must only be called on this connection's Netty event loop (single writer). */
+    void incrementRequests()
     {
-        switch (state)
+        requestsUpdater.lazySet(this, requests + 1);
+    }
+
+    public long requestCount()
+    {
+        return requests;
+    }
+
+    ConnectionStage stage()
+    {
+        return stage;
+    }
+
+    QueryState validateNewMessage(Message.Type type, ProtocolVersion version)
+    {
+        switch (stage)
         {
-            case UNINITIALIZED:
+            case ESTABLISHED:
                 if (type != Message.Type.STARTUP && type != Message.Type.OPTIONS)
                     throw new ProtocolException(String.format("Unexpected message %s, expecting STARTUP or OPTIONS", type));
                 break;
-            case AUTHENTICATION:
+            case AUTHENTICATING:
                 // Support both SASL auth from protocol v2 and the older style Credentials auth from v1
                 if (type != Message.Type.AUTH_RESPONSE && type != Message.Type.CREDENTIALS)
-                    throw new ProtocolException(String.format("Unexpected message %s, expecting %s", type, version == 1 ? "CREDENTIALS" : "SASL_RESPONSE"));
+                    throw new ProtocolException(String.format("Unexpected message %s, expecting %s", type, version == ProtocolVersion.V1 ? "CREDENTIALS" : "SASL_RESPONSE"));
                 break;
             case READY:
                 if (type == Message.Type.STARTUP)
@@ -80,31 +96,32 @@ public class ServerConnection extends Connection
             default:
                 throw new AssertionError();
         }
-        return getQueryState(streamId);
+
+        return new QueryState(clientState);
     }
 
-    public void applyStateTransition(Message.Type requestType, Message.Type responseType)
+    void applyStateTransition(Message.Type requestType, Message.Type responseType)
     {
-        switch (state)
+        switch (stage)
         {
-            case UNINITIALIZED:
+            case ESTABLISHED:
                 if (requestType == Message.Type.STARTUP)
                 {
                     if (responseType == Message.Type.AUTHENTICATE)
-                        state = State.AUTHENTICATION;
+                        stage = ConnectionStage.AUTHENTICATING;
                     else if (responseType == Message.Type.READY)
-                        state = State.READY;
+                        stage = ConnectionStage.READY;
                 }
                 break;
-            case AUTHENTICATION:
+            case AUTHENTICATING:
                 // Support both SASL auth from protocol v2 and the older style Credentials auth from v1
                 assert requestType == Message.Type.AUTH_RESPONSE || requestType == Message.Type.CREDENTIALS;
 
                 if (responseType == Message.Type.READY || responseType == Message.Type.AUTH_SUCCESS)
                 {
-                    state = State.READY;
+                    stage = ConnectionStage.READY;
                     // we won't use the authenticator again, null it so that it can be GC'd
-                    saslAuthenticator = null;
+                    saslNegotiator = null;
                 }
                 break;
             case READY:
@@ -114,14 +131,45 @@ public class ServerConnection extends Connection
         }
     }
 
-    public SaslAuthenticator getAuthenticator()
+    public IAuthenticator.SaslNegotiator getSaslNegotiator(QueryState queryState)
     {
-        if (saslAuthenticator == null)
+        if (saslNegotiator == null)
+            saslNegotiator = DatabaseDescriptor.getAuthenticator()
+                                               .newSaslNegotiator(queryState.getClientAddress(), certificates());
+        return saslNegotiator;
+    }
+
+    private Certificate[] certificates()
+    {
+        SslHandler sslHandler = (SslHandler) channel().pipeline()
+                                                      .get("ssl");
+        Certificate[] certificates = null;
+
+        if (sslHandler != null)
         {
-            IAuthenticator authenticator = DatabaseDescriptor.getAuthenticator();
-            assert authenticator instanceof ISaslAwareAuthenticator : "Configured IAuthenticator does not support SASL authentication";
-            saslAuthenticator = ((ISaslAwareAuthenticator)authenticator).newAuthenticator();
+            try
+            {
+                certificates = sslHandler.engine()
+                                         .getSession()
+                                         .getPeerCertificates();
+            }
+            catch (SSLPeerUnverifiedException e)
+            {
+                if (logger.isTraceEnabled())
+                    logger.trace("Failed to get peer certificates for peer {}", channel().remoteAddress(), e);
+            }
         }
-        return saslAuthenticator;
+        return certificates;
+    }
+
+    /**
+     * @return Whether this connection is SSL-encrypted.
+     */
+    public boolean isSSL()
+    {
+        // If an SslHandler is present on the pipeline, the connection is using ssl.
+        SslHandler sslHandler = (SslHandler) channel().pipeline()
+                                                      .get("ssl");
+        return sslHandler != null;
     }
 }

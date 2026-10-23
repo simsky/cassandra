@@ -17,91 +17,269 @@
  */
 package org.apache.cassandra.cql3;
 
-import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
+
+import com.google.common.annotations.VisibleForTesting;
+
+import org.apache.cassandra.cql3.restrictions.SimpleRestriction;
+import org.apache.cassandra.cql3.restrictions.SingleRestriction;
+import org.apache.cassandra.cql3.terms.Term;
+import org.apache.cassandra.cql3.terms.Terms;
+import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.db.marshal.CollectionType;
+import org.apache.cassandra.db.marshal.ListType;
+import org.apache.cassandra.db.marshal.MapType;
+import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.schema.ColumnMetadata;
+import org.apache.cassandra.schema.TableMetadata;
+
+import static org.apache.cassandra.cql3.statements.RequestValidations.checkFalse;
+import static org.apache.cassandra.cql3.statements.RequestValidations.checkTrue;
+import static org.apache.cassandra.cql3.statements.RequestValidations.invalidRequest;
 
 /**
- * Relations encapsulate the relationship between an entity of some kind, and
- * a value (term). For example, <key> > "start" or "colname1" = "somevalue".
- *
+ * The parsed version of a {@code SimpleRestriction} as outputed by the CQL parser.
+ * {@code Relation.prepare} will be called upon schema binding to create a {@code SimpleRestriction}.
  */
-public class Relation
+public final class Relation
 {
-    private final ColumnIdentifier entity;
-    private final Type relationType;
-    private final Term.Raw value;
-    private final List<Term.Raw> inValues;
-    public final boolean onToken;
+    public static final String FROZEN_MAP_ENTRY_PREDICATES_NOT_SUPPORTED = "Map-entry predicates on frozen map column %s are not supported";
 
-    public static enum Type
+    /**
+     * The raw columns'expression.
+     */
+    private final ColumnsExpression.Raw rawExpressions;
+
+    /**
+     * The relation operator
+     */
+    private final Operator operator;
+
+    /**
+     * The raw terms.
+     */
+    private final Terms.Raw rawTerms;
+
+    private Relation(ColumnsExpression.Raw rawExpressions, Operator operator, Terms.Raw rawTerms)
     {
-        EQ, LT, LTE, GTE, GT, IN;
+        this.rawExpressions = rawExpressions;
+        this.operator = operator;
+        this.rawTerms = rawTerms;
     }
 
-    private Relation(ColumnIdentifier entity, Type type, Term.Raw value, List<Term.Raw> inValues, boolean onToken)
+    public Operator operator()
     {
-        this.entity = entity;
-        this.relationType = type;
-        this.value = value;
-        this.inValues = inValues;
-        this.onToken = onToken;
+        return operator;
     }
 
     /**
-     * Creates a new relation.
+     * Creates a relation for a single column (e.g. {@code columnA = ?} ).
      *
-     * @param entity the kind of relation this is; what the term is being compared to.
-     * @param type the type that describes how this entity relates to the value.
-     * @param value the value being compared.
+     * @param identifier the column identifier to which the relation applies
+     * @param operator the relation operator
+     * @param rawTerm the term to which the column values must be compared
+     * @return a relation for a single column.
      */
-    public Relation(ColumnIdentifier entity, Type type, Term.Raw value)
+    public static Relation singleColumn(ColumnIdentifier identifier, Operator operator, Term.Raw rawTerm)
     {
-        this(entity, type, value, null, false);
+        assert operator.kind() == Operator.Kind.BINARY;
+        return new Relation(ColumnsExpression.Raw.singleColumn(identifier), operator, Terms.Raw.of(rawTerm));
     }
 
-    public Relation(ColumnIdentifier entity, Type type, Term.Raw value, boolean onToken)
+    /**
+     * Creates a relation for a single column (e.g. {@code columnA IN ?} ).
+     *
+     * @param identifier the column identifier to which the relation applies
+     * @param operator the relation operator
+     * @param rawTerms the terms to which the column values must be compared
+     * @return a relation for a single column.
+     */
+    public static Relation singleColumn(ColumnIdentifier identifier, Operator operator, Terms.Raw rawTerms)
     {
-        this(entity, type, value, null, onToken);
+        assert operator.kind() != Operator.Kind.BINARY;
+        return new Relation(ColumnsExpression.Raw.singleColumn(identifier), operator, rawTerms);
     }
 
-    public static Relation createInRelation(ColumnIdentifier entity)
+    /**
+     * Creates a relation for a map element (e.g. {@code columnA[?] = ?}).
+     *
+     * @param identifier the map column identifier
+     * @param rawKey the map element key (we do not support list elements in relations yet)
+     * @param operator the relation operator
+     * @param rawTerm the term to which the map element must be compared
+     * @return a relation for a map element.
+     */
+    @VisibleForTesting
+    static Relation mapElement(ColumnIdentifier identifier, Term.Raw rawKey, Operator operator, Term.Raw rawTerm)
     {
-        return new Relation(entity, Type.IN, null, new ArrayList<Term.Raw>(), false);
+        assert operator.kind() == Operator.Kind.BINARY;
+        return new Relation(ColumnsExpression.Raw.collectionElement(identifier, rawKey), operator, Terms.Raw.of(rawTerm));
     }
 
-    public Type operator()
+    /**
+     * Creates a relation for multiple columns (e.g. {@code (columnA, columnB) = (?, ?)}).
+     *
+     * @param identifiers the columns identifiers
+     * @param operator the relation operator
+     * @param rawTerm the term (tuple) to which the multiple columns must be compared
+     * @return a relation for multiple columns.
+     */
+    public static Relation multiColumn(List<ColumnIdentifier> identifiers, Operator operator, Term.Raw rawTerm)
     {
-        return relationType;
+        assert operator.kind() == Operator.Kind.BINARY;
+        return new Relation(ColumnsExpression.Raw.multiColumn(identifiers), operator, Terms.Raw.of(rawTerm));
     }
 
-    public ColumnIdentifier getEntity()
+    /**
+     * Creates a relation for multiple columns (e.g. {@code (columnA, columnB) = (?, ?)}).
+     *
+     * @param identifiers the columns identifiers
+     * @param operator the relation operator
+     * @param rawTerms the terms (tuples) to which the multiple columns must be compared
+     * @return a relation for multiple columns.
+     */
+    public static Relation multiColumn(List<ColumnIdentifier> identifiers, Operator operator, Terms.Raw rawTerms)
     {
-        return entity;
+        assert operator.kind() != Operator.Kind.BINARY;
+        return new Relation(ColumnsExpression.Raw.multiColumn(identifiers), operator, rawTerms);
     }
 
-    public Term.Raw getValue()
+    /**
+     * Creates a relation for token expression (e.g. {@code token(columnA, columnB) = ?} ).
+     *
+     * @param identifiers the column identifiers for the partition columns
+     * @param operator the relation operator
+     * @param rawTerm the terms to which the token value must be compared
+     * @return a relation for a token expression.
+     */
+    public static Relation token(List<ColumnIdentifier> identifiers, Operator operator, Term.Raw rawTerm)
     {
-        assert relationType != Type.IN || value == null || value instanceof AbstractMarker.INRaw;
-        return value;
+        assert operator.kind() == Operator.Kind.BINARY;
+        return new Relation(ColumnsExpression.Raw.token(identifiers), operator, Terms.Raw.of(rawTerm));
     }
 
-    public List<Term.Raw> getInValues()
+    /**
+     * Creates a relation for token expression (e.g. {@code token(columnA, columnB) = ?} ).
+     *
+     * @param identifiers the column identifiers for the partition columns
+     * @param operator the relation operator
+     * @param rawTerms the terms to which the token value must be compared
+     * @return a relation for a token expression.
+     */
+    public static Relation token(List<ColumnIdentifier> identifiers, Operator operator, Terms.Raw rawTerms)
     {
-        assert relationType == Type.IN;
-        return inValues;
+        assert operator.kind() == Operator.Kind.TERNARY;
+        return new Relation(ColumnsExpression.Raw.token(identifiers), operator, rawTerms);
     }
 
-    public void addInValue(Term.Raw t)
+    /**
+     * Checks if this relation is a token relation (e.g. <pre>token(a) = token(1)</pre>).
+     *
+     * @return <code>true</code> if this relation is a token relation, <code>false</code> otherwise.
+     */
+    public boolean onToken()
     {
-        inValues.add(t);
+        return rawExpressions.kind() == ColumnsExpression.Kind.TOKEN;
+    }
+
+    /**
+     * Converts this <code>Relation</code> into a <code>Restriction</code>.
+     *
+     * @param table the table metadata
+     * @param boundNames the variables specification where to collect the bind variables
+     * @return the <code>Restriction</code> corresponding to this <code>Relation</code>
+     * @throws InvalidRequestException if this <code>Relation</code> is not valid
+     */
+    public SingleRestriction toRestriction(TableMetadata table, VariableSpecifications boundNames, Object owner, boolean allowFiltering)
+    {
+        ColumnsExpression columnsExpression = rawExpressions.prepare(table);
+
+        if (operator == Operator.NEQ && columnsExpression.kind() == ColumnsExpression.Kind.TOKEN)
+            throw invalidRequest("Unsupported '!=' relation: %s", this);
+
+        // TODO support restrictions on list elements as we do in conditions, then we can probably move below validations
+        //  to ElementExpression prepare/validateColumns
+        if (columnsExpression.isMapElementExpression())
+        {
+            ColumnMetadata column = columnsExpression.firstColumn();
+            AbstractType<?> baseType = column.type.unwrap();
+            checkFalse(baseType instanceof ListType, "Indexes on list entries (%s[index] = value) are not supported.", column.name);
+            checkTrue(baseType instanceof MapType, "Column %s cannot be used as a map", column.name);
+
+            if (column.isClusteringColumn() && baseType.isCollection() && !column.type.isMultiCell())
+                throw invalidRequest(FROZEN_MAP_ENTRY_PREDICATES_NOT_SUPPORTED, column.name);
+
+            columnsExpression.collectMarkerSpecification(boundNames, owner);
+        }
+
+        operator.validateFor(columnsExpression);
+
+        ColumnSpecification receiver = columnsExpression.columnSpecification();
+        if (!operator.appliesToColumnValues())
+            receiver = ((CollectionType<?>) receiver.type).makeCollectionReceiver(receiver, operator.appliesToMapKeys());
+
+        Terms terms = rawTerms.prepare(table.keyspace, receiver);
+        terms.collectMarkerSpecification(boundNames, owner);
+
+        // An IN restriction with only one element is the same as an EQ restriction
+        if (operator.isIN() && terms.containsSingleTerm())
+            return new SimpleRestriction(columnsExpression, Operator.EQ, terms, allowFiltering);
+
+        return new SimpleRestriction(columnsExpression, operator, terms, allowFiltering);
+    }
+
+    public ColumnIdentifier column()
+    {
+        return rawExpressions.identifiers().get(0);
+    }
+
+    /**
+     * Renames an identifier in this Relation, if applicable.
+     * @param from the old identifier
+     * @param to the new identifier
+     * @return this object, if the old identifier is not in the set of entities that this relation covers; otherwise
+     *         a new Relation with "from" replaced by "to" is returned.
+     */
+    public Relation renameIdentifier(ColumnIdentifier from, ColumnIdentifier to)
+    {
+        return new Relation(rawExpressions.renameIdentifier(from, to), operator, rawTerms);
+    }
+
+    @Override
+    public boolean equals(Object o)
+    {
+        if (this == o)
+            return true;
+
+        if (o == null || getClass() != o.getClass())
+            return false;
+
+        Relation relation = (Relation) o;
+        return Objects.equals(rawExpressions, relation.rawExpressions)
+            && operator == relation.operator
+            && Objects.equals(rawTerms, relation.rawTerms);
+    }
+
+    @Override
+    public int hashCode()
+    {
+        return Objects.hash(rawExpressions, operator, rawTerms);
+    }
+
+    /**
+     * Returns a CQL representation of this relation.
+     *
+     * @return a CQL representation of this relation
+     */
+    public String toCQLString()
+    {
+        return operator.buildCQLString(rawExpressions, rawTerms);
     }
 
     @Override
     public String toString()
     {
-        if (relationType == Type.IN)
-            return String.format("%s IN %s", entity, inValues);
-        else
-            return String.format("%s %s %s", entity, relationType, value);
+        return toCQLString();
     }
 }

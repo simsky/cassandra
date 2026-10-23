@@ -18,43 +18,55 @@
 package org.apache.cassandra.db.marshal;
 
 import java.nio.ByteBuffer;
-import java.text.ParseException;
-import java.text.SimpleDateFormat;
 import java.util.Date;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.cql3.CQL3Type;
-import org.apache.cassandra.serializers.TypeSerializer;
-import org.apache.cassandra.serializers.TimestampSerializer;
+import org.apache.cassandra.cql3.functions.ArgumentDeserializer;
+import org.apache.cassandra.cql3.terms.Constants;
+import org.apache.cassandra.cql3.terms.Term;
 import org.apache.cassandra.serializers.MarshalException;
+import org.apache.cassandra.serializers.TimestampSerializer;
+import org.apache.cassandra.serializers.TypeSerializer;
+import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.ByteBufferUtil;
-import org.apache.commons.lang3.time.DateUtils;
+import org.apache.cassandra.utils.bytecomparable.ByteComparable;
+import org.apache.cassandra.utils.bytecomparable.ByteSource;
+import org.apache.cassandra.utils.bytecomparable.ByteSourceInverse;
 
+/**
+ * @deprecated This is the old version of TimestampType, but has been replaced as it wasn't comparing pre-epoch timestamps
+ * correctly. This is kept for backward compatibility but shouldn't be used in new code.
+ */
+@Deprecated(since = "2.2.6")
 public class DateType extends AbstractType<Date>
 {
     private static final Logger logger = LoggerFactory.getLogger(DateType.class);
 
     public static final DateType instance = new DateType();
+    private static final ArgumentDeserializer ARGUMENT_DESERIALIZER = new DefaultArgumentDeserializer(instance);
+    private static final ByteBuffer MASKED_VALUE = instance.decompose(new Date(0));
 
-    static final String DEFAULT_FORMAT = TimestampSerializer.iso8601Patterns[3];
-    static final SimpleDateFormat FORMATTER = new SimpleDateFormat(DEFAULT_FORMAT);
+    DateType() {super(ComparisonType.BYTE_ORDER, 8);} // singleton
 
-    DateType() {} // singleton
-
-    public int compare(ByteBuffer o1, ByteBuffer o2)
+    public boolean isEmptyValueMeaningless()
     {
-        if (o1.remaining() == 0)
-        {
-            return o2.remaining() == 0 ? 0 : -1;
-        }
-        if (o2.remaining() == 0)
-        {
-            return 1;
-        }
+        return true;
+    }
 
-        return ByteBufferUtil.compareUnsigned(o1, o2);
+    @Override
+    public <V> ByteSource asComparableBytes(ValueAccessor<V> accessor, V data, ByteComparable.Version version)
+    {
+        // While BYTE_ORDER would still work for this type, making use of the fixed length is more efficient.
+        return ByteSource.optionalFixedLength(accessor, data);
+    }
+
+    @Override
+    public <V> V fromComparableBytes(ValueAccessor<V> accessor, ByteSource.Peekable comparableBytes, ByteComparable.Version version)
+    {
+        return ByteSourceInverse.getOptionalFixedLength(accessor, comparableBytes, 8);
     }
 
     public ByteBuffer fromString(String source) throws MarshalException
@@ -63,43 +75,31 @@ public class DateType extends AbstractType<Date>
       if (source.isEmpty())
           return ByteBufferUtil.EMPTY_BYTE_BUFFER;
 
-      return ByteBufferUtil.bytes(dateStringToTimestamp(source));
+      return ByteBufferUtil.bytes(TimestampSerializer.dateStringToTimestamp(source));
     }
 
-    public static long dateStringToTimestamp(String source) throws MarshalException
+    @Override
+    public Term fromJSONObject(Object parsed) throws MarshalException
     {
-      long millis;
+        if (parsed instanceof Long)
+            return new Constants.Value(ByteBufferUtil.bytes((Long) parsed));
 
-      if (source.toLowerCase().equals("now"))
-      {
-          millis = System.currentTimeMillis();
-      }
-      // Milliseconds since epoch?
-      else if (source.matches("^\\d+$"))
-      {
-          try
-          {
-              millis = Long.parseLong(source);
-          }
-          catch (NumberFormatException e)
-          {
-              throw new MarshalException(String.format("unable to make long (for date) from: '%s'", source), e);
-          }
-      }
-      // Last chance, attempt to parse as date-time string
-      else
-      {
-          try
-          {
-              millis = DateUtils.parseDateStrictly(source, TimestampSerializer.iso8601Patterns).getTime();
-          }
-          catch (ParseException e1)
-          {
-              throw new MarshalException(String.format("unable to coerce '%s' to a  formatted date (long)", source), e1);
-          }
-      }
+        try
+        {
+            return new Constants.Value(TimestampType.instance.fromString((String) parsed));
+        }
+        catch (ClassCastException exc)
+        {
+            throw new MarshalException(String.format(
+                    "Expected a long or a datestring representation of a date value, but got a %s: %s",
+                    parsed.getClass().getSimpleName(), parsed));
+        }
+    }
 
-      return millis;
+    @Override
+    public String toJSONString(ByteBuffer buffer, ProtocolVersion protocolVersion)
+    {
+        return '"' + TimestampSerializer.getJsonDateFormatter().format(TimestampSerializer.instance.deserialize(buffer).toInstant()) + '"';
     }
 
     @Override
@@ -121,6 +121,12 @@ public class DateType extends AbstractType<Date>
     }
 
     @Override
+    public boolean isValueCompatibleWithInternal(AbstractType<?> otherType)
+    {
+        return this == otherType || otherType == TimestampType.instance || otherType == LongType.instance;
+    }
+
+    @Override
     public CQL3Type asCQL3Type()
     {
         return CQL3Type.Native.TIMESTAMP;
@@ -129,5 +135,17 @@ public class DateType extends AbstractType<Date>
     public TypeSerializer<Date> getSerializer()
     {
         return TimestampSerializer.instance;
+    }
+
+    @Override
+    public ArgumentDeserializer getArgumentDeserializer()
+    {
+        return ARGUMENT_DESERIALIZER;
+    }
+
+    @Override
+    public ByteBuffer getMaskedValue()
+    {
+        return MASKED_VALUE;
     }
 }

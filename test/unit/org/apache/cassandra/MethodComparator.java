@@ -21,15 +21,15 @@ package org.apache.cassandra;
  */
 
 
-import org.junit.Ignore;
-import org.junit.runners.model.FrameworkMethod;
-
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.LineNumberReader;
 import java.lang.reflect.Method;
 import java.util.Comparator;
+
+import org.junit.Ignore;
+import org.junit.runners.model.FrameworkMethod;
 
 public class MethodComparator<T> implements Comparator<T>
 {
@@ -75,9 +75,9 @@ public class MethodComparator<T> implements Comparator<T>
 
     private MethodPosition getIndexOfMethodPosition(final Method method)
     {
-        final Class aClass = method.getDeclaringClass();
         if (method.getAnnotation(Ignore.class) == null)
         {
+            final Class<?> aClass = method.getDeclaringClass();
             return getIndexOfMethodPosition(aClass, method.getName());
         }
         else
@@ -86,7 +86,7 @@ public class MethodComparator<T> implements Comparator<T>
         }
     }
 
-    private MethodPosition getIndexOfMethodPosition(final Class aClass, final String methodName)
+    private MethodPosition getIndexOfMethodPosition(final Class<?> aClass, final String methodName)
     {
         MethodPosition methodPosition;
         for (final char methodSeparator : METHOD_SEPARATORS)
@@ -100,7 +100,7 @@ public class MethodComparator<T> implements Comparator<T>
         return new NullMethodPosition();
     }
 
-    private MethodPosition getIndexOfMethodPosition(final Class aClass, final String methodName, final char methodSeparator)
+    private MethodPosition getIndexOfMethodPosition(final Class<?> aClass, final String methodName, final char methodSeparator)
     {
         final InputStream inputStream = aClass.getResourceAsStream(aClass.getSimpleName() + ".class");
         final LineNumberReader lineNumberReader = new LineNumberReader(new InputStreamReader(inputStream));

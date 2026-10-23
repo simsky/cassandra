@@ -17,19 +17,46 @@
  */
 package org.apache.cassandra.transport;
 
-import java.util.EnumSet;
-import java.util.UUID;
+import java.lang.reflect.Field;
+import java.lang.reflect.Modifier;
+import java.nio.ByteBuffer;
+import java.util.List;
+import java.util.Map;
 
-import org.jboss.netty.buffer.ChannelBuffer;
-import org.jboss.netty.buffer.ChannelBuffers;
-import org.jboss.netty.channel.*;
-import org.jboss.netty.handler.codec.oneone.OneToOneDecoder;
-import org.jboss.netty.handler.codec.oneone.OneToOneEncoder;
+import com.google.common.annotations.VisibleForTesting;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.cassandra.transport.messages.*;
 import org.apache.cassandra.service.QueryState;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.tracing.Tracing;
+import org.apache.cassandra.transport.Envelope.Header.Flag;
+import org.apache.cassandra.transport.messages.AuthChallenge;
+import org.apache.cassandra.transport.messages.AuthResponse;
+import org.apache.cassandra.transport.messages.AuthSuccess;
+import org.apache.cassandra.transport.messages.AuthenticateMessage;
+import org.apache.cassandra.transport.messages.BatchMessage;
+import org.apache.cassandra.transport.messages.ErrorMessage;
+import org.apache.cassandra.transport.messages.EventMessage;
+import org.apache.cassandra.transport.messages.ExecuteMessage;
+import org.apache.cassandra.transport.messages.OptionsMessage;
+import org.apache.cassandra.transport.messages.PrepareMessage;
+import org.apache.cassandra.transport.messages.QueryMessage;
+import org.apache.cassandra.transport.messages.ReadyMessage;
+import org.apache.cassandra.transport.messages.RegisterMessage;
+import org.apache.cassandra.transport.messages.ResultMessage;
+import org.apache.cassandra.transport.messages.StartupMessage;
+import org.apache.cassandra.transport.messages.SupportedMessage;
+import org.apache.cassandra.transport.messages.UnsupportedMessageCodec;
+import org.apache.cassandra.utils.MonotonicClock;
+import org.apache.cassandra.utils.ReflectionUtils;
+import org.apache.cassandra.utils.TimeUUID;
+
+import io.netty.buffer.ByteBuf;
+import io.netty.channel.Channel;
+
+import static org.apache.cassandra.utils.TimeUUID.Generator.nextTimeUUID;
 
 /**
  * A message from the CQL binary protocol.
@@ -37,6 +64,12 @@ import org.apache.cassandra.service.QueryState;
 public abstract class Message
 {
     protected static final Logger logger = LoggerFactory.getLogger(Message.class);
+
+    /**
+     * Sentinel default for a {@link Response}'s stream id;
+     * must be overwritten before {@link #encode}.
+     **/
+    public static final int UNSET_STREAM_ID = Integer.MIN_VALUE;
 
     public interface Codec<M extends Message> extends CBCodec<M> {}
 
@@ -61,7 +94,7 @@ public abstract class Message
         STARTUP        (1,  Direction.REQUEST,  StartupMessage.codec),
         READY          (2,  Direction.RESPONSE, ReadyMessage.codec),
         AUTHENTICATE   (3,  Direction.RESPONSE, AuthenticateMessage.codec),
-        CREDENTIALS    (4,  Direction.REQUEST,  CredentialsMessage.codec),
+        CREDENTIALS    (4,  Direction.REQUEST,  UnsupportedMessageCodec.instance),
         OPTIONS        (5,  Direction.REQUEST,  OptionsMessage.codec),
         SUPPORTED      (6,  Direction.RESPONSE, SupportedMessage.codec),
         QUERY          (7,  Direction.REQUEST,  QueryMessage.codec),
@@ -94,7 +127,7 @@ public abstract class Message
             }
         }
 
-        private Type(int opcode, Direction direction, Codec<?> codec)
+        Type(int opcode, Direction direction, Codec<?> codec)
         {
             this.opcode = opcode;
             this.direction = direction;
@@ -103,6 +136,8 @@ public abstract class Message
 
         public static Type fromOpcode(int opcode, Direction direction)
         {
+            if (opcode >= opcodeIdx.length)
+                throw new ProtocolException(String.format("Unknown opcode %d", opcode));
             Type t = opcodeIdx[opcode];
             if (t == null)
                 throw new ProtocolException(String.format("Unknown opcode %d", opcode));
@@ -114,11 +149,26 @@ public abstract class Message
                                                           t));
             return t;
         }
+
+        @VisibleForTesting
+        public Codec<?> unsafeSetCodec(Codec<?> codec) throws NoSuchFieldException, IllegalAccessException
+        {
+            Codec<?> original = this.codec;
+            Field field = Type.class.getDeclaredField("codec");
+            field.setAccessible(true);
+            Field modifiers = ReflectionUtils.getModifiersField();
+            modifiers.setAccessible(true);
+            modifiers.setInt(field, field.getModifiers() & ~Modifier.FINAL);
+            field.set(this, codec);
+            return original;
+        }
     }
 
     public final Type type;
-    protected volatile Connection connection;
-    private volatile int streamId;
+    protected Connection connection;
+    private Envelope source;
+    private Map<String, ByteBuffer> customPayload;
+    protected ProtocolVersion forcedProtocolVersion = null;
 
     protected Message(Type type)
     {
@@ -135,45 +185,125 @@ public abstract class Message
         return connection;
     }
 
-    public Message setStreamId(int streamId)
+    public void setSource(Envelope source)
     {
-        this.streamId = streamId;
-        return this;
+        this.source = source;
     }
 
-    public int getStreamId()
+    public Envelope getSource()
     {
-        return streamId;
+        return source;
+    }
+
+    public Map<String, ByteBuffer> getCustomPayload()
+    {
+        return customPayload;
+    }
+
+    public void setCustomPayload(Map<String, ByteBuffer> customPayload)
+    {
+        this.customPayload = customPayload;
+    }
+
+    @Override
+    public String toString()
+    {
+        return String.format("(%s:%s)", type, connection == null ? "null" :  connection.getVersion().asInt());
     }
 
     public static abstract class Request extends Message
     {
-        protected boolean tracingRequested;
-
+        private boolean tracingRequested;
+        public final long createdAtNanos;
         protected Request(Type type)
         {
             super(type);
+
+            createdAtNanos = MonotonicClock.Global.preciseTime.now();
 
             if (type.direction != Direction.REQUEST)
                 throw new IllegalArgumentException();
         }
 
-        public abstract Response execute(QueryState queryState);
-
-        public void setTracingRequested()
+        /**
+         * @return true if the execution of this {@link Request} should be recorded in a tracing session
+         */
+        protected boolean isTraceable()
         {
-            this.tracingRequested = true;
+            return false;
         }
 
-        public boolean isTracingRequested()
+        /**
+         * @return true if warnings should be tracked and aborts enforced for resource limits on this {@link Request}
+         */
+        protected boolean isTrackable()
+        {
+            return false;
+        }
+
+        protected abstract Response execute(QueryState queryState, Dispatcher.RequestTime requestTime, boolean traceRequest);
+
+        public final Response execute(QueryState queryState, Dispatcher.RequestTime requestTime)
+        {
+            boolean shouldTrace = false;
+            TimeUUID tracingSessionId = null;
+
+            if (isTraceable())
+            {
+                if (isTracingRequested())
+                {
+                    shouldTrace = true;
+                    tracingSessionId = nextTimeUUID();
+                    Tracing.instance.newSession(tracingSessionId, getCustomPayload());
+                }
+                else if (StorageService.instance.shouldTraceProbablistically())
+                {
+                    shouldTrace = true;
+                    Tracing.instance.newSession(getCustomPayload());
+                }
+            }
+
+            Response response;
+            try
+            {
+                response = execute(queryState, requestTime, shouldTrace);
+            }
+            finally
+            {
+                if (shouldTrace)
+                    Tracing.instance.stopSession();
+            }
+
+            if (isTraceable() && isTracingRequested())
+                response.setTracingId(tracingSessionId);
+
+            return response;
+        }
+
+        void setTracingRequested()
+        {
+            tracingRequested = true;
+        }
+
+        boolean isTracingRequested()
         {
             return tracingRequested;
+        }
+
+        @Override
+        public String toString()
+        {
+            return "Request{" +
+                   "tracingRequested=" + tracingRequested +
+                   ", createdAtNanos=" + createdAtNanos +
+                   '}';
         }
     }
 
     public static abstract class Response extends Message
     {
-        protected UUID tracingId;
+        protected TimeUUID tracingId;
+        protected List<String> warnings;
 
         protected Response(Type type)
         {
@@ -183,157 +313,210 @@ public abstract class Message
                 throw new IllegalArgumentException();
         }
 
-        public Message setTracingId(UUID tracingId)
+        Message setTracingId(TimeUUID tracingId)
         {
             this.tracingId = tracingId;
             return this;
         }
 
-        public UUID getTracingId()
+        TimeUUID getTracingId()
         {
             return tracingId;
         }
-    }
 
-    public static class ProtocolDecoder extends OneToOneDecoder
-    {
-        public Object decode(ChannelHandlerContext ctx, Channel channel, Object msg)
+        public Message setWarnings(List<String> warnings)
         {
-            assert msg instanceof Frame : "Expecting frame, got " + msg;
+            this.warnings = warnings;
+            return this;
+        }
 
-            Frame frame = (Frame)msg;
-            boolean isRequest = frame.header.type.direction == Direction.REQUEST;
-            boolean isTracing = frame.header.flags.contains(Frame.Header.Flag.TRACING);
-
-            UUID tracingId = isRequest || !isTracing ? null : CBUtil.readUUID(frame.body);
-
-            try
-            {
-                Message message = frame.header.type.codec.decode(frame.body, frame.header.version);
-                message.setStreamId(frame.header.streamId);
-
-                if (isRequest)
-                {
-                    assert message instanceof Request;
-                    Request req = (Request)message;
-                    req.attach((Connection)channel.getAttachment());
-                    if (isTracing)
-                        req.setTracingRequested();
-                }
-                else
-                {
-                    assert message instanceof Response;
-                    if (isTracing)
-                        ((Response)message).setTracingId(tracingId);
-                }
-
-                return message;
-            }
-            catch (Exception ex)
-            {
-                // Remember the streamId
-                throw ErrorMessage.wrap(ex, frame.header.streamId);
-            }
+        public List<String> getWarnings()
+        {
+            return warnings;
         }
     }
 
-    public static class ProtocolEncoder extends OneToOneEncoder
+    public Envelope encode(ProtocolVersion version, int streamId)
     {
-        public Object encode(ChannelHandlerContext ctx, Channel channel, Object msg)
+        // A Response's stream id must be stamped before it is serialized to the wire. UNSET_STREAM_ID here
+        // means a server code path produced a response without routing information; sending it would risk
+        // delivering it to an unrelated in-flight request (CASSANDRA-21508). Fail fatally so the connection
+        // is torn down rather than mis-route a response. Checked before the try below so it is not caught and
+        // re-wrapped (which would carry the unset id forward).
+        if (streamId == UNSET_STREAM_ID)
+            throw ProtocolException.toFatalException(new ProtocolException("Attempted to encode a response with an unset stream id: " + this));
+
+        int flags = Flag.none();
+        @SuppressWarnings("unchecked")
+        Codec<Message> codec = (Codec<Message>)this.type.codec;
+        try
         {
-            assert msg instanceof Message : "Expecting message, got " + msg;
-
-            Message message = (Message)msg;
-
-            Connection connection = (Connection)channel.getAttachment();
-            // The only case the connection can be null is when we send the initial STARTUP message (client side thus)
-            int version = connection == null ? Server.CURRENT_VERSION : connection.getVersion();
-
-            EnumSet<Frame.Header.Flag> flags = EnumSet.noneOf(Frame.Header.Flag.class);
-
-            Codec<Message> codec = (Codec<Message>)message.type.codec;
-            int messageSize = codec.encodedSize(message, version);
-            ChannelBuffer body;
-            if (message instanceof Response)
+            int messageSize = codec.encodedSize(this, version);
+            ByteBuf body;
+            if (this instanceof Response)
             {
-                UUID tracingId = ((Response)message).getTracingId();
+                Response message = (Response)this;
+                TimeUUID tracingId = message.getTracingId();
+                Map<String, ByteBuffer> customPayload = message.getCustomPayload();
+                if (tracingId != null)
+                    messageSize += TimeUUID.sizeInBytes();
+                List<String> warnings = message.getWarnings();
+                if (warnings != null)
+                {
+                    // if cassandra populates warnings for <= v3 protocol, this is a bug
+                    if (version.isSmallerThan(ProtocolVersion.V4))
+                    {
+                        logger.warn("Warnings present in message with version less than v4 (it is {}); warnings={}", version, warnings);
+                        warnings = null;
+                    }
+                    else
+                    {
+                        messageSize += CBUtil.sizeOfStringList(warnings);
+                    }
+                }
+                if (customPayload != null)
+                {
+                    if (version.isSmallerThan(ProtocolVersion.V4))
+                        throw new ProtocolException("Must not send frame with CUSTOM_PAYLOAD flag for native protocol version < 4");
+                    messageSize += CBUtil.sizeOfBytesMap(customPayload);
+                }
+                body = CBUtil.allocator.buffer(messageSize);
                 if (tracingId != null)
                 {
-                    body = ChannelBuffers.buffer(CBUtil.sizeOfUUID(tracingId) + messageSize);
                     CBUtil.writeUUID(tracingId, body);
-                    flags.add(Frame.Header.Flag.TRACING);
+                    flags = Flag.add(flags, Flag.TRACING);
                 }
-                else
+                if (warnings != null)
                 {
-                    body = ChannelBuffers.buffer(messageSize);
+                    CBUtil.writeStringList(warnings, body);
+                    flags = Flag.add(flags, Flag.WARNING);
+                }
+                if (customPayload != null)
+                {
+                    CBUtil.writeBytesMap(customPayload, body);
+                    flags = Flag.add(flags, Flag.CUSTOM_PAYLOAD);
                 }
             }
             else
             {
-                assert message instanceof Request;
-                body = ChannelBuffers.buffer(messageSize);
-                if (((Request)message).isTracingRequested())
-                    flags.add(Frame.Header.Flag.TRACING);
+                assert this instanceof Request;
+                if (((Request)this).isTracingRequested())
+                    flags = Flag.add(flags, Flag.TRACING);
+                Map<String, ByteBuffer> payload = getCustomPayload();
+                if (payload != null)
+                    messageSize += CBUtil.sizeOfBytesMap(payload);
+                body = CBUtil.allocator.buffer(messageSize);
+                if (payload != null)
+                {
+                    CBUtil.writeBytesMap(payload, body);
+                    flags = Flag.add(flags, Flag.CUSTOM_PAYLOAD);
+                }
             }
-
-            codec.encode(message, body, version);
-            return Frame.create(message.type, message.getStreamId(), version, flags, body);
-        }
-    }
-
-    public static class Dispatcher extends SimpleChannelUpstreamHandler
-    {
-        @Override
-        public void messageReceived(ChannelHandlerContext ctx, MessageEvent e)
-        {
-            assert e.getMessage() instanceof Message : "Expecting message, got " + e.getMessage();
-
-            if (e.getMessage() instanceof Response)
-                throw new ProtocolException("Invalid response message received, expecting requests");
-
-            Request request = (Request)e.getMessage();
 
             try
             {
-                assert request.connection() instanceof ServerConnection;
-                ServerConnection connection = (ServerConnection)request.connection();
-                QueryState qstate = connection.validateNewMessage(request.type, connection.getVersion(), request.getStreamId());
-
-                logger.debug("Received: {}, v={}", request, connection.getVersion());
-
-                Response response = request.execute(qstate);
-                response.setStreamId(request.getStreamId());
-                response.attach(connection);
-                connection.applyStateTransition(request.type, response.type);
-
-                logger.debug("Responding: {}, v={}", response, connection.getVersion());
-
-                ctx.getChannel().write(response);
+                codec.encode(this, body, version);
             }
-            catch (Exception ex)
+            catch (Throwable e)
             {
-                // Don't let the exception propagate to exceptionCaught() if we can help it so that we can assign the right streamID.
-                ctx.getChannel().write(ErrorMessage.fromException(ex).setStreamId(request.getStreamId()));
+                body.release();
+                throw e;
             }
-        }
 
-        @Override
-        public void exceptionCaught(final ChannelHandlerContext ctx, ExceptionEvent e)
-        throws Exception
+            // if the driver attempted to connect with a protocol version lower than the minimum supported
+            // version, respond with a protocol error message with the correct message header for that version
+            ProtocolVersion responseVersion = forcedProtocolVersion == null
+                                              ? version
+                                              : forcedProtocolVersion;
+
+            if (responseVersion.isBeta())
+                flags = Flag.add(flags, Flag.USE_BETA);
+
+            return Envelope.create(type, streamId, responseVersion, flags, body);
+        }
+        catch (Throwable e)
         {
-            if (ctx.getChannel().isOpen())
+            throw ErrorMessage.wrap(e, streamId);
+        }
+    }
+
+    abstract static class Decoder<M extends Message>
+    {
+        static Message decodeMessage(Channel channel, Envelope inbound)
+        {
+            boolean isRequest = inbound.header.type.direction == Direction.REQUEST;
+            boolean isTracing = inbound.header.hasFlag(Flag.TRACING);
+            boolean isCustomPayload = inbound.header.hasFlag(Flag.CUSTOM_PAYLOAD);
+            boolean hasWarning = inbound.header.hasFlag(Flag.WARNING);
+
+            TimeUUID tracingId = isRequest || !isTracing ? null : CBUtil.readTimeUUID(inbound.body);
+            List<String> warnings = isRequest || !hasWarning ? null : CBUtil.readStringList(inbound.body);
+            Map<String, ByteBuffer> customPayload = !isCustomPayload ? null : CBUtil.readBytesMap(inbound.body);
+
+            if (isCustomPayload && inbound.header.version.isSmallerThan(ProtocolVersion.V4))
+                throw new ProtocolException("Received frame with CUSTOM_PAYLOAD flag for native protocol version < 4");
+
+            Message message = inbound.header.type.codec.decode(inbound.body, inbound.header.version);
+            message.setSource(inbound);
+            message.setCustomPayload(customPayload);
+
+            if (isRequest)
             {
-                ChannelFuture future = ctx.getChannel().write(ErrorMessage.fromException(e.getCause()));
-                // On protocol exception, close the channel as soon as the message have been sent
-                if (e.getCause() instanceof ProtocolException)
-                {
-                    future.addListener(new ChannelFutureListener() {
-                        public void operationComplete(ChannelFuture future) {
-                            ctx.getChannel().close();
-                        }
-                    });
-                }
+                assert message instanceof Request;
+                Request req = (Request) message;
+                Connection connection = channel.attr(Connection.attributeKey).get();
+                req.attach(connection);
+                if (isTracing)
+                    req.setTracingRequested();
+            }
+            else
+            {
+                assert message instanceof Response;
+                if (isTracing)
+                    ((Response) message).setTracingId(tracingId);
+                if (hasWarning)
+                    ((Response) message).setWarnings(warnings);
+            }
+            return message;
+        }
+
+        abstract M decode(Channel channel, Envelope inbound);
+
+        private static class RequestDecoder extends Decoder<Request>
+        {
+            Request decode(Channel channel, Envelope request)
+            {
+                if (request.header.type.direction != Direction.REQUEST)
+                    throw new ProtocolException(String.format("Unexpected RESPONSE message %s, expecting REQUEST",
+                                                              request.header.type));
+
+                return (Request) decodeMessage(channel, request);
             }
         }
+
+        private static class ResponseDecoder extends Decoder<Response>
+        {
+            Response decode(Channel channel, Envelope response)
+            {
+                if (response.header.type.direction != Direction.RESPONSE)
+                    throw new ProtocolException(String.format("Unexpected REQUEST message %s, expecting RESPONSE",
+                                                              response.header.type));
+
+                return (Response) decodeMessage(channel, response);
+            }
+        }
+    }
+
+    private static final Decoder.RequestDecoder REQUEST_DECODER = new Decoder.RequestDecoder();
+    private static final Decoder.ResponseDecoder RESPONSE_DECODER = new Decoder.ResponseDecoder();
+
+    static Decoder<Message.Request> requestDecoder()
+    {
+        return REQUEST_DECODER;
+    }
+
+    static Decoder<Message.Response> responseDecoder()
+    {
+        return RESPONSE_DECODER;
     }
 }

@@ -17,173 +17,179 @@
  */
 package org.apache.cassandra.io.sstable;
 
-import java.io.File;
-import java.io.FilenameFilter;
+
+import java.io.Closeable;
 import java.io.IOException;
 import java.nio.ByteBuffer;
-import java.util.HashSet;
-import java.util.Set;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Objects;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
+import java.util.stream.Stream;
 
-import org.apache.cassandra.config.CFMetaData;
+import javax.annotation.Nullable;
+
 import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.db.*;
-import org.apache.cassandra.db.context.CounterContext;
-import org.apache.cassandra.db.marshal.CompositeType;
-import org.apache.cassandra.dht.IPartitioner;
-import org.apache.cassandra.utils.CounterId;
-import org.apache.cassandra.utils.Pair;
+import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.RegularAndStaticColumns;
+import org.apache.cassandra.db.SerializationHeader;
+import org.apache.cassandra.db.compression.CompressionDictionary;
+import org.apache.cassandra.db.partitions.PartitionUpdate;
+import org.apache.cassandra.db.rows.EncodingStats;
+import org.apache.cassandra.index.Index;
+import org.apache.cassandra.io.sstable.format.SSTableFormat;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.io.util.File;
+import org.apache.cassandra.schema.TableMetadataRef;
+import org.apache.cassandra.service.ActiveRepairService;
 
-public abstract class AbstractSSTableSimpleWriter
+/**
+ * Base class for the sstable writers used by CQLSSTableWriter.
+ */
+public abstract class AbstractSSTableSimpleWriter implements Closeable
 {
     protected final File directory;
-    protected final CFMetaData metadata;
-    protected DecoratedKey currentKey;
-    protected ColumnFamily columnFamily;
-    protected ByteBuffer currentSuperColumn;
-    protected final CounterId counterid = CounterId.generate();
+    protected final TableMetadataRef metadata;
+    protected final RegularAndStaticColumns columns;
+    protected SSTableFormat<?, ?> format = DatabaseDescriptor.getSelectedSSTableFormat();
+    protected static final AtomicReference<SSTableId> id = new AtomicReference<>(SSTableIdFactory.instance.defaultBuilder().generator(Stream.empty()).get());
+    protected final SSTableId.Builder<? extends SSTableId> idBuilder;
+    protected boolean makeRangeAware = false;
+    protected final Collection<Index.Group> indexGroups;
+    protected Consumer<Collection<SSTableReader>> sstableProducedListener;
+    protected boolean openSSTableOnProduced = false;
+    protected CompressionDictionary compressionDictionary;
+    protected SSTable.Owner owner;
 
-    public AbstractSSTableSimpleWriter(File directory, CFMetaData metadata, IPartitioner partitioner)
+    /**
+     * @param idBuilder builder used to generate SSTable identifiers; if {@code null}, the default builder is used.
+     */
+    protected AbstractSSTableSimpleWriter(File directory, TableMetadataRef metadata, RegularAndStaticColumns columns, @Nullable SSTableId.Builder<? extends SSTableId> idBuilder)
     {
         this.metadata = metadata;
         this.directory = directory;
-        DatabaseDescriptor.setPartitioner(partitioner);
+        this.columns = columns;
+        this.idBuilder = idBuilder != null ? idBuilder : SSTableIdFactory.instance.defaultBuilder();
+        indexGroups = new ArrayList<>();
     }
 
-    protected SSTableWriter getWriter()
+    protected void setSSTableFormatType(SSTableFormat<?, ?> type)
     {
-        return new SSTableWriter(
-            makeFilename(directory, metadata.ksName, metadata.cfName),
-            0, // We don't care about the bloom filter
-            metadata,
-            DatabaseDescriptor.getPartitioner(),
-            SSTableMetadata.createCollector(metadata.comparator));
+        this.format = type;
     }
 
-    // find available generation and pick up filename from that
-    protected static String makeFilename(File directory, final String keyspace, final String columnFamily)
+    protected void setRangeAwareWriting(boolean makeRangeAware)
     {
-        final Set<Descriptor> existing = new HashSet<Descriptor>();
-        directory.list(new FilenameFilter()
-        {
-            public boolean accept(File dir, String name)
-            {
-                Pair<Descriptor, Component> p = SSTable.tryComponentFromFilename(dir, name);
-                Descriptor desc = p == null ? null : p.left;
-                if (desc == null)
-                    return false;
+        this.makeRangeAware = makeRangeAware;
+    }
 
-                if (desc.cfname.equals(columnFamily))
-                    existing.add(desc);
+    protected void addIndexGroup(Index.Group indexGroup)
+    {
+        this.indexGroups.add(indexGroup);
+    }
 
-                return false;
-            }
-        });
-        int maxGen = 0;
-        for (Descriptor desc : existing)
-            maxGen = Math.max(maxGen, desc.generation);
-        return new Descriptor(directory, keyspace, columnFamily, maxGen + 1, true).filenameFor(Component.DATA);
+    public void setCompressionDictionary(CompressionDictionary compressionDictionary)
+    {
+        this.compressionDictionary = compressionDictionary;
+    }
+
+    protected void setSSTableProducedListener(Consumer<Collection<SSTableReader>> listener)
+    {
+        this.sstableProducedListener = Objects.requireNonNull(listener, "sstableProducedListener cannot be null");
+    }
+
+    protected void setShouldOpenProducedSSTable(boolean openSSTableOnProduced)
+    {
+        this.openSSTableOnProduced = openSSTableOnProduced;
     }
 
     /**
-     * Start a new row whose key is {@code key}.
-     * @param key the row key
+     * Indicate whether the produced sstable should be opened or not.
      */
-    public void newRow(ByteBuffer key) throws IOException
+    protected boolean shouldOpenSSTables()
     {
-        if (currentKey != null && !columnFamily.isEmpty())
-            writeRow(currentKey, columnFamily);
-
-        currentKey = DatabaseDescriptor.getPartitioner().decorateKey(key);
-        columnFamily = getColumnFamily();
+        return openSSTableOnProduced;
     }
 
-    /**
-     * Start a new super column with name {@code name}.
-     * @param name the name for the super column
-     */
-    public void newSuperColumn(ByteBuffer name)
+    protected void notifySSTableProduced(Collection<SSTableReader> sstables)
     {
-        if (!columnFamily.metadata().isSuper())
-            throw new IllegalStateException("Cannot add a super column to a standard column family");
+        if (sstableProducedListener == null)
+            return;
 
-        currentSuperColumn = name;
+        sstableProducedListener.accept(sstables);
     }
 
-    private void addColumn(Column column)
+    protected SSTableTxnWriter createWriter(SSTable.Owner owner) throws IOException
     {
-        if (columnFamily.metadata().isSuper())
+        SerializationHeader header = new SerializationHeader(true, metadata.get(), columns, EncodingStats.NO_STATS);
+
+        if (makeRangeAware)
+            return SSTableTxnWriter.createRangeAware(metadata, 0, ActiveRepairService.UNREPAIRED_SSTABLE, ActiveRepairService.NO_PENDING_REPAIR, false, format, header);
+
+
+        SSTable.Owner effectiveOwner;
+
+        if (this.owner != null && this.owner.compressionDictionaryManager() != null && compressionDictionary != null)
         {
-            if (currentSuperColumn == null)
-                throw new IllegalStateException("Trying to add a column to a super column family, but no super column has been started.");
-
-            column = column.withUpdatedName(CompositeType.build(currentSuperColumn, column.name()));
+            // already checks if it is cached or not
+            this.owner.compressionDictionaryManager().add(compressionDictionary);
+            effectiveOwner = this.owner;
         }
-        columnFamily.addColumn(column);
+        else
+        {
+            effectiveOwner = owner;
+        }
+
+        return SSTableTxnWriter.create(metadata,
+                                       createDescriptor(directory, metadata.keyspace, metadata.name, format),
+                                       0,
+                                       ActiveRepairService.UNREPAIRED_SSTABLE,
+                                       ActiveRepairService.NO_PENDING_REPAIR,
+                                       false,
+                                       header,
+                                       indexGroups,
+                                       effectiveOwner);
     }
 
-    /**
-     * Insert a new "regular" column to the current row (and super column if applicable).
-     * @param name the column name
-     * @param value the column value
-     * @param timestamp the column timestamp
-     */
-    public void addColumn(ByteBuffer name, ByteBuffer value, long timestamp)
+    private Descriptor createDescriptor(File directory, final String keyspace, final String columnFamily, final SSTableFormat<?, ?> fmt) throws IOException
     {
-        addColumn(new Column(name, value, timestamp));
+        SSTableId nextGen = getNextId(directory, columnFamily);
+        return new Descriptor(directory, keyspace, columnFamily, nextGen, fmt);
     }
 
-    /**
-     * Insert a new expiring column to the current row (and super column if applicable).
-     * @param name the column name
-     * @param value the column value
-     * @param timestamp the column timestamp
-     * @param ttl the column time to live in seconds
-     * @param expirationTimestampMS the local expiration timestamp in milliseconds. This is the server time timestamp used for actually
-     * expiring the column, and as a consequence should be synchronized with the cassandra servers time. If {@code timestamp} represents
-     * the insertion time in microseconds (which is not required), this should be {@code (timestamp / 1000) + (ttl * 1000)}.
-     */
-    public void addExpiringColumn(ByteBuffer name, ByteBuffer value, long timestamp, int ttl, long expirationTimestampMS)
+    private SSTableId getNextId(File directory, final String columnFamily) throws IOException
     {
-        addColumn(new ExpiringColumn(name, value, timestamp, ttl, (int)(expirationTimestampMS / 1000)));
+        while (true)
+        {
+            try (Stream<Path> existingPaths = Files.list(directory.toPath()))
+            {
+                Stream<SSTableId> existingIds = existingPaths.map(File::new)
+                                                             .map(SSTable::tryDescriptorFromFile)
+                                                             .filter(d -> d != null && d.cfname.equals(columnFamily))
+                                                             .map(d -> d.id);
+
+                SSTableId lastId = id.get();
+                SSTableId newId = idBuilder.generator(Stream.concat(existingIds, Stream.of(lastId))).get();
+                if (id.compareAndSet(lastId, newId))
+                    return newId;
+            }
+        }
     }
 
-    /**
-     * Insert a new counter column to the current row (and super column if applicable).
-     * @param name the column name
-     * @param value the value of the counter
-     */
-    public void addCounterColumn(ByteBuffer name, long value)
+    public PartitionUpdate.Builder getUpdateFor(ByteBuffer key) throws IOException
     {
-        addColumn(new CounterColumn(name, CounterContext.instance().create(counterid, 1L, value, false), System.currentTimeMillis()));
+        return getUpdateFor(metadata.get().partitioner.decorateKey(key));
     }
 
     /**
-     * Close this writer.
-     * This method should be called, otherwise the produced sstables are not
-     * guaranteed to be complete (and won't be in practice).
+     * Returns a PartitionUpdate suitable to write on this writer for the provided key.
+     *
+     * @param key they partition key for which the returned update will be.
+     * @return an update on partition {@code key} that is tied to this writer.
      */
-    public abstract void close() throws IOException;
-
-    /**
-     * Package protected for use by AbstractCQLSSTableWriter.
-     * Not meant to be exposed publicly.
-     */
-    ColumnFamily currentColumnFamily()
-    {
-        return columnFamily;
-    }
-
-    /**
-     * Package protected for use by AbstractCQLSSTableWriter.
-     * Not meant to be exposed publicly.
-     */
-    DecoratedKey currentKey()
-    {
-        return currentKey;
-    }
-
-
-    protected abstract void writeRow(DecoratedKey key, ColumnFamily columnFamily) throws IOException;
-
-    protected abstract ColumnFamily getColumnFamily();
+    abstract PartitionUpdate.Builder getUpdateFor(DecoratedKey key) throws IOException;
 }
+

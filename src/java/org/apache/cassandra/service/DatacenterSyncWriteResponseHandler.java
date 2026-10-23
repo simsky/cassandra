@@ -17,83 +17,109 @@
  */
 package org.apache.cassandra.service;
 
-import java.net.InetAddress;
-import java.util.Collection;
 import java.util.HashMap;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Supplier;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.db.Keyspace;
-import org.apache.cassandra.locator.IEndpointSnitch;
-import org.apache.cassandra.locator.NetworkTopologyStrategy;
-import org.apache.cassandra.net.MessageIn;
 import org.apache.cassandra.db.ConsistencyLevel;
+import org.apache.cassandra.db.MessageParams;
+import org.apache.cassandra.db.Mutation;
 import org.apache.cassandra.db.WriteType;
+import org.apache.cassandra.locator.Locator;
+import org.apache.cassandra.locator.NetworkTopologyStrategy;
+import org.apache.cassandra.locator.Replica;
+import org.apache.cassandra.locator.ReplicaPlan;
+import org.apache.cassandra.net.Message;
+import org.apache.cassandra.net.ParamType;
+import org.apache.cassandra.service.writes.thresholds.WriteWarningContext;
+import org.apache.cassandra.transport.Dispatcher;
 
 /**
  * This class blocks for a quorum of responses _in all datacenters_ (CL.EACH_QUORUM).
  */
-public class DatacenterSyncWriteResponseHandler extends AbstractWriteResponseHandler
+public class DatacenterSyncWriteResponseHandler<T> extends AbstractWriteResponseHandler<T>
 {
-    private static final IEndpointSnitch snitch = DatabaseDescriptor.getEndpointSnitch();
+    private static final Locator locator = DatabaseDescriptor.getLocator();
 
-    private final NetworkTopologyStrategy strategy;
-    private final HashMap<String, AtomicInteger> responses = new HashMap<String, AtomicInteger>();
+    private final Map<String, AtomicInteger> responses = new HashMap<String, AtomicInteger>();
     private final AtomicInteger acks = new AtomicInteger(0);
 
-    public DatacenterSyncWriteResponseHandler(Collection<InetAddress> naturalEndpoints,
-                                              Collection<InetAddress> pendingEndpoints,
-                                              ConsistencyLevel consistencyLevel,
-                                              Keyspace keyspace,
+    public DatacenterSyncWriteResponseHandler(ReplicaPlan.ForWrite replicaPlan,
                                               Runnable callback,
-                                              WriteType writeType)
+                                              WriteType writeType,
+                                              Supplier<Mutation> hintOnFailure,
+                                              Dispatcher.RequestTime requestTime)
     {
         // Response is been managed by the map so make it 1 for the superclass.
-        super(keyspace, naturalEndpoints, pendingEndpoints, consistencyLevel, callback, writeType);
-        assert consistencyLevel == ConsistencyLevel.EACH_QUORUM;
+        super(replicaPlan, callback, writeType, hintOnFailure, requestTime);
+        assert replicaPlan.consistencyLevel() == ConsistencyLevel.EACH_QUORUM;
 
-        strategy = (NetworkTopologyStrategy) keyspace.getReplicationStrategy();
-
-        for (String dc : strategy.getDatacenters())
+        if (replicaPlan.replicationStrategy() instanceof NetworkTopologyStrategy)
         {
-            int rf = strategy.getReplicationFactor(dc);
-            responses.put(dc, new AtomicInteger((rf / 2) + 1));
+            NetworkTopologyStrategy strategy = (NetworkTopologyStrategy) replicaPlan.replicationStrategy();
+            for (String dc : strategy.getDatacenters())
+            {
+                int rf = strategy.getReplicationFactor(dc).allReplicas;
+                responses.put(dc, new AtomicInteger((rf / 2) + 1));
+            }
+        }
+        else
+        {
+            responses.put(locator.local().datacenter, new AtomicInteger(ConsistencyLevel.quorumFor(replicaPlan.replicationStrategy())));
         }
 
         // During bootstrap, we have to include the pending endpoints or we may fail the consistency level
         // guarantees (see #833)
-        for (InetAddress pending : pendingEndpoints)
+        for (Replica pending : replicaPlan.pending())
         {
-            responses.get(snitch.getDatacenter(pending)).incrementAndGet();
+            responses.get(locator.location(pending.endpoint()).datacenter).incrementAndGet();
         }
     }
 
-    public void response(MessageIn message)
+    public void onResponse(Message<T> message)
     {
-        String dataCenter = message == null
-                            ? DatabaseDescriptor.getLocalDataCenter()
-                            : snitch.getDatacenter(message.from);
-
-        responses.get(dataCenter).getAndDecrement();
-        acks.incrementAndGet();
-
-        for (AtomicInteger i : responses.values())
+        try
         {
-            if (i.get() > 0)
-                return;
-        }
+            Map<ParamType, Object> params;
+            String dataCenter;
 
-        // all the quorum conditions are met
-        signal();
+            if (message != null)
+            {
+                params = message.header.params();
+                dataCenter = locator.location(message.from()).datacenter;
+            }
+            else
+            {
+                params = MessageParams.capture();
+                dataCenter = locator.local().datacenter;
+            }
+
+            if (WriteWarningContext.isSupported(params.keySet()))
+                getWarningContext().updateCounters(params);
+
+            responses.get(dataCenter).getAndDecrement();
+            acks.incrementAndGet();
+
+            for (AtomicInteger i : responses.values())
+            {
+                if (i.get() > 0)
+                    return;
+            }
+
+            // all the quorum conditions are met
+            signal();
+        }
+        finally
+        {
+            //Must be last after all subclass processing
+            logResponseToIdealCLDelegate(message);
+        }
     }
 
     protected int ackCount()
     {
         return acks.get();
-    }
-
-    public boolean isLatencyForSnitch()
-    {
-        return false;
     }
 }

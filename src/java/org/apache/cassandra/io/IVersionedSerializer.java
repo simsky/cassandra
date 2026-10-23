@@ -17,35 +17,34 @@
  */
 package org.apache.cassandra.io;
 
-import java.io.DataInput;
-import java.io.DataOutput;
 import java.io.IOException;
 
-public interface IVersionedSerializer<T>
+import org.apache.cassandra.io.util.DataInputPlus;
+import org.apache.cassandra.io.util.DataOutputPlus;
+
+public interface IVersionedSerializer<T> extends IVersionedAsymmetricSerializer<T, T>
 {
-    /**
-     * Serialize the specified type into the specified DataOutputStream instance.
-     * @param t type that needs to be serialized
-     * @param out DataOutput into which serialization needs to happen.
-     * @param version protocol version
-     * @throws java.io.IOException
-     */
-    public void serialize(T t, DataOutput out, int version) throws IOException;
+    static <T> IVersionedSerializer<T> from(UnversionedSerializer<T> delegate)
+    {
+        return new IVersionedSerializer<T>()
+        {
+            @Override
+            public void serialize(T t, DataOutputPlus out, int version) throws IOException
+            {
+                delegate.serialize(t, out);
+            }
 
-    /**
-     * Deserialize into the specified DataInputStream instance.
-     * @param in DataInput from which deserialization needs to happen.
-     * @param version protocol version
-     * @return the type that was deserialized
-     * @throws IOException
-     */
-    public T deserialize(DataInput in, int version) throws IOException;
+            @Override
+            public T deserialize(DataInputPlus in, int version) throws IOException
+            {
+                return delegate.deserialize(in);
+            }
 
-    /**
-     * Calculate serialized size of object without actually serializing.
-     * @param t object to calculate serialized size
-     * @param version protocol version
-     * @return serialized size of object t
-     */
-    public long serializedSize(T t, int version);
+            @Override
+            public long serializedSize(T t, int version)
+            {
+                return delegate.serializedSize(t);
+            }
+        };
+    }
 }

@@ -17,108 +17,106 @@
  */
 package org.apache.cassandra.streaming.messages;
 
-import java.io.DataInput;
-import java.io.DataOutput;
 import java.io.IOException;
-import java.net.InetAddress;
-import java.nio.ByteBuffer;
-import java.util.UUID;
 
 import org.apache.cassandra.db.TypeSizes;
-import org.apache.cassandra.io.IVersionedSerializer;
-import org.apache.cassandra.io.util.DataOutputBuffer;
-import org.apache.cassandra.net.CompactEndpointSerializationHelper;
-import org.apache.cassandra.net.MessagingService;
-import org.apache.cassandra.utils.UUIDSerializer;
+import org.apache.cassandra.io.util.DataInputPlus;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.streaming.PreviewKind;
+import org.apache.cassandra.streaming.StreamOperation;
+import org.apache.cassandra.streaming.StreamResultFuture;
+import org.apache.cassandra.streaming.StreamSession;
+import org.apache.cassandra.streaming.StreamingChannel;
+import org.apache.cassandra.streaming.StreamingDataOutputPlus;
+import org.apache.cassandra.utils.TimeUUID;
+
+import static org.apache.cassandra.locator.InetAddressAndPort.Serializer.inetAddressAndPortSerializer;
 
 /**
  * StreamInitMessage is first sent from the node where {@link org.apache.cassandra.streaming.StreamSession} is started,
  * to initiate corresponding {@link org.apache.cassandra.streaming.StreamSession} on the other side.
  */
-public class StreamInitMessage
+public class StreamInitMessage extends StreamMessage
 {
-    public static IVersionedSerializer<StreamInitMessage> serializer = new StreamInitMessageSerializer();
+    public static Serializer<StreamInitMessage> serializer = new StreamInitMessageSerializer();
 
-    public final InetAddress from;
-    public final UUID planId;
-    public final String description;
+    public final InetAddressAndPort from;
+    public final int sessionIndex;
+    public final TimeUUID planId;
+    public final StreamOperation streamOperation;
 
-    // true if this init message is to connect for outgoing message on receiving side
-    public final boolean isForOutgoing;
+    public final TimeUUID pendingRepair;
+    public final PreviewKind previewKind;
 
-    public StreamInitMessage(InetAddress from, UUID planId, String description, boolean isForOutgoing)
+    public StreamInitMessage(InetAddressAndPort from, int sessionIndex, TimeUUID planId, StreamOperation streamOperation,
+                             TimeUUID pendingRepair, PreviewKind previewKind)
     {
+        super(Type.STREAM_INIT);
         this.from = from;
+        this.sessionIndex = sessionIndex;
         this.planId = planId;
-        this.description = description;
-        this.isForOutgoing = isForOutgoing;
+        this.streamOperation = streamOperation;
+        this.pendingRepair = pendingRepair;
+        this.previewKind = previewKind;
     }
 
-    /**
-     * Create serialized message.
-     *
-     * @param compress true if message is compressed
-     * @param version Streaming protocol version
-     * @return serialized message in ByteBuffer format
-     */
-    public ByteBuffer createMessage(boolean compress, int version)
+    @Override
+    public StreamSession getOrCreateAndAttachInboundSession(StreamingChannel channel, int messagingVersion)
     {
-        int header = 0;
-        // set compression bit.
-        if (compress)
-            header |= 4;
-        // set streaming bit
-        header |= 8;
-        // Setting up the version bit
-        header |= (version << 8);
-
-        byte[] bytes;
-        try
-        {
-            int size = (int)StreamInitMessage.serializer.serializedSize(this, version);
-            DataOutputBuffer buffer = new DataOutputBuffer(size);
-            StreamInitMessage.serializer.serialize(this, buffer, version);
-            bytes = buffer.getData();
-        }
-        catch (IOException e)
-        {
-            throw new RuntimeException(e);
-        }
-        assert bytes.length > 0;
-
-        ByteBuffer buffer = ByteBuffer.allocate(4 + 4 + bytes.length);
-        buffer.putInt(MessagingService.PROTOCOL_MAGIC);
-        buffer.putInt(header);
-        buffer.put(bytes);
-        buffer.flip();
-        return buffer;
+        StreamSession session = StreamResultFuture.createFollower(sessionIndex, planId, streamOperation, from, channel, messagingVersion, pendingRepair, previewKind)
+                                 .getSession(from, sessionIndex);
+        session.attachInbound(channel);
+        return session;
     }
 
-    private static class StreamInitMessageSerializer implements IVersionedSerializer<StreamInitMessage>
+    @Override
+    public String toString()
     {
-        public void serialize(StreamInitMessage message, DataOutput out, int version) throws IOException
+        StringBuilder sb = new StringBuilder(128);
+        sb.append("StreamInitMessage: from = ").append(from);
+        sb.append(", planId = ").append(planId).append(", session index = ").append(sessionIndex);
+        return sb.toString();
+    }
+
+    private static class StreamInitMessageSerializer implements Serializer<StreamInitMessage>
+    {
+        public void serialize(StreamInitMessage message, StreamingDataOutputPlus out, int version, StreamSession session) throws IOException
         {
-            CompactEndpointSerializationHelper.serialize(message.from, out);
-            UUIDSerializer.serializer.serialize(message.planId, out, MessagingService.current_version);
-            out.writeUTF(message.description);
-            out.writeBoolean(message.isForOutgoing);
+            inetAddressAndPortSerializer.serialize(message.from, out, version);
+            out.writeInt(message.sessionIndex);
+            message.planId.serialize(out);
+            out.writeUTF(message.streamOperation.getDescription());
+
+            out.writeBoolean(message.pendingRepair != null);
+            if (message.pendingRepair != null)
+                message.pendingRepair.serialize(out);
+            out.writeInt(message.previewKind.getSerializationVal());
         }
 
-        public StreamInitMessage deserialize(DataInput in, int version) throws IOException
+        public StreamInitMessage deserialize(DataInputPlus in, int version) throws IOException
         {
-            InetAddress from = CompactEndpointSerializationHelper.deserialize(in);
-            UUID planId = UUIDSerializer.serializer.deserialize(in, MessagingService.current_version);
+            InetAddressAndPort from = inetAddressAndPortSerializer.deserialize(in, version);
+            int sessionIndex = in.readInt();
+            TimeUUID planId = TimeUUID.deserialize(in);
             String description = in.readUTF();
-            boolean sentByInitiator = in.readBoolean();
-            return new StreamInitMessage(from, planId, description, sentByInitiator);
+
+            TimeUUID pendingRepair = in.readBoolean() ? TimeUUID.deserialize(in) : null;
+            PreviewKind previewKind = PreviewKind.deserialize(in.readInt());
+            return new StreamInitMessage(from, sessionIndex, planId, StreamOperation.fromString(description),
+                                         pendingRepair, previewKind);
         }
 
         public long serializedSize(StreamInitMessage message, int version)
         {
-            long size = CompactEndpointSerializationHelper.serializedSize(message.from);
-            size += UUIDSerializer.serializer.serializedSize(message.planId, MessagingService.current_version);
-            size += TypeSizes.NATIVE.sizeof(message.description);
-            size += TypeSizes.NATIVE.sizeof(message.isForOutgoing);
+            long size = inetAddressAndPortSerializer.serializedSize(message.from, version);
+            size += TypeSizes.sizeof(message.sessionIndex);
+            size += TimeUUID.sizeInBytes();
+            size += TypeSizes.sizeof(message.streamOperation.getDescription());
+            size += TypeSizes.sizeof(message.pendingRepair != null);
+            if (message.pendingRepair != null)
+                size += TimeUUID.sizeInBytes();
+            size += TypeSizes.sizeof(message.previewKind.getSerializationVal());
+
             return size;
         }
     }

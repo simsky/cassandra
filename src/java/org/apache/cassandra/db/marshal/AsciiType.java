@@ -18,25 +18,82 @@
 package org.apache.cassandra.db.marshal;
 
 import java.nio.ByteBuffer;
+import java.nio.CharBuffer;
+import java.nio.charset.CharacterCodingException;
+import java.nio.charset.CharsetEncoder;
+import java.nio.charset.StandardCharsets;
 
 import org.apache.cassandra.cql3.CQL3Type;
-import org.apache.cassandra.serializers.TypeSerializer;
+import org.apache.cassandra.cql3.functions.ArgumentDeserializer;
+import org.apache.cassandra.cql3.terms.Constants;
+import org.apache.cassandra.cql3.terms.Term;
 import org.apache.cassandra.serializers.AsciiSerializer;
+import org.apache.cassandra.serializers.MarshalException;
+import org.apache.cassandra.serializers.TypeSerializer;
+import org.apache.cassandra.transport.ProtocolVersion;
+import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.JsonUtils;
 
-public class AsciiType extends AbstractType<String>
+import io.netty.util.concurrent.FastThreadLocal;
+
+public class AsciiType extends StringType
 {
     public static final AsciiType instance = new AsciiType();
+    private static final ArgumentDeserializer ARGUMENT_DESERIALIZER = new DefaultArgumentDeserializer(instance);
+    private static final ByteBuffer MASKED_VALUE = instance.decompose("****");
 
-    AsciiType() {} // singleton
+    AsciiType() {super(ComparisonType.BYTE_ORDER);} // singleton
 
-    public int compare(ByteBuffer o1, ByteBuffer o2)
+    private final FastThreadLocal<CharsetEncoder> encoder = new FastThreadLocal<CharsetEncoder>()
     {
-        return BytesType.bytesCompare(o1, o2);
-    }
+        @Override
+        protected CharsetEncoder initialValue()
+        {
+            return StandardCharsets.US_ASCII.newEncoder();
+        }
+    };
 
     public ByteBuffer fromString(String source)
     {
-        return decompose(source);
+        // the encoder must be reset each time it's used, hence the thread-local storage
+        CharsetEncoder theEncoder = encoder.get();
+        theEncoder.reset();
+
+        try
+        {
+            return theEncoder.encode(CharBuffer.wrap(source));
+        }
+        catch (CharacterCodingException exc)
+        {
+            throw new MarshalException(String.format("Invalid ASCII character in string literal: %s", exc));
+        }
+    }
+
+    @Override
+    public Term fromJSONObject(Object parsed) throws MarshalException
+    {
+        try
+        {
+            return new Constants.Value(fromString((String) parsed));
+        }
+        catch (ClassCastException exc)
+        {
+            throw new MarshalException(String.format(
+                    "Expected an ascii string, but got a %s: %s", parsed.getClass().getSimpleName(), parsed));
+        }
+    }
+
+    @Override
+    public String toJSONString(ByteBuffer buffer, ProtocolVersion protocolVersion)
+    {
+        try
+        {
+            return '"' + JsonUtils.quoteAsJsonString(ByteBufferUtil.string(buffer, StandardCharsets.US_ASCII)) + '"';
+        }
+        catch (CharacterCodingException exc)
+        {
+            throw new AssertionError("ascii value contained non-ascii characters: ", exc);
+        }
     }
 
     public CQL3Type asCQL3Type()
@@ -47,5 +104,17 @@ public class AsciiType extends AbstractType<String>
     public TypeSerializer<String> getSerializer()
     {
         return AsciiSerializer.instance;
+    }
+
+    @Override
+    public ArgumentDeserializer getArgumentDeserializer()
+    {
+        return ARGUMENT_DESERIALIZER;
+    }
+
+    @Override
+    public ByteBuffer getMaskedValue()
+    {
+        return MASKED_VALUE;
     }
 }

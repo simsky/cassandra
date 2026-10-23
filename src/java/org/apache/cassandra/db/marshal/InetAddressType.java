@@ -18,23 +18,39 @@
 package org.apache.cassandra.db.marshal;
 
 import java.net.InetAddress;
+import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 
 import org.apache.cassandra.cql3.CQL3Type;
-import org.apache.cassandra.serializers.TypeSerializer;
+import org.apache.cassandra.cql3.functions.ArgumentDeserializer;
+import org.apache.cassandra.cql3.terms.Constants;
+import org.apache.cassandra.cql3.terms.Term;
 import org.apache.cassandra.serializers.InetAddressSerializer;
 import org.apache.cassandra.serializers.MarshalException;
+import org.apache.cassandra.serializers.TypeSerializer;
+import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
 public class InetAddressType extends AbstractType<InetAddress>
 {
     public static final InetAddressType instance = new InetAddressType();
 
-    InetAddressType() {} // singleton
+    private static final ArgumentDeserializer ARGUMENT_DESERIALIZER = new DefaultArgumentDeserializer(instance);
 
-    public int compare(ByteBuffer o1, ByteBuffer o2)
+    private static final ByteBuffer MASKED_VALUE = instance.decompose(new InetSocketAddress(0).getAddress());
+
+    InetAddressType() {super(ComparisonType.BYTE_ORDER);} // singleton
+
+    @Override
+    public boolean allowsEmpty()
     {
-        return ByteBufferUtil.compareUnsigned(o1, o2);
+        return true;
+    }
+
+    @Override
+    public boolean isEmptyValueMeaningless()
+    {
+        return true;
     }
 
     public ByteBuffer fromString(String source) throws MarshalException
@@ -51,10 +67,35 @@ public class InetAddressType extends AbstractType<InetAddress>
         }
         catch (Exception e)
         {
-            throw new MarshalException(String.format("unable to make inetaddress from '%s'", source), e);
+            throw new MarshalException(String.format("Unable to make inet address from '%s'", source), e);
         }
 
         return decompose(address);
+    }
+
+    @Override
+    public Term fromJSONObject(Object parsed) throws MarshalException
+    {
+        try
+        {
+            return new Constants.Value(InetAddressType.instance.fromString((String) parsed));
+        }
+        catch (ClassCastException exc)
+        {
+            throw new MarshalException(String.format(
+                    "Expected a string representation of an inet value, but got a %s: %s", parsed.getClass().getSimpleName(), parsed));
+        }
+    }
+
+    private String toString(InetAddress inet)
+    {
+        return inet != null ? inet.getHostAddress() : "";
+    }
+
+    @Override
+    public String toJSONString(ByteBuffer buffer, ProtocolVersion protocolVersion)
+    {
+        return '"' + toString(getSerializer().deserialize(buffer)) + '"';
     }
 
     public CQL3Type asCQL3Type()
@@ -65,5 +106,17 @@ public class InetAddressType extends AbstractType<InetAddress>
     public TypeSerializer<InetAddress> getSerializer()
     {
         return InetAddressSerializer.instance;
+    }
+
+    @Override
+    public ArgumentDeserializer getArgumentDeserializer()
+    {
+        return ARGUMENT_DESERIALIZER;
+    }
+
+    @Override
+    public ByteBuffer getMaskedValue()
+    {
+        return MASKED_VALUE;
     }
 }

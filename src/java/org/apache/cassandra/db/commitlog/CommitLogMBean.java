@@ -20,29 +20,44 @@ package org.apache.cassandra.db.commitlog;
 
 import java.io.IOException;
 import java.util.List;
+import java.util.Map;
 
 public interface CommitLogMBean
 {
     /**
-     * Get the number of completed tasks
-     * @see org.apache.cassandra.metrics.CommitLogMetrics#completedTasks
+     *  Command to execute to archive a commitlog segment.  Blank to disabled.
      */
-    @Deprecated
-    public long getCompletedTasks();
+    public String getArchiveCommand();
 
     /**
-     * Get the number of tasks waiting to be executed
-     * @see org.apache.cassandra.metrics.CommitLogMetrics#pendingTasks
+     * Command to execute to make an archived commitlog live again
      */
-    @Deprecated
-    public long getPendingTasks();
+    public String getRestoreCommand();
 
     /**
-     * Get the current size used by all the commitlog segments.
-     * @see org.apache.cassandra.metrics.CommitLogMetrics#totalCommitLogSize
+     * Directory to scan the recovery files in
      */
-    @Deprecated
-    public long getTotalCommitlogSize();
+    public String getRestoreDirectories();
+
+    /**
+     * Restore mutations created up to and including this timestamp in GMT
+     * There are only three different formats to express three time precisions:
+     * Seconds, Milliseconds, and Microseconds.
+     * Seconds format: yyyy:MM:dd HH:mm:ss (2012:04:31 20:43:12)
+     * Milliseconds format: yyyy:MM:dd HH:mm:ss.SSS (2012:04:31 20:43:12.633)
+     * Microseconds format: yyyy:MM:dd HH:mm:ss.SSSSSS (2012:04:31 20:43:12.633222)
+     *
+     * Recovery will continue through the segment when the first client-supplied
+     * timestamp greater than this time is encountered, but only mutations less than
+     * or equal to this timestamp will be applied.
+     */
+    public long getRestorePointInTime();
+
+    /**
+     * get precision of the timestamp used in the restore (MILLISECONDS, MICROSECONDS, ...)
+     * to determine if passed the restore point in time.
+     */
+    public String getRestorePrecision();
 
     /**
      * Recover a single file.
@@ -53,9 +68,34 @@ public interface CommitLogMBean
      * @return file names (not full paths) of active commit log segments (segments containing unflushed data)
      */
     public List<String> getActiveSegmentNames();
-    
+
     /**
      * @return Files which are pending for archival attempt.  Does NOT include failed archive attempts.
      */
     public List<String> getArchivingSegmentNames();
+
+    /**
+     * @return The size of the mutations in all active commit log segments (uncompressed).
+     */
+    public long getActiveContentSize();
+
+    /**
+     * @return The space taken on disk by the commit log (compressed).
+     */
+    public long getActiveOnDiskSize();
+
+    /**
+     * @return A map between active log segments and the compression ratio achieved for each.
+     */
+    public Map<String, Double> getActiveSegmentCompressionRatios();
+
+    public boolean getCDCBlockWrites();
+
+    public void setCDCBlockWrites(boolean val);
+
+    /** Returns true if internodes streaming of CDC data should go through write path */
+    boolean isCDCOnRepairEnabled();
+
+    /** Set whether enable write path for CDC data during internodes streaming, e.g. repair */
+    void setCDCOnRepairEnabled(boolean value);
 }

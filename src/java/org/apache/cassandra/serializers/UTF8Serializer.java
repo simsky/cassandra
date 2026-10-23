@@ -20,24 +20,29 @@ package org.apache.cassandra.serializers;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 
+import org.apache.cassandra.db.marshal.ByteArrayAccessor;
+import org.apache.cassandra.db.marshal.ByteBufferAccessor;
+import org.apache.cassandra.db.marshal.ValueAccessor;
+
 public class UTF8Serializer extends AbstractTextSerializer
 {
     public static final UTF8Serializer instance = new UTF8Serializer();
 
-    private UTF8Serializer()
+    protected UTF8Serializer()
     {
         super(StandardCharsets.UTF_8);
     }
 
-    public void validate(ByteBuffer bytes) throws MarshalException
+    public <V> void validate(V value, ValueAccessor<V> accessor) throws MarshalException
     {
-        if (!UTF8Validator.validate(bytes))
+        if (!UTF8Validator.validate(value, accessor))
             throw new MarshalException("String didn't validate.");
     }
 
     static class UTF8Validator
     {
-        enum State {
+        enum State
+        {
             START,
             TWO,
             TWO_80,
@@ -50,14 +55,62 @@ public class UTF8Serializer extends AbstractTextSerializer
 
         // since we're not converting to java strings, we don't need to worry about converting to surrogates.
         // buf has already been sliced/duplicated.
-        static boolean validate(ByteBuffer buf)
+        static <V> boolean validate(V value, ValueAccessor<V> accessor)
         {
-            buf = buf.slice();
-            int b = 0;
-            State state = State.START;
-            while (buf.remaining() > 0)
+            if (value == null)
+                return false;
+
+            // perf optimizations:
+            // 1) avoid bimorphic/megamorphic calls via ValueAccessor
+            // 2) use a simplified logic to handle ASCII prefixed String scenario faster
+            if (accessor == ByteArrayAccessor.instance)
             {
-                b = buf.get();
+                byte[] valueAsArray = accessor.toArray(value);
+                return validateByteArray(valueAsArray, 0, valueAsArray.length, value, accessor);
+            }
+
+            if (accessor == ByteBufferAccessor.instance)
+            {
+                ByteBuffer valueAsBuffer = accessor.toBuffer(value);
+                if (valueAsBuffer.hasArray())
+                {
+                    byte[] valueAsArray = valueAsBuffer.array();
+                    int start = valueAsBuffer.position();
+                    int end = start + valueAsBuffer.remaining();
+                    return validateByteArray(valueAsArray, start, end, value, accessor);
+                }
+            }
+
+            int end = accessor.size(value);
+            for (int i = 0; i < end; i++)
+            {
+                if (accessor.getByte(value, i) < 0)
+                {
+                    return validateSlowPath(value, accessor, i);
+                }
+            }
+            return true;
+        }
+
+        private static <V> boolean validateByteArray(byte[] valueAsArray, int start, int end,
+                                                     V value, ValueAccessor<V> accessor)
+        {
+            assert start >= 0 && end <= valueAsArray.length;
+            for (int i = start; i < end; i++)
+            {
+                if (valueAsArray[i] < 0)
+                    return validateSlowPath(value, accessor, i - start);
+            }
+            return true;
+        }
+
+        private static <V> boolean validateSlowPath(V value, ValueAccessor<V> accessor, int offset)
+        {
+            int b;
+            State state = State.START;
+            while (!accessor.isEmptyFromOffset(value, offset))
+            {
+                b = accessor.getByte(value, offset++);
                 switch (state)
                 {
                     case START:
@@ -71,11 +124,12 @@ public class UTF8Serializer extends AbstractTextSerializer
                         {
                             // validate first byte of 2-byte char, 0xc2-0xdf
                             if (b == (byte) 0xc0)
-                                // speical case: modified utf8 null is 0xc080.
+                                // special case: modified utf8 null is 0xc080.
                                 state = State.TWO_80;
                             else if ((b & 0x1e) == 0)
                                 return false;
-                            state = State.TWO;
+                            else
+                                state = State.TWO;
                         }
                         else if ((b >> 4) == -2)
                         {
@@ -93,10 +147,8 @@ public class UTF8Serializer extends AbstractTextSerializer
                             if (b == (byte)0xf0)
                                 // 0xf0, 0x90-0xbf, 0x80-0xbf, 0x80-0xbf
                                 state = State.FOUR_90bf;
-                            else if (b == (byte)0xf4)
-                                // 0xf4, 0x80-0xbf, 0x80-0xbf, 0x80-0xbf
-                                state = State.FOUR_80bf_3;
                             else
+                                // 0xf4, 0x80-0xbf, 0x80-0xbf, 0x80-0xbf
                                 // 0xf1-0xf3, 0x80-0xbf, 0x80-0xbf, 0x80-0xbf
                                 state = State.FOUR_80bf_3;
                             break;

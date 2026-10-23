@@ -17,17 +17,21 @@
  */
 package org.apache.cassandra.transport;
 
-import org.jboss.netty.channel.Channel;
+import io.netty.channel.Channel;
+import io.netty.util.AttributeKey;
 
 public class Connection
 {
+    static final AttributeKey<Connection> attributeKey = AttributeKey.valueOf("CONN");
+
     private final Channel channel;
-    private final int version;
+    private final ProtocolVersion version;
     private final Tracker tracker;
 
-    private volatile FrameCompressor frameCompressor;
+    private boolean throwOnOverload;
+    private volatile Compressor preV5MessageCompressor;
 
-    public Connection(Channel channel, int version, Tracker tracker)
+    public Connection(Channel channel, ProtocolVersion version, Tracker tracker)
     {
         this.channel = channel;
         this.version = version;
@@ -36,14 +40,24 @@ public class Connection
         tracker.addConnection(channel, this);
     }
 
-    public void setCompressor(FrameCompressor compressor)
+    public void setCompressor(Compressor compressor)
     {
-        this.frameCompressor = compressor;
+        this.preV5MessageCompressor = compressor;
     }
 
-    public FrameCompressor getCompressor()
+    public Compressor getCompressor()
     {
-        return frameCompressor;
+        return preV5MessageCompressor;
+    }
+
+    public void setThrowOnOverload(boolean throwOnOverload)
+    {
+        this.throwOnOverload = throwOnOverload;
+    }
+
+    public boolean isThrowOnOverload()
+    {
+        return throwOnOverload;
     }
 
     public Tracker getTracker()
@@ -51,7 +65,7 @@ public class Connection
         return tracker;
     }
 
-    public int getVersion()
+    public ProtocolVersion getVersion()
     {
         return version;
     }
@@ -63,12 +77,12 @@ public class Connection
 
     public interface Factory
     {
-        public Connection newConnection(Channel channel, int version);
+        Connection newConnection(Channel channel, ProtocolVersion version);
     }
 
     public interface Tracker
     {
-        public void addConnection(Channel ch, Connection connection);
-        public void closeAll();
+        void addConnection(Channel ch, Connection connection);
+        boolean isRunning();
     }
 }

@@ -17,60 +17,122 @@
  */
 package org.apache.cassandra.io.util;
 
-import java.io.*;
-import java.lang.reflect.InvocationTargetException;
-import java.lang.reflect.Method;
-import java.nio.MappedByteBuffer;
+import java.io.BufferedWriter;
+import java.io.Closeable;
+import java.io.IOException;
+import java.io.OutputStreamWriter;
+import java.nio.channels.Channels;
+import java.nio.channels.ClosedChannelException;
+import java.nio.channels.FileChannel;
+import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.DirectoryNotEmptyException;
+import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
-import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
+import java.nio.file.SimpleFileVisitor;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.text.DecimalFormat;
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.EnumSet;
+import java.util.List;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+import com.google.common.base.Preconditions;
+import com.google.common.util.concurrent.RateLimiter;
+import com.sun.nio.file.ExtendedOpenOption;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.db.BlacklistedDirectories;
-import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.io.FSError;
-import org.apache.cassandra.io.FSReadError;
 import org.apache.cassandra.io.FSWriteError;
-import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.utils.JVMStabilityInspector;
+import org.apache.cassandra.utils.SyncUtil;
 
-public class FileUtils
+import static org.apache.cassandra.config.CassandraRelevantProperties.JAVA_IO_TMPDIR;
+import static org.apache.cassandra.utils.Throwables.maybeFail;
+
+public final class FileUtils
 {
+    public static final Charset CHARSET = StandardCharsets.UTF_8;
+
     private static final Logger logger = LoggerFactory.getLogger(FileUtils.class);
-    private static final double KB = 1024d;
-    private static final double MB = 1024*1024d;
-    private static final double GB = 1024*1024*1024d;
-    private static final double TB = 1024*1024*1024*1024d;
+
+    public static final long ONE_KIB = 1024;
+    public static final long ONE_MIB = 1024 * ONE_KIB;
+    public static final long ONE_GIB = 1024 * ONE_MIB;
+    public static final long ONE_TIB = 1024 * ONE_GIB;
 
     private static final DecimalFormat df = new DecimalFormat("#.##");
 
-    private static final Method cleanerMethod;
+    private static final File tempDir = new File(JAVA_IO_TMPDIR.getString());
+    private static final AtomicLong tempFileNum = new AtomicLong();
 
-    static
+    public static File getTempDir()
     {
-        Method m;
-        try
+        return tempDir;
+    }
+
+    /**
+     * Pretty much like {@link java.io.File#createTempFile(String, String, java.io.File)}, but with
+     * the guarantee that the "random" part of the generated file name between
+     * {@code prefix} and {@code suffix} is a positive, increasing {@code long} value.
+     */
+    public static File createTempFile(String prefix, String suffix, File directory)
+    {
+        // Do not use java.io.File.createTempFile(), because some tests rely on the
+        // behavior that the "random" part in the temp file name is a positive 'long'.
+        // However, at least since Java 9 the code to generate the "random" part
+        // uses an _unsigned_ random long generated like this:
+        // Long.toUnsignedString(new java.util.Random.nextLong())
+
+        while (true)
         {
-            m = Class.forName("sun.nio.ch.DirectBuffer").getMethod("cleaner");
+            // The contract of File.createTempFile() says, that it must not return
+            // the same file name again. We do that here in a very simple way,
+            // that probably doesn't cover all edge cases. Just rely on system
+            // wall clock and return strictly increasing values from that.
+            long num = tempFileNum.getAndIncrement();
+
+            // We have a positive long here, which is safe to use for example
+            // for CommitLogTest.
+            String fileName = prefix + num + suffix;
+            File candidate = new File(directory, fileName);
+            if (candidate.createFileIfNotExists())
+                return candidate;
         }
-        catch (Exception e)
-        {
-            // Perhaps a non-sun-derived JVM - contributions welcome
-            logger.info("Cannot initialize un-mmaper.  (Are you using a non-SUN JVM?)  Compacted data files will not be removed promptly.  Consider using a SUN JVM or using standard disk access mode");
-            m = null;
-        }
-        cleanerMethod = m;
+    }
+
+    public static File createTempFile(String prefix, String suffix)
+    {
+        return createTempFile(prefix, suffix, tempDir);
+    }
+
+    public static File createDeletableTempFile(String prefix, String suffix)
+    {
+        File f = createTempFile(prefix, suffix, getTempDir());
+        f.deleteOnExit();
+        return f;
+    }
+
+    public static void createHardLink(String from, String to)
+    {
+        createHardLink(new File(from), new File(to));
     }
 
     public static void createHardLink(File from, File to)
     {
         if (to.exists())
-            throw new RuntimeException("Tried to create duplicate hard link to " + to);
+            throw new DuplicateHardlinkException("Tried to create duplicate hard link from " + from + " to " + to);
         if (!from.exists())
             throw new RuntimeException("Tried to hard link to file that does not exist " + from);
 
@@ -84,125 +146,115 @@ public class FileUtils
         }
     }
 
-    public static File createTempFile(String prefix, String suffix, File directory)
+    public static void createHardLinkWithConfirm(String from, String to)
+    {
+        createHardLinkWithConfirm(new File(from), new File(to));
+    }
+
+    public static void createHardLinkWithConfirm(File from, File to)
     {
         try
         {
-            return File.createTempFile(prefix, suffix, directory);
+            createHardLink(from, to);
         }
-        catch (IOException e)
+        catch (FSWriteError ex)
         {
-            throw new FSWriteError(e, directory);
+            throw ex;
         }
-    }
-
-    public static File createTempFile(String prefix, String suffix)
-    {
-        return createTempFile(prefix, suffix, new File(System.getProperty("java.io.tmpdir")));
-    }
-
-    public static void deleteWithConfirm(String file)
-    {
-        deleteWithConfirm(new File(file));
-    }
-
-    public static void deleteWithConfirm(File file)
-    {
-        assert file.exists() : "attempted to delete non-existing file " + file.getName();
-        if (logger.isDebugEnabled())
-            logger.debug("Deleting {}", file.getName());
-        try
+        catch (DuplicateHardlinkException ex)
         {
-            Files.delete(file.toPath());
+            throw new RuntimeException(ex.getMessage());
         }
-        catch (IOException e)
+        catch (Throwable t)
         {
-            throw new FSWriteError(e, file);
+            throw new RuntimeException(String.format("Unable to hardlink from %s to %s", from, to), t);
         }
     }
 
-    public static void renameWithOutConfirm(String from, String to)
+    public static void createHardLinkWithoutConfirm(String from, String to)
+    {
+        createHardLinkWithoutConfirm(new File(from), new File(to));
+    }
+
+    public static void createHardLinkWithoutConfirm(File from, File to)
     {
         try
         {
-            atomicMoveWithFallback(new File(from).toPath(), new File(to).toPath());
+            createHardLink(from, to);
+        }
+        catch (FSWriteError fse)
+        {
+            if (logger.isTraceEnabled())
+                logger.trace("Could not hardlink file {} to {}", from, to, fse);
+        }
+    }
+
+    public static void copyWithOutConfirm(String from, String to)
+    {
+        copyWithOutConfirm(new File(from), new File(to));
+    }
+
+    public static void copyWithOutConfirm(File from, File to)
+    {
+        try
+        {
+            Files.copy(from.toPath(), to.toPath());
         }
         catch (IOException e)
         {
             if (logger.isTraceEnabled())
-                logger.trace("Could not move file "+from+" to "+to, e);
+                logger.trace("Could not copy file {} to {}", from, to, e);
         }
     }
 
-    public static void renameWithConfirm(String from, String to)
+    public static void copyWithConfirm(String from, String to)
     {
-        renameWithConfirm(new File(from), new File(to));
+        copyWithConfirm(new File(from), new File(to));
     }
 
-    public static void renameWithConfirm(File from, File to)
+    public static void copyWithConfirm(File from, File to)
     {
         assert from.exists();
-        if (logger.isDebugEnabled())
-            logger.debug((String.format("Renaming %s to %s", from.getPath(), to.getPath())));
-        // this is not FSWE because usually when we see it it's because we didn't close the file before renaming it,
-        // and Windows is picky about that.
+        if (logger.isTraceEnabled())
+            logger.trace("Copying {} to {}", from.path(), to.path());
+
         try
         {
-            atomicMoveWithFallback(from.toPath(), to.toPath());
+            Files.copy(from.toPath(), to.toPath());
         }
         catch (IOException e)
         {
-            throw new RuntimeException(String.format("Failed to rename %s to %s", from.getPath(), to.getPath()), e);
+            throw new FSWriteError(e, "Could not copy file" + from + " to " + to);
         }
     }
 
-    /**
-     * Move a file atomically, if it fails, it falls back to a non-atomic operation
-     * @param from
-     * @param to
-     * @throws IOException
-     */
-    private static void atomicMoveWithFallback(Path from, Path to) throws IOException
-    {
-        try
-        {
-            Files.move(from, to, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
-        }
-        catch (AtomicMoveNotSupportedException e)
-        {
-            logger.debug("Could not do an atomic move", e);
-            Files.move(from, to, StandardCopyOption.REPLACE_EXISTING);
-        }
-
-    }
     public static void truncate(String path, long size)
     {
-        RandomAccessFile file;
-
-        try
+        File file = new File(path);
+        try (FileChannel channel = file.newReadWriteChannel())
         {
-            file = new RandomAccessFile(path, "rw");
-        }
-        catch (FileNotFoundException e)
-        {
-            throw new RuntimeException(e);
-        }
-
-        try
-        {
-            file.getChannel().truncate(size);
+            channel.truncate(size);
         }
         catch (IOException e)
         {
-            throw new FSWriteError(e, path);
-        }
-        finally
-        {
-            closeQuietly(file);
+            throw PathUtils.propagateUnchecked(e, file.toPath(), true);
         }
     }
 
     public static void closeQuietly(Closeable c)
+    {
+        try
+        {
+            if (c != null)
+                c.close();
+        }
+        catch (Exception e)
+        {
+            logger.warn("Failed closing {}", c, e);
+        }
+    }
+
+    public static void closeQuietly(AutoCloseable c)
     {
         try
         {
@@ -222,7 +274,7 @@ public class FileUtils
 
     public static void close(Iterable<? extends Closeable> cs) throws IOException
     {
-        IOException e = null;
+        Throwable e = null;
         for (Closeable c : cs)
         {
             try
@@ -230,132 +282,121 @@ public class FileUtils
                 if (c != null)
                     c.close();
             }
-            catch (IOException ex)
+            catch (Throwable ex)
             {
-                e = ex;
+                if (e == null) e = ex;
+                else e.addSuppressed(ex);
                 logger.warn("Failed closing stream {}", c, ex);
             }
         }
-        if (e != null)
-            throw e;
+        maybeFail(e, IOException.class);
+    }
+
+    public static void closeQuietly(Iterable<? extends AutoCloseable> cs)
+    {
+        for (AutoCloseable c : cs)
+        {
+            try
+            {
+                if (c != null)
+                    c.close();
+            }
+            catch (Exception ex)
+            {
+                logger.warn("Failed closing {}", c, ex);
+            }
+        }
     }
 
     public static String getCanonicalPath(String filename)
     {
-        try
-        {
-            return new File(filename).getCanonicalPath();
-        }
-        catch (IOException e)
-        {
-            throw new FSReadError(e, filename);
-        }
+        return new File(filename).canonicalPath();
     }
 
     public static String getCanonicalPath(File file)
     {
-        try
+        return file.canonicalPath();
+    }
+
+    /** Return true if file is contained in folder */
+    public static boolean isContained(File folder, File file)
+    {
+        return folder.isAncestorOf(file);
+    }
+
+    public static long parseFileSize(String value)
+    {
+        long result;
+        if (!value.matches("\\d+(\\.\\d+)? (GiB|KiB|MiB|TiB|bytes)"))
         {
-            return file.getCanonicalPath();
+            throw new IllegalArgumentException(
+                String.format("value %s is not a valid human-readable file size", value));
         }
-        catch (IOException e)
+        if (value.endsWith(" TiB"))
         {
-            throw new FSReadError(e, file);
+            result = Math.round(Double.valueOf(value.replace(" TiB", "")) * ONE_TIB);
+            return result;
+        }
+        else if (value.endsWith(" GiB"))
+        {
+            result = Math.round(Double.valueOf(value.replace(" GiB", "")) * ONE_GIB);
+            return result;
+        }
+        else if (value.endsWith(" KiB"))
+        {
+            result = Math.round(Double.valueOf(value.replace(" KiB", "")) * ONE_KIB);
+            return result;
+        }
+        else if (value.endsWith(" MiB"))
+        {
+            result = Math.round(Double.valueOf(value.replace(" MiB", "")) * ONE_MIB);
+            return result;
+        }
+        else if (value.endsWith(" bytes"))
+        {
+            result = Math.round(Double.valueOf(value.replace(" bytes", "")));
+            return result;
+        }
+        else
+        {
+            throw new IllegalStateException(String.format("FileUtils.parseFileSize() reached an illegal state parsing %s", value));
         }
     }
 
-    public static boolean isCleanerAvailable()
+    public static String stringifyFileSize(long bytes, boolean humanReadable)
     {
-        return cleanerMethod != null;
-    }
-
-    public static void clean(MappedByteBuffer buffer)
-    {
-        try
-        {
-            Object cleaner = cleanerMethod.invoke(buffer);
-            cleaner.getClass().getMethod("clean").invoke(cleaner);
-        }
-        catch (IllegalAccessException e)
-        {
-            throw new RuntimeException(e);
-        }
-        catch (InvocationTargetException e)
-        {
-            throw new RuntimeException(e);
-        }
-        catch (NoSuchMethodException e)
-        {
-            throw new RuntimeException(e);
-        }
-    }
-
-    public static void createDirectory(String directory)
-    {
-        createDirectory(new File(directory));
-    }
-
-    public static void createDirectory(File directory)
-    {
-        if (!directory.exists())
-        {
-            if (!directory.mkdirs())
-                throw new FSWriteError(new IOException("Failed to mkdirs " + directory), directory);
-        }
-    }
-
-    public static boolean delete(String file)
-    {
-        File f = new File(file);
-        return f.delete();
-    }
-
-    public static void delete(File[] files)
-    {
-        for ( File file : files )
-        {
-            file.delete();
-        }
-    }
-
-    public static void deleteAsync(final String file)
-    {
-        Runnable runnable = new Runnable()
-        {
-            public void run()
-            {
-                deleteWithConfirm(new File(file));
-            }
-        };
-        StorageService.tasks.execute(runnable);
+        if (humanReadable)
+            return stringifyFileSize(bytes);
+        else
+            return Long.toString(bytes);
     }
 
     public static String stringifyFileSize(double value)
     {
         double d;
-        if ( value >= TB )
+        if (value >= ONE_TIB)
         {
-            d = value / TB;
+            d = value / ONE_TIB;
             String val = df.format(d);
-            return val + " TB";
+            return val + " TiB";
         }
-        else if ( value >= GB )
+        else if (value >= ONE_GIB)
         {
-            d = value / GB;
+            d = value / ONE_GIB;
             String val = df.format(d);
-            return val + " GB";
+            return val + " GiB";
         }
-        else if ( value >= MB )
+        else if (value >= ONE_MIB)
         {
-            d = value / MB;
+            d = value / ONE_MIB;
             String val = df.format(d);
-            return val + " MB";
+            return val + " MiB";
         }
-        else if ( value >= KB )
+        else if (value >= ONE_KIB)
         {
-            d = value / KB;
+            d = value / ONE_KIB;
             String val = df.format(d);
-            return val + " KB";
+            return val + " KiB";
         }
         else
         {
@@ -365,86 +406,422 @@ public class FileUtils
     }
 
     /**
+     * handleFSErrorAndPropagate will invoke the disk failure policy error handler,
+     * which may or may not stop the daemon or transports. However, if we don't exit,
+     * we still want to propagate the exception to the caller in case they have custom
+     * exception handling
+     *
+     * @param e A filesystem error
+     */
+    public static void handleFSErrorAndPropagate(FSError e)
+    {
+        JVMStabilityInspector.inspectThrowable(e);
+        throw e;
+    }
+
+    /**
+     * Get the size of a directory in bytes
+     * @param folder The directory for which we need size.
+     * @return The size of the directory
+     */
+    public static long folderSize(File folder)
+    {
+        if (!folder.exists())
+            return 0;
+
+        final long [] sizeArr = {0L};
+        try
+        {
+            Files.walkFileTree(folder.toPath(), new SimpleFileVisitor<Path>()
+            {
+                @Override
+                public FileVisitResult visitFile(Path file, BasicFileAttributes attrs)
+                {
+                    sizeArr[0] += attrs.size();
+                    return FileVisitResult.CONTINUE;
+                }
+
+                @Override
+                public FileVisitResult visitFileFailed(Path path, IOException e) throws IOException
+                {
+                    if (e instanceof NoSuchFileException)
+                        return FileVisitResult.CONTINUE;
+                    else
+                        throw e;
+                }
+            });
+        }
+        catch (IOException e)
+        {
+            logger.error("Error while getting {} folder size. {}", folder, e.getMessage());
+        }
+        return sizeArr[0];
+    }
+
+    public static void append(File file, String ... lines)
+    {
+        if (file.exists())
+            write(file, Arrays.asList(lines), StandardOpenOption.APPEND);
+        else
+            write(file, Arrays.asList(lines), StandardOpenOption.CREATE);
+    }
+
+    public static void appendAndSync(File file, String ... lines)
+    {
+        if (file.exists())
+            write(file, Arrays.asList(lines), StandardOpenOption.APPEND, StandardOpenOption.SYNC);
+        else
+            write(file, Arrays.asList(lines), StandardOpenOption.CREATE, StandardOpenOption.SYNC);
+    }
+
+    public static void replace(File file, String ... lines)
+    {
+        write(file, Arrays.asList(lines), StandardOpenOption.TRUNCATE_EXISTING);
+    }
+
+    /**
+     * Write lines to a file adding a newline to the end of each supplied line using the provided open options.
+     *
+     * If open option sync or dsync is provided this will not open the file with sync or dsync since it might end up syncing
+     * many times for a lot of lines. Instead it will write all the lines and sync once at the end. Since the file is
+     * never returned there is not much difference from the perspective of the caller.
+     * @param file
+     * @param lines
+     * @param options
+     */
+    public static void write(File file, List<String> lines, StandardOpenOption ... options)
+    {
+        Set<StandardOpenOption> optionsSet = EnumSet.noneOf(StandardOpenOption.class);
+        for (StandardOpenOption option : options)
+            optionsSet.add(option);
+
+        //Emulate the old FileSystemProvider.newOutputStream behavior for open options.
+        if (optionsSet.isEmpty())
+        {
+            optionsSet.add(StandardOpenOption.CREATE);
+            optionsSet.add(StandardOpenOption.TRUNCATE_EXISTING);
+        }
+        boolean sync = optionsSet.remove(StandardOpenOption.SYNC);
+        boolean dsync = optionsSet.remove(StandardOpenOption.DSYNC);
+        optionsSet.add(StandardOpenOption.WRITE);
+
+        Path filePath = file.toPath();
+        try (FileChannel fc = filePath.getFileSystem().provider().newFileChannel(filePath, optionsSet);
+             BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(Channels.newOutputStream(fc), CHARSET.newEncoder())))
+        {
+            for (CharSequence line: lines) {
+                writer.append(line);
+                writer.newLine();
+            }
+
+            writer.flush();
+
+            if (sync)
+            {
+                SyncUtil.force(fc, true);
+            }
+            else if (dsync)
+            {
+                SyncUtil.force(fc, false);
+            }
+        }
+        catch (ClosedChannelException cce)
+        {
+            throw new RuntimeException(cce);
+        }
+        catch (IOException ex)
+        {
+            throw new FSWriteError(ex, file);
+        }
+    }
+
+    public static List<String> readLines(File file)
+    {
+        try
+        {
+            return Files.readAllLines(file.toPath(), CHARSET);
+        }
+        catch (IOException ex)
+        {
+            if (ex instanceof NoSuchFileException)
+                return Collections.emptyList();
+
+            throw new RuntimeException(ex);
+        }
+    }
+
+    /** @deprecated See CASSANDRA-16926 */
+    @Deprecated(since = "4.1")
+    public static void createDirectory(String directory)
+    {
+        createDirectory(new File(directory));
+    }
+
+    /** @deprecated See CASSANDRA-16926 */
+    @Deprecated(since = "4.1")
+    public static void createDirectory(File directory)
+    {
+        PathUtils.createDirectoriesIfNotExists(directory.toPath());
+    }
+
+    /** @deprecated See CASSANDRA-16926 */
+    @Deprecated(since = "4.1")
+    public static boolean delete(String file)
+    {
+        return new File(file).tryDelete();
+    }
+
+    /** @deprecated See CASSANDRA-16926 */
+    @Deprecated(since = "4.1")
+    public static void delete(File... files)
+    {
+        for (File file : files)
+            file.tryDelete();
+    }
+
+    /**
      * Deletes all files and subdirectories under "dir".
      * @param dir Directory to be deleted
      * @throws FSWriteError if any part of the tree cannot be deleted
+     *
+     * @deprecated See CASSANDRA-16926
      */
+    @Deprecated(since = "4.1")
+    public static void deleteRecursiveWithThrottle(File dir, RateLimiter rateLimiter)
+    {
+        dir.deleteRecursive(rateLimiter);
+    }
+
+    /**
+     * Deletes all files and subdirectories under "dir".
+     * @param dir Directory to be deleted
+     * @throws FSWriteError if any part of the tree cannot be deleted
+     *
+     * @deprecated See CASSANDRA-16926
+     */
+    @Deprecated(since = "4.1")
     public static void deleteRecursive(File dir)
     {
-        if (dir.isDirectory())
-        {
-            String[] children = dir.list();
-            for (String child : children)
-                deleteRecursive(new File(dir, child));
-        }
-
-        // The directory is now empty so now it can be smoked
-        deleteWithConfirm(dir);
+        dir.deleteRecursive();
     }
 
-    public static void skipBytesFully(DataInput in, int bytes) throws IOException
+    /**
+     * Schedules deletion of all file and subdirectories under "dir" on JVM shutdown.
+     * @param dir Directory to be deleted
+     *
+     * @deprecated See CASSANDRA-16926
+     */
+    @Deprecated(since = "4.1")
+    public static void deleteRecursiveOnExit(File dir)
     {
-        int n = 0;
-        while (n < bytes)
+        dir.deleteRecursiveOnExit();
+    }
+
+    /** @deprecated See CASSANDRA-16926 */
+    @Deprecated(since = "4.1")
+    public static boolean isSubDirectory(File parent, File child)
+    {
+        return parent.isAncestorOf(child);
+    }
+
+    /** @deprecated See CASSANDRA-16926 */
+    @Deprecated(since = "4.1")
+    public static Throwable deleteWithConfirm(File file, Throwable accumulate)
+    {
+        return file.delete(accumulate, null);
+    }
+
+    /** @deprecated See CASSANDRA-16926 */
+    @Deprecated(since = "4.1")
+    public static Throwable deleteWithConfirm(File file, Throwable accumulate, RateLimiter rateLimiter)
+    {
+        return file.delete(accumulate, rateLimiter);
+    }
+
+    /** @deprecated See CASSANDRA-16926 */
+    @Deprecated(since = "4.1")
+    public static void deleteWithConfirm(String file)
+    {
+        deleteWithConfirm(new File(file));
+    }
+
+    /** @deprecated See CASSANDRA-16926 */
+    @Deprecated(since = "4.1")
+    public static void deleteWithConfirm(File file)
+    {
+        file.delete();
+    }
+
+    /** @deprecated See CASSANDRA-16926 */
+    @Deprecated(since = "4.1")
+    public static void renameWithOutConfirm(String from, String to)
+    {
+        new File(from).tryMove(new File(to));
+    }
+
+    /** @deprecated See CASSANDRA-16926 */
+    @Deprecated(since = "4.1")
+    public static void renameWithConfirm(String from, String to)
+    {
+        renameWithConfirm(new File(from), new File(to));
+    }
+
+    /** @deprecated See CASSANDRA-16926 */
+    @Deprecated(since = "4.1")
+    public static void renameWithConfirm(File from, File to)
+    {
+        from.move(to);
+    }
+
+    /**
+     * Private constructor as the class contains only static methods.
+     */
+    private FileUtils()
+    {
+    }
+
+    /**
+     * Moves the contents of a directory to another directory.
+     * <p>Once a file has been copied to the target directory it will be deleted from the source directory.
+     * If a file already exists in the target directory a warning will be logged and the file will not
+     * be deleted.</p>
+     *
+     * @param source the directory containing the files to move
+     * @param target the directory where the files must be moved
+     */
+    public static void moveRecursively(Path source, Path target) throws IOException
+    {
+        logger.info("Moving {} to {}" , source, target);
+
+        if (Files.isDirectory(source))
         {
-            int skipped = in.skipBytes(bytes - n);
-            if (skipped == 0)
-                throw new EOFException("EOF after " + n + " bytes out of " + bytes);
-            n += skipped;
+            Files.createDirectories(target);
+
+            for (File f : new File(source).tryList())
+            {
+                String fileName = f.name();
+                moveRecursively(source.resolve(fileName), target.resolve(fileName));
+            }
+
+            deleteDirectoryIfEmpty(source);
+        }
+        else
+        {
+            if (Files.exists(target))
+            {
+                logger.warn("Cannot move the file {} to {} as the target file already exists." , source, target);
+            }
+            else
+            {
+                Files.copy(source, target, StandardCopyOption.COPY_ATTRIBUTES);
+                Files.delete(source);
+            }
         }
     }
 
-    public static void skipBytesFully(DataInput in, long bytes) throws IOException
+    /**
+     * Deletes the specified directory if it is empty
+     *
+     * @param path the path to the directory
+     */
+    public static void deleteDirectoryIfEmpty(Path path) throws IOException
     {
-        long n = 0;
-        while (n < bytes)
+        Preconditions.checkArgument(Files.isDirectory(path), String.format("%s is not a directory", path));
+
+        try
         {
-            int m = (int) Math.min(Integer.MAX_VALUE, bytes - n);
-            int skipped = in.skipBytes(m);
-            if (skipped == 0)
-                throw new EOFException("EOF after " + n + " bytes out of " + bytes);
-            n += skipped;
+            logger.info("Deleting directory {}", path);
+            Files.delete(path);
+        }
+        catch (DirectoryNotEmptyException e)
+        {
+            try (Stream<Path> paths = Files.list(path))
+            {
+                String content = paths.map(p -> p.getFileName().toString()).collect(Collectors.joining(", "));
+
+                logger.warn("Cannot delete the directory {} as it is not empty. (Content: {})", path, content);
+            }
         }
     }
-    
-    public static void handleFSError(FSError e)
+
+    public static boolean isDirectIOSupported(File file)
     {
-        switch (DatabaseDescriptor.getDiskFailurePolicy())
+        File testFile = null;
+        try
         {
-            case stop:
-                if (StorageService.instance.isInitialized())
-                {
-                    logger.error("Stopping gossiper");
-                    StorageService.instance.stopGossiping();
-                }
+            File dir = file.isDirectory() ? file : file.parent();
+            testFile = createTempFile("direct-io-test", ".tmp", dir);
 
-                if (StorageService.instance.isRPCServerRunning())
-                {
-                    logger.error("Stopping RPC server");
-                    StorageService.instance.stopRPCServer();
-                }
+            // Direct IO requires knowing the block size for buffer alignment
+            if (blockSize(testFile) <= 0)
+                return false;
 
-                if (StorageService.instance.isNativeTransportRunning())
-                {
-                    logger.error("Stopping native transport");
-                    StorageService.instance.stopNativeTransport();
-                }
-                break;
-            case best_effort:
-                // for both read and write errors mark the path as unwritable.
-                BlacklistedDirectories.maybeMarkUnwritable(e.path);
-                if (e instanceof FSReadError)
-                {
-                    File directory = BlacklistedDirectories.maybeMarkUnreadable(e.path);
-                    if (directory != null)
-                        Keyspace.removeUnreadableSSTables(directory);
-                }
-                break;
-            case ignore:
-                // already logged, so left nothing to do
-                break;
-            default:
-                throw new IllegalStateException();
+            try (FileChannel channel = FileChannel.open(testFile.toPath(),
+                                                        StandardOpenOption.READ,
+                                                        ExtendedOpenOption.DIRECT))
+            {
+                return true;
+            }
+        }
+        catch (Exception e)
+        {
+            return false;
+        }
+        finally
+        {
+            if (testFile != null)
+                testFile.tryDelete();
+        }
+    }
+
+    public static int getFileBlockSize(File file)
+    {
+        try
+        {
+            return blockSize(file);
+        }
+        catch (IOException e)
+        {
+            throw new RuntimeException("Failed to get file block size in " + file, e);
+        }
+    }
+
+    private static final ConcurrentHashMap<String, Integer> blockSizeByDirectory = new ConcurrentHashMap<>();
+
+    public static int getBlockSize(File directory)
+    {
+        return blockSizeByDirectory.computeIfAbsent(directory.absolutePath(), ignored -> probeBlockSize(directory));
+    }
+
+    private static int probeBlockSize(File directory)
+    {
+        File f = FileUtils.createTempFile("block-size-test", ".tmp", directory);
+        try
+        {
+            return blockSize(f);
+        }
+        catch (IOException e)
+        {
+            throw new RuntimeException("Failed to get file block size in " + directory, e);
+        }
+        finally
+        {
+            f.tryDelete();
+        }
+    }
+
+    private static int blockSize(File file) throws IOException
+    {
+        long bs = Files.getFileStore(file.toPath()).getBlockSize();
+        assert bs >= 0 && bs <= Integer.MAX_VALUE;
+        return (int) bs;
+    }
+
+    public static class DuplicateHardlinkException extends RuntimeException
+    {
+        public DuplicateHardlinkException(String message)
+        {
+            super(message);
         }
     }
 }

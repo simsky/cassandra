@@ -18,48 +18,39 @@
 package org.apache.cassandra.io.util;
 
 import java.io.Closeable;
-import java.io.File;
-import java.io.IOError;
 import java.io.IOException;
-import java.nio.channels.ClosedChannelException;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
-import java.util.regex.Pattern;
+import java.nio.ByteBuffer;
+import java.util.zip.CheckedInputStream;
 import java.util.zip.Checksum;
 
-import org.apache.cassandra.io.sstable.Component;
-import org.apache.cassandra.io.sstable.Descriptor;
-import org.apache.cassandra.io.sstable.SSTable;
-import org.apache.cassandra.utils.Hex;
-import org.apache.cassandra.utils.PureJavaCrc32;
+import org.apache.cassandra.utils.ChecksumType;
 
 public class DataIntegrityMetadata
 {
-    public static ChecksumValidator checksumValidator(Descriptor desc) throws IOException
-    {
-        return new ChecksumValidator(desc);
-    }
-
     public static class ChecksumValidator implements Closeable
     {
-        private final Checksum checksum = new PureJavaCrc32();
+        private final ChecksumType checksumType;
         private final RandomAccessReader reader;
-        private final Descriptor descriptor;
         public final int chunkSize;
 
-        public ChecksumValidator(Descriptor desc) throws IOException
+        public ChecksumValidator(File dataFile, File crcFile) throws IOException
         {
-            this.descriptor = desc;
-            reader = RandomAccessReader.open(new File(desc.filenameFor(Component.CRC)));
+            this(ChecksumType.CRC32,
+                 RandomAccessReader.open(crcFile),
+                 dataFile.absolutePath());
+        }
+
+        public ChecksumValidator(ChecksumType checksumType, RandomAccessReader reader, String dataFilename) throws IOException
+        {
+            this.checksumType = checksumType;
+            this.reader = reader;
             chunkSize = reader.readInt();
         }
 
         public void seek(long offset)
         {
             long start = chunkStart(offset);
-            reader.seek(((start / chunkSize) * 4L) + 4); // 8 byte checksum per
-                                                         // chunk + 4 byte
-                                                         // header/chunkLength
+            reader.seek(((start / chunkSize) * 4L) + 4); // 8 byte checksum per chunk + 4 byte header/chunkLength
         }
 
         public long chunkStart(long offset)
@@ -70,12 +61,24 @@ public class DataIntegrityMetadata
 
         public void validate(byte[] bytes, int start, int end) throws IOException
         {
-            checksum.update(bytes, start, end);
-            int current = (int) checksum.getValue();
-            checksum.reset();
-            int actual = reader.readInt();
-            if (current != actual)
-                throw new IOException("Corrupted SSTable : " + descriptor.filenameFor(Component.DATA));
+            int calculatedValue = (int) checksumType.of(bytes, start, end);
+            int storedValue = reader.readInt();
+            if (calculatedValue != storedValue)
+                throw new IOException(String.format("Corrupted file: integrity check (%s) failed for %s: %d != %d", checksumType.name(), reader.getPath(), storedValue, calculatedValue));
+        }
+
+        /**
+         * validates the checksum with the bytes from the specified buffer.
+         *
+         * Upon return, the buffer's position will
+         * be updated to its limit; its limit will not have been changed.
+         */
+        public void validate(ByteBuffer buffer) throws IOException
+        {
+            int calculatedValue = (int) checksumType.of(buffer);
+            int storedValue = reader.readInt();
+            if (calculatedValue != storedValue)
+                throw new IOException(String.format("Corrupted file: integrity check (%s) failed for %s: %d != %d", checksumType.name(), reader.getPath(), storedValue, calculatedValue));
         }
 
         public void close()
@@ -84,83 +87,40 @@ public class DataIntegrityMetadata
         }
     }
 
-    public static ChecksumWriter checksumWriter(Descriptor desc)
+    public static class FileDigestValidator
     {
-        return new ChecksumWriter(desc);
-    }
+        private final Checksum checksum;
+        private final File dataFile;
+        private final File digestFile;
 
-    public static class ChecksumWriter implements Closeable
-    {
-        private final Checksum checksum = new PureJavaCrc32();
-        private final MessageDigest digest;
-        private final SequentialWriter writer;
-        private final Descriptor descriptor;
-
-        public ChecksumWriter(Descriptor desc)
+        public FileDigestValidator(File dataFile, File digestFile) throws IOException
         {
-            this.descriptor = desc;
-            writer = SequentialWriter.open(new File(desc.filenameFor(Component.CRC)), true);
-            try
-            {
-                digest = MessageDigest.getInstance("SHA-1");
-            }
-            catch (NoSuchAlgorithmException e)
-            {
-                // SHA-1 is standard in java 6
-                throw new RuntimeException(e);
-            }
+            this.dataFile = dataFile;
+            this.digestFile = digestFile;
+            this.checksum = ChecksumType.CRC32.newInstance();
         }
 
-        public void writeChunkSize(int length)
+        // Validate the entire file
+        public void validate() throws IOException
         {
-            try
+            try (RandomAccessReader digestReader = RandomAccessReader.open(digestFile);
+                 RandomAccessReader dataReader = RandomAccessReader.open(dataFile);
+                 CheckedInputStream checkedInputStream = new CheckedInputStream(dataReader, checksum);)
             {
-                writer.stream.writeInt(length);
-            }
-            catch (IOException e)
-            {
-                throw new IOError(e);
-            }
-        }
-
-        public void append(byte[] buffer, int start, int end)
-        {
-            try
-            {
-                checksum.update(buffer, start, end);
-                writer.stream.writeInt((int) checksum.getValue());
-                checksum.reset();
-
-                digest.update(buffer, start, end);
-            }
-            catch (IOException e)
-            {
-                throw new IOError(e);
-            }
-        }
-
-        public void close()
-        {
-            FileUtils.closeQuietly(writer);
-            byte[] bytes = digest.digest();
-            if (bytes == null)
-                return;
-            SequentialWriter out = SequentialWriter.open(new File(descriptor.filenameFor(Component.DIGEST)), true);
-            // Writting output compatible with sha1sum
-            Descriptor newdesc = descriptor.asTemporary(false);
-            String[] tmp = newdesc.filenameFor(Component.DATA).split(Pattern.quote(File.separator));
-            String dataFileName = tmp[tmp.length - 1];
-            try
-            {
-                out.write(String.format("%s  %s", Hex.bytesToHex(bytes), dataFileName).getBytes());
-            }
-            catch (ClosedChannelException e)
-            {
-                throw new AssertionError(); // can't happen.
-            }
-            finally
-            {
-                FileUtils.closeQuietly(out);
+                long storedDigestValue;
+                try
+                {
+                    storedDigestValue = Long.parseLong(digestReader.readLine());
+                }
+                catch (NumberFormatException e)
+                {
+                    throw new IOException(String.format("Corrupted file: invalid digest value in %s", digestFile), e);
+                }
+                byte[] chunk = new byte[64 * 1024];
+                while (checkedInputStream.read(chunk) > 0) ;
+                long calculatedDigestValue = checkedInputStream.getChecksum().getValue();
+                if (storedDigestValue != calculatedDigestValue)
+                    throw new IOException(String.format("Corrupted file: integrity check (digest) failed for %s: %d != %d", dataFile, storedDigestValue, calculatedDigestValue));
             }
         }
     }

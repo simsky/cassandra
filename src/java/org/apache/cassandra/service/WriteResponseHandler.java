@@ -17,63 +17,69 @@
  */
 package org.apache.cassandra.service;
 
-import java.net.InetAddress;
-import java.util.Arrays;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
+import java.util.function.Supplier;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.cassandra.db.Keyspace;
-import org.apache.cassandra.net.MessageIn;
-import org.apache.cassandra.db.ConsistencyLevel;
+import org.apache.cassandra.db.MessageParams;
+import org.apache.cassandra.db.Mutation;
 import org.apache.cassandra.db.WriteType;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.locator.ReplicaPlan;
+import org.apache.cassandra.net.Message;
+import org.apache.cassandra.net.ParamType;
+import org.apache.cassandra.service.writes.thresholds.WriteWarningContext;
+import org.apache.cassandra.transport.Dispatcher;
+import org.apache.cassandra.utils.FBUtilities;
 
 /**
  * Handles blocking writes for ONE, ANY, TWO, THREE, QUORUM, and ALL consistency levels.
  */
-public class WriteResponseHandler extends AbstractWriteResponseHandler
+public class WriteResponseHandler<T> extends AbstractWriteResponseHandler<T>
 {
     protected static final Logger logger = LoggerFactory.getLogger(WriteResponseHandler.class);
 
-    protected final AtomicInteger responses;
+    protected volatile int responses;
+    private static final AtomicIntegerFieldUpdater<WriteResponseHandler> responsesUpdater
+            = AtomicIntegerFieldUpdater.newUpdater(WriteResponseHandler.class, "responses");
 
-    public WriteResponseHandler(Collection<InetAddress> writeEndpoints,
-                                Collection<InetAddress> pendingEndpoints,
-                                ConsistencyLevel consistencyLevel,
-                                Keyspace keyspace,
+    public WriteResponseHandler(ReplicaPlan.ForWrite replicaPlan,
                                 Runnable callback,
-                                WriteType writeType)
+                                WriteType writeType,
+                                Supplier<Mutation> hintOnFailure,
+                                Dispatcher.RequestTime requestTime)
     {
-        super(keyspace, writeEndpoints, pendingEndpoints, consistencyLevel, callback, writeType);
-        responses = new AtomicInteger(totalBlockFor());
+        super(replicaPlan, callback, writeType, hintOnFailure, requestTime);
+        responses = blockFor();
     }
 
-    public WriteResponseHandler(InetAddress endpoint, WriteType writeType, Runnable callback)
+    public WriteResponseHandler(ReplicaPlan.ForWrite replicaPlan, WriteType writeType, Supplier<Mutation> hintOnFailure, Dispatcher.RequestTime requestTime)
     {
-        this(Arrays.asList(endpoint), Collections.<InetAddress>emptyList(), ConsistencyLevel.ONE, null, callback, writeType);
+        this(replicaPlan, null, writeType, hintOnFailure, requestTime);
     }
 
-    public WriteResponseHandler(InetAddress endpoint, WriteType writeType)
+    public void onResponse(Message<T> m)
     {
-        this(endpoint, writeType, null);
-    }
+        InetAddressAndPort from = m == null ? FBUtilities.getBroadcastAddressAndPort() : m.from();
+        Map<ParamType, Object> params = m != null ? m.header.params() : MessageParams.capture();
 
-    public void response(MessageIn m)
-    {
-        if (responses.decrementAndGet() == 0)
+        if (WriteWarningContext.isSupported(params.keySet()))
+            getWarningContext().updateCounters(params);
+
+        replicaPlan.collectSuccess(from);
+        if (responsesUpdater.decrementAndGet(this) == 0)
             signal();
+        //Must be last after all subclass processing
+        //The two current subclasses both assume logResponseToIdealCLDelegate is called
+        //here.
+        logResponseToIdealCLDelegate(m);
     }
 
     protected int ackCount()
     {
-        return totalBlockFor() - responses.get();
-    }
-
-    public boolean isLatencyForSnitch()
-    {
-        return false;
+        return blockFor() - responses;
     }
 }

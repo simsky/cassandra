@@ -25,13 +25,74 @@ import org.apache.cassandra.exceptions.TransportException;
  */
 public class ProtocolException extends RuntimeException implements TransportException
 {
+    private final ProtocolVersion forcedProtocolVersion;
+
     public ProtocolException(String msg)
     {
+        this(msg, null);
+    }
+
+    public ProtocolException(String msg, ProtocolVersion forcedProtocolVersion)
+    {
         super(msg);
+        this.forcedProtocolVersion = forcedProtocolVersion;
     }
 
     public ExceptionCode code()
     {
         return ExceptionCode.PROTOCOL_ERROR;
+    }
+
+    public ProtocolVersion getForcedProtocolVersion()
+    {
+        return forcedProtocolVersion;
+    }
+
+    public boolean isFatal()
+    {
+        return false;
+    }
+
+    public boolean isSilent()
+    {
+        return false;
+    }
+
+    public static ProtocolException toFatalException(ProtocolException e)
+    {
+        return new Fatal(e);
+    }
+
+    public static ProtocolException toSilentException(ProtocolException e)
+    {
+        return new Silent(e);
+    }
+
+    private static class Fatal extends ProtocolException
+    {
+        private Fatal(ProtocolException cause)
+        {
+            super(cause.getMessage(), cause.forcedProtocolVersion);
+        }
+
+        @Override
+        public boolean isFatal()
+        {
+            return true;
+        }
+    }
+
+    private static class Silent extends ProtocolException
+    {
+        public Silent(ProtocolException cause)
+        {
+            super(cause.getMessage(), cause.forcedProtocolVersion);
+        }
+
+        @Override
+        public boolean isSilent()
+        {
+            return true;
+        }
     }
 }

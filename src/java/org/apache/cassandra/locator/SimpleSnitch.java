@@ -17,36 +17,61 @@
  */
 package org.apache.cassandra.locator;
 
-import java.net.InetAddress;
-import java.util.List;
+import java.util.Comparator;
+
+import org.apache.cassandra.utils.Sortable;
 
 /**
  * A simple endpoint snitch implementation that treats Strategy order as proximity,
  * allowing non-read-repaired reads to prefer a single endpoint, which improves
  * cache locality.
+ * @deprecated See CASSANDRA-19488
  */
+@Deprecated(since = "CEP-21")
 public class SimpleSnitch extends AbstractEndpointSnitch
 {
-    public String getRack(InetAddress endpoint)
-    {
-        return "rack1";
-    }
+    private static final NodeProximity sorter = new NoOpProximity();
+    private static final SimpleLocationProvider provider = new SimpleLocationProvider();
 
-    public String getDatacenter(InetAddress endpoint)
+    @Override
+    public String getLocalRack()
     {
-        return "datacenter1";
+        return provider.initialLocation().rack;
     }
 
     @Override
-    public void sortByProximity(final InetAddress address, List<InetAddress> addresses)
+    public String getLocalDatacenter()
     {
-        // Optimization to avoid walking the list
+        return provider.initialLocation().datacenter;
     }
 
-    public int compareEndpoints(InetAddress target, InetAddress a1, InetAddress a2)
+    @Override
+    public <C extends ReplicaCollection<? extends C>> C sortedByProximity(InetAddressAndPort address, C unsortedAddress)
     {
-        // Making all endpoints equal ensures we won't change the original ordering (since
-        // Collections.sort is guaranteed to be stable)
-        return 0;
+        return sorter.sortedByProximity(address, unsortedAddress);
+    }
+
+    @Override
+    public int compareEndpoints(InetAddressAndPort target, Replica r1, Replica r2)
+    {
+        return sorter.compareEndpoints(target, r1, r2);
+    }
+
+    @Override
+    public boolean isWorthMergingForRangeQuery(ReplicaCollection<?> merged, ReplicaCollection<?> l1, ReplicaCollection<?> l2)
+    {
+        return sorter.isWorthMergingForRangeQuery(merged, l1, l2);
+    }
+
+    @Override
+    public boolean supportCompareByEndpoint()
+    {
+        return sorter.supportCompareByEndpoint();
+    }
+
+    @Override
+    public <C extends Sortable<? extends Endpoint, ? extends C>> Comparator<Endpoint> endpointComparator(InetAddressAndPort address, C addresses)
+    {
+        return sorter.endpointComparator(address, addresses);
     }
 }

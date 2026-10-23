@@ -17,22 +17,50 @@
  */
 package org.apache.cassandra.metrics;
 
-import java.util.concurrent.TimeUnit;
+import com.codahale.metrics.Meter;
 
-import com.yammer.metrics.Metrics;
-import com.yammer.metrics.core.Meter;
+import static org.apache.cassandra.metrics.CassandraMetricsRegistry.Metrics;
 
 /**
  * Metrics related to Read Repair.
  */
 public class ReadRepairMetrics
 {
-    private static final MetricNameFactory factory = new DefaultNameFactory("ReadRepair");
+    public static final String TYPE_NAME = "ReadRepair";
+    private static final MetricNameFactory factory = new DefaultNameFactory(TYPE_NAME);
 
-    public static final Meter repairedBlocking =
-            Metrics.newMeter(factory.createMetricName("RepairedBlocking"), "RepairedBlocking", TimeUnit.SECONDS);
-    public static final Meter repairedBackground =
-            Metrics.newMeter(factory.createMetricName("RepairedBackground"), "RepairedBackground", TimeUnit.SECONDS);
-    public static final Meter attempted = 
-            Metrics.newMeter(factory.createMetricName("Attempted"), "Attempted", TimeUnit.SECONDS);
+    public static final Meter repairedBlocking = Metrics.meter(factory.createMetricName("RepairedBlocking"));
+
+    /**
+     * Non-transactional read did a blocking read repair via an Accord transaction. This is expected/normal if non-transactional
+     * reads are interoperating with Accord.
+     */
+    public static final Meter repairedBlockingViaAccord = Metrics.meter(factory.createMetricName("RepairedBlockingViaAccord"));
+
+    /**
+     * This should be zero if you are trying to run Accord in a 100% correct way and interoperating with non-transactional writes.
+     *
+     * An Accord transaction read at QUORUM and ended up having to do BRR to make something it read monotonic. While it
+     * will be monotonic this is not 100% deterministic for transaction recovery because different Accord coordinators could
+     * read different things when computing a transaction's writes.
+     *
+     * If Accord is operating in TransactionalMode.full and the range is migrated then this metric will be zero just
+     * because Accord is reading at ONE not QUORUM and there are should be no non-transactional writes anywyas.
+     */
+    public static final Meter repairedBlockingFromAccord = Metrics.meter(factory.createMetricName("RepairedBlockingFromAccord"));
+    public static final Meter reconcileRead = Metrics.meter(factory.createMetricName("ReconcileRead"));
+
+    /** @deprecated See CASSANDRA-13910 */
+    @Deprecated(since = "4.0")
+    public static final Meter repairedBackground = Metrics.meter(factory.createMetricName("RepairedBackground"));
+    /** @deprecated See CASSANDRA-13910 */
+    @Deprecated(since = "4.0")
+    public static final Meter attempted = Metrics.meter(factory.createMetricName("Attempted"));
+    public static final Meter timedOut = Metrics.meter(factory.createMetricName("RepairTimedOut"));
+
+    // Incremented when additional requests were sent during blocking read repair due to unavailable or slow nodes
+    public static final Meter speculatedRead = Metrics.meter(factory.createMetricName("SpeculatedRead"));
+    public static final Meter speculatedWrite = Metrics.meter(factory.createMetricName("SpeculatedWrite"));
+
+    public static void init() {}
 }

@@ -18,16 +18,23 @@
 
 package org.apache.cassandra.locator;
 
-import java.net.InetAddress;
 import java.net.UnknownHostException;
+
+import com.google.common.annotations.VisibleForTesting;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.gms.ApplicationState;
 import org.apache.cassandra.gms.EndpointState;
+import org.apache.cassandra.gms.Gossiper;
 import org.apache.cassandra.gms.IEndpointStateChangeSubscriber;
 import org.apache.cassandra.gms.VersionedValue;
+import org.apache.cassandra.net.ConnectionCategory;
 import org.apache.cassandra.net.MessagingService;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.apache.cassandra.net.OutboundConnectionSettings;
+
+import static org.apache.cassandra.auth.IInternodeAuthenticator.InternodeConnectionDirection.OUTBOUND_PRECONNECT;
 
 /**
  * Sidekick helper for snitches that want to reconnect from one IP addr for a node to another.
@@ -37,22 +44,20 @@ import org.slf4j.LoggerFactory;
 public class ReconnectableSnitchHelper implements IEndpointStateChangeSubscriber
 {
     private static final Logger logger = LoggerFactory.getLogger(ReconnectableSnitchHelper.class);
-    private final IEndpointSnitch snitch;
-    private final String localDc;
+    private final Locator locator;
     private final boolean preferLocal;
 
-    public ReconnectableSnitchHelper(IEndpointSnitch snitch, String localDc, boolean preferLocal)
+    public ReconnectableSnitchHelper(Locator locator, boolean preferLocal)
     {
-        this.snitch = snitch;
-        this.localDc = localDc;
+        this.locator = locator;
         this.preferLocal = preferLocal;
     }
 
-    private void reconnect(InetAddress publicAddress, VersionedValue localAddressValue)
+    private void reconnect(InetAddressAndPort publicAddress, VersionedValue localAddressValue)
     {
         try
         {
-            reconnect(publicAddress, InetAddress.getByName(localAddressValue.value));
+            reconnect(publicAddress, InetAddressAndPort.getByName(localAddressValue.value), locator);
         }
         catch (UnknownHostException e)
         {
@@ -60,52 +65,63 @@ public class ReconnectableSnitchHelper implements IEndpointStateChangeSubscriber
         }
     }
 
-    private void reconnect(InetAddress publicAddress, InetAddress localAddress)
+    @VisibleForTesting
+    static void reconnect(InetAddressAndPort publicAddress, InetAddressAndPort localAddress, Locator locator)
     {
-        if (snitch.getDatacenter(publicAddress).equals(localDc)
-                && MessagingService.instance().getVersion(publicAddress) == MessagingService.current_version
-                && !MessagingService.instance().getConnectionPool(publicAddress).endPoint().equals(localAddress))
+        final OutboundConnectionSettings settings = new OutboundConnectionSettings(publicAddress, localAddress).withDefaults(ConnectionCategory.MESSAGING);
+        if (!settings.authenticator().authenticate(settings.to.getAddress(), settings.to.getPort(), null, OUTBOUND_PRECONNECT))
         {
-            MessagingService.instance().getConnectionPool(publicAddress).reset(localAddress);
-            logger.debug(String.format("Intiated reconnect to an Internal IP %s for the %s", localAddress, publicAddress));
+            logger.debug("InternodeAuthenticator said don't reconnect to {} on {}", publicAddress, localAddress);
+            return;
+        }
+
+        if (locator.local().sameDatacenter(locator.location(publicAddress)))
+        {
+            MessagingService.instance().maybeReconnectWithNewIp(publicAddress, localAddress);
+            logger.debug("Initiated reconnect to an Internal IP {} for the {}", localAddress, publicAddress);
         }
     }
-    
-    public void beforeChange(InetAddress endpoint, EndpointState currentState, ApplicationState newStateKey, VersionedValue newValue)
+
+    public void onJoin(InetAddressAndPort endpoint, EndpointState epState)
     {
-        // no-op
+        if (preferLocal && !Gossiper.instance.isDeadState(epState))
+        {
+            VersionedValue address = epState.getApplicationState(ApplicationState.INTERNAL_ADDRESS_AND_PORT);
+            if (address == null)
+            {
+                address = epState.getApplicationState(ApplicationState.INTERNAL_ADDRESS_AND_PORT);
+            }
+            if (address != null)
+            {
+                reconnect(endpoint, address);
+            }
+        }
     }
 
-    public void onJoin(InetAddress endpoint, EndpointState epState)
+    //Skeptical this will always do the right thing all the time port wise. It will converge on the right thing
+    //eventually once INTERNAL_ADDRESS_AND_PORT is populated
+    public void onChange(InetAddressAndPort endpoint, ApplicationState state, VersionedValue value)
     {
-        if (preferLocal && epState.getApplicationState(ApplicationState.INTERNAL_IP) != null)
-            reconnect(endpoint, epState.getApplicationState(ApplicationState.INTERNAL_IP));
+        if (preferLocal && !Gossiper.instance.isDeadState(Gossiper.instance.getEndpointStateForEndpoint(endpoint)))
+        {
+            if (state == ApplicationState.INTERNAL_ADDRESS_AND_PORT)
+            {
+                reconnect(endpoint, value);
+            }
+            else if (state == ApplicationState.INTERNAL_IP &&
+                     null == Gossiper.instance.getEndpointStateForEndpoint(endpoint).getApplicationState(ApplicationState.INTERNAL_ADDRESS_AND_PORT))
+            {
+                //Only use INTERNAL_IP if INTERNAL_ADDRESS_AND_PORT is unavailable
+                reconnect(endpoint, value);
+            }
+        }
     }
 
-    public void onChange(InetAddress endpoint, ApplicationState state, VersionedValue value)
+    public void onAlive(InetAddressAndPort endpoint, EndpointState state)
     {
-        if (preferLocal && state == ApplicationState.INTERNAL_IP)
-            reconnect(endpoint, value);
-    }
-
-    public void onAlive(InetAddress endpoint, EndpointState state)
-    {
-        if (preferLocal && state.getApplicationState(ApplicationState.INTERNAL_IP) != null)
-            reconnect(endpoint, state.getApplicationState(ApplicationState.INTERNAL_IP));
-    }
-
-    public void onDead(InetAddress endpoint, EndpointState state)
-    {
-        // do nothing.
-    }
-
-    public void onRemove(InetAddress endpoint)
-    {
-        // do nothing.
-    }
-
-    public void onRestart(InetAddress endpoint, EndpointState state)
-    {
-        // do nothing.
+        VersionedValue internalIP = state.getApplicationState(ApplicationState.INTERNAL_IP);
+        VersionedValue internalIPAndPorts = state.getApplicationState(ApplicationState.INTERNAL_ADDRESS_AND_PORT);
+        if (preferLocal && internalIP != null)
+            reconnect(endpoint, internalIPAndPorts != null ? internalIPAndPorts : internalIP);
     }
 }

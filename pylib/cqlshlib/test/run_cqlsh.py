@@ -17,20 +17,50 @@
 # NOTE: this testing tool is *nix specific
 
 import os
+import sys
 import re
-import pty
-import fcntl
+import codecs
 import contextlib
 import subprocess
 import signal
-import math
 from time import time
 from . import basecase
+from os.path import join
 
-DEFAULT_CQLSH_PROMPT = '\ncqlsh(:\S+)?> '
+
+import pty
+DEFAULT_PREFIX = os.linesep
+
+DEFAULT_CQLSH_PROMPT = DEFAULT_PREFIX + r'(\S+@)?cqlsh(:\S+)?> '
 DEFAULT_CQLSH_TERM = 'xterm'
 
+try:
+    Pattern = re._pattern_type
+except AttributeError:
+    # Python 3.6+
+    Pattern = re.Pattern
+
+
+def get_smm_sequence(term='xterm'):
+    """
+    Return the set meta mode (smm) sequence, if any.
+    On more recent Linux systems, xterm emits the smm sequence
+    before each prompt.
+    """
+    result = ''
+    tput_proc = subprocess.Popen(['tput', '-T{}'.format(term), 'smm'], stdout=subprocess.PIPE)
+    tput_stdout = tput_proc.communicate()[0]
+    if (tput_stdout and (tput_stdout != b'')):
+        result = tput_stdout
+        if isinstance(result, bytes):
+            result = result.decode("utf-8")
+    return result
+
+
+DEFAULT_SMM_SEQUENCE = get_smm_sequence()
+
 cqlshlog = basecase.cqlshlog
+
 
 def set_controlling_pty(master, slave):
     os.setsid()
@@ -41,9 +71,6 @@ def set_controlling_pty(master, slave):
         os.close(slave)
     os.close(os.open(os.ttyname(1), os.O_RDWR))
 
-def set_nonblocking(fd):
-    flags = fcntl.fcntl(fd, fcntl.F_GETFL)
-    fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
 
 @contextlib.contextmanager
 def raising_signal(signum, exc):
@@ -60,11 +87,13 @@ def raising_signal(signum, exc):
     finally:
         signal.signal(signum, oldhandlr)
 
+
 class TimeoutError(Exception):
     pass
 
+
 @contextlib.contextmanager
-def timing_out_itimer(seconds):
+def timing_out(seconds):
     if seconds is None:
         yield
         return
@@ -78,64 +107,45 @@ def timing_out_itimer(seconds):
         finally:
             signal.setitimer(signal.ITIMER_REAL, 0)
 
-@contextlib.contextmanager
-def timing_out_alarm(seconds):
-    if seconds is None:
-        yield
-        return
-    with raising_signal(signal.SIGALRM, TimeoutError):
-        oldval = signal.alarm(int(math.ceil(seconds)))
-        if oldval != 0:
-            signal.alarm(oldval)
-            raise RuntimeError("SIGALRM already in use")
-        try:
-            yield
-        finally:
-            signal.alarm(0)
-
-# setitimer is new in 2.6, but it's still worth supporting, for potentially
-# faster tests because of sub-second resolution on timeouts.
-if hasattr(signal, 'setitimer'):
-    timing_out = timing_out_itimer
-else:
-    timing_out = timing_out_alarm
-
-def noop(*a):
-    pass
 
 class ProcRunner:
     def __init__(self, path, tty=True, env=None, args=()):
         self.exe_path = path
         self.args = args
-        self.tty = bool(tty)
+        self.tty = tty
         if env is None:
             env = {}
         self.env = env
         self.readbuf = ''
+        # os.read()/pipe reads can split a multi-byte UTF-8 sequence across two
+        # reads (the boundary depends on terminal/readline echo flushing, which
+        # changed with the Ubuntu 22.04 / readline 8.1 build image). Decode
+        # incrementally so a partial trailing sequence is buffered until the
+        # rest of its bytes arrive, instead of failing with UnicodeDecodeError.
+        self._decoder = codecs.getincrementaldecoder("utf-8")()
 
         self.start_proc()
 
     def start_proc(self):
-        preexec = noop
         stdin = stdout = stderr = None
-        if self.tty:
-            masterfd, slavefd = pty.openpty()
-            preexec = lambda: set_controlling_pty(masterfd, slavefd)
-        else:
-            stdin = stdout = subprocess.PIPE
-            stderr = subprocess.STDOUT
         cqlshlog.info("Spawning %r subprocess with args: %r and env: %r"
                       % (self.exe_path, self.args, self.env))
-        self.proc = subprocess.Popen((self.exe_path,) + tuple(self.args),
-                                     env=self.env, preexec_fn=preexec,
-                                     stdin=stdin, stdout=stdout, stderr=stderr,
-                                     close_fds=False)
         if self.tty:
+            masterfd, slavefd = pty.openpty()
+            preexec = (lambda: set_controlling_pty(masterfd, slavefd))
+            self.proc = subprocess.Popen((self.exe_path,) + tuple(self.args),
+                                         env=self.env, preexec_fn=preexec,
+                                         stdin=stdin, stdout=stdout, stderr=stderr,
+                                         close_fds=False)
             os.close(slavefd)
             self.childpty = masterfd
             self.send = self.send_tty
             self.read = self.read_tty
         else:
+            stdin = stdout = subprocess.PIPE
+            self.proc = subprocess.Popen((self.exe_path,) + tuple(self.args),
+                                         env=self.env, stdin=stdin, stdout=stdout,
+                                         stderr=stderr, bufsize=0, close_fds=False)
             self.send = self.send_pipe
             self.read = self.read_pipe
 
@@ -149,25 +159,51 @@ class ProcRunner:
         return self.proc.wait()
 
     def send_tty(self, data):
+        if not isinstance(data, bytes):
+            data = data.encode("utf-8")
         os.write(self.childpty, data)
 
     def send_pipe(self, data):
         self.proc.stdin.write(data)
 
-    def read_tty(self, blksize):
-        return os.read(self.childpty, blksize)
+    def read_tty(self, blksize, timeout=None):
+        while True:
+            buf = os.read(self.childpty, blksize)
+            if not isinstance(buf, bytes):
+                return buf
+            decoded = self._decoder.decode(buf)
+            # A non-empty read that decodes to '' means we only got the start of
+            # a multi-byte UTF-8 sequence; keep reading until it completes rather
+            # than returning '', which callers (read_until) treat as EOF.
+            # An empty read (b'') is genuine EOF and must propagate as ''.
+            if decoded != '' or buf == b'':
+                return decoded
 
-    def read_pipe(self, blksize):
-        return self.proc.stdout.read(blksize)
+    def read_pipe(self, blksize, timeout=None):
+        while True:
+            buf = self.proc.stdout.read(blksize)
+            if not isinstance(buf, bytes):
+                return buf
+            decoded = self._decoder.decode(buf)
+            if decoded != '' or buf == b'':
+                return decoded
 
-    def read_until(self, until, blksize=4096, timeout=None, flags=0):
-        if not isinstance(until, re._pattern_type):
+    def read_until(self, until, blksize=4096, timeout=None,
+                   flags=0, ptty_timeout=None, replace=None):
+        if replace is None:
+            replace = []
+        if not isinstance(until, Pattern):
             until = re.compile(until, flags)
+
+        cqlshlog.debug("Searching for %r" % (until.pattern,))
         got = self.readbuf
         self.readbuf = ''
         with timing_out(timeout):
             while True:
-                val = self.read(blksize)
+                val = self.read(blksize, ptty_timeout)
+                for replace_target in replace:
+                    if (replace_target != ''):
+                        val = val.replace(replace_target, '')
                 cqlshlog.debug("read %r from subproc" % (val,))
                 if val == '':
                     raise EOFError("'until' pattern %r not found" % (until.pattern,))
@@ -203,11 +239,12 @@ class ProcRunner:
             curtime = time()
         return got
 
+
 class CqlshRunner(ProcRunner):
     def __init__(self, path=None, host=None, port=None, keyspace=None, cqlver=None,
-                 args=(), prompt=DEFAULT_CQLSH_PROMPT, env=None, **kwargs):
+                 args=(), prompt=DEFAULT_CQLSH_PROMPT, env=None, tty=True, **kwargs):
         if path is None:
-            path = basecase.path_to_cqlsh
+            path = join(basecase.cqlsh_dir, 'cqlsh')
         if host is None:
             host = basecase.TEST_HOST
         if port is None:
@@ -217,21 +254,27 @@ class CqlshRunner(ProcRunner):
         env.setdefault('TERM', 'xterm')
         env.setdefault('CQLSH_NO_BUNDLED', os.environ.get('CQLSH_NO_BUNDLED', ''))
         env.setdefault('PYTHONPATH', os.environ.get('PYTHONPATH', ''))
+        coverage = False
+        if ('CQLSH_COVERAGE' in env.keys()):
+            coverage = True
         args = tuple(args) + (host, str(port))
         if cqlver is not None:
             args += ('--cqlversion', str(cqlver))
         if keyspace is not None:
-            args += ('--keyspace', keyspace)
+            args += ('--keyspace', keyspace.lower())
+        if coverage:
+            args += ('--coverage',)
         self.keyspace = keyspace
-        ProcRunner.__init__(self, path, args=args, env=env, **kwargs)
+        env.setdefault('CQLSH_PYTHON', sys.executable)  # run with the same interpreter as the test
+        ProcRunner.__init__(self, path, tty=tty, args=args, env=env, **kwargs)
         self.prompt = prompt
         if self.prompt is None:
             self.output_header = ''
         else:
             self.output_header = self.read_to_next_prompt()
 
-    def read_to_next_prompt(self):
-        return self.read_until(self.prompt, timeout=4.0)
+    def read_to_next_prompt(self, timeout=10.0):
+        return self.read_until(self.prompt, timeout=timeout, ptty_timeout=3, replace=[DEFAULT_SMM_SEQUENCE])
 
     def read_up_to_timeout(self, timeout, blksize=4096):
         output = ProcRunner.read_up_to_timeout(self, timeout, blksize=blksize)
@@ -246,6 +289,7 @@ class CqlshRunner(ProcRunner):
         # readline trying to be friendly- remove these artifacts
         output = output.replace(' \r', '')
         output = output.replace('\r', '')
+        output = output.replace(' \b', '')
         if self.tty:
             echo, output = output.split('\n', 1)
             assert echo == cmd, "unexpected echo %r instead of %r" % (echo, cmd)
@@ -254,12 +298,14 @@ class CqlshRunner(ProcRunner):
         except ValueError:
             promptline = output
             output = ''
-        assert re.match(self.prompt, '\n' + promptline), \
-                'last line of output %r does not match %r?' % (promptline, self.prompt)
+        assert re.match(self.prompt, DEFAULT_PREFIX + promptline), \
+            'last line of output %r does not match %r?' % (promptline, self.prompt)
         return output + '\n'
+
 
 def run_cqlsh(**kwargs):
     return contextlib.closing(CqlshRunner(**kwargs))
+
 
 def call_cqlsh(**kwargs):
     kwargs.setdefault('prompt', None)
@@ -268,4 +314,6 @@ def call_cqlsh(**kwargs):
     c = CqlshRunner(**kwargs)
     output, _ = c.proc.communicate(proginput)
     result = c.close()
+    if isinstance(output, bytes):
+        output = output.decode("utf-8")
     return output, result
